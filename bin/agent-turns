@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# agent-turns v2 - token-efficient consensus loop
+# agent-turns v2.1.1 - token-efficient consensus loop
 #
 # Env vars:
 #   AGENT_BRIDGE_HOME            base dir for runs (default: ~/agent-bridge)
 #   AGENT_BRIDGE_TIMEOUT         seconds per agent turn (default: 900)
 #   AGENT_BRIDGE_VERIFY_CMD      ground-truth command run after a turn that changed files
 #   AGENT_BRIDGE_VERIFY_TIMEOUT  seconds for verify cmd (default: 300)
-#   AGENT_BRIDGE_HISTORY_TURNS   extracted blocks kept in handoff (default: 2)
+#   AGENT_BRIDGE_HISTORY_TURNS   sections kept in handoff (default: 2; 4 if VERIFY_CMD set)
 #   AGENT_BRIDGE_RESUME          1 = resume Claude session across rounds (default: 1, needs jq)
 #   AGENT_BRIDGE_CODEX_RESUME    1 = codex exec resume --last (default: 0, needs recent codex CLI)
 #   AGENT_BRIDGE_MAX_FALLBACK_CHARS  chars kept when output has no STATUS block (default: 1200)
@@ -31,7 +31,13 @@ run_dir="$bridge_dir/runs/$run_id"
 turn_timeout="${AGENT_BRIDGE_TIMEOUT:-900}"
 verify_cmd="${AGENT_BRIDGE_VERIFY_CMD:-}"
 verify_timeout="${AGENT_BRIDGE_VERIFY_TIMEOUT:-300}"
-history_turns="${AGENT_BRIDGE_HISTORY_TURNS:-2}"
+if [[ -n "${AGENT_BRIDGE_HISTORY_TURNS:-}" ]]; then
+  history_turns="$AGENT_BRIDGE_HISTORY_TURNS"
+elif [[ -n "$verify_cmd" ]]; then
+  history_turns=4
+else
+  history_turns=2
+fi
 fallback_chars="${AGENT_BRIDGE_MAX_FALLBACK_CHARS:-1200}"
 resume_claude="${AGENT_BRIDGE_RESUME:-1}"
 resume_codex="${AGENT_BRIDGE_CODEX_RESUME:-0}"
@@ -42,6 +48,14 @@ command -v jq >/dev/null 2>&1 && have_jq=1
 if [[ "$resume_claude" == "1" && "$have_jq" -ne 1 ]]; then
   echo "jq not found: disabling Claude session resume + cost tracking." >&2
   resume_claude=0
+fi
+
+if [[ "$resume_codex" == "1" ]]; then
+  if ! codex exec resume --help >/dev/null 2>&1; then
+    echo "AGENT_BRIDGE_CODEX_RESUME=1, but this codex CLI does not support 'exec resume'." >&2
+    echo "Set AGENT_BRIDGE_CODEX_RESUME=0 or upgrade the codex CLI." >&2
+    exit 2
+  fi
 fi
 
 protocol="$run_dir/protocol.md"
@@ -76,6 +90,28 @@ extract_block() {
   fi
 }
 
+synth_block() {
+  cat > "$1" <<EOF
+STATUS: BLOCKED
+CHANGED: none
+EVIDENCE: $2
+NEXT: operator intervention required
+HANDOFF: orchestrator-generated block; the agent call failed or returned unparseable output
+EOF
+}
+
+judge_summary() {
+  local f="$1" verdict lines
+  verdict="$(grep -m1 -oE 'ACCEPT_CLAUDE|ACCEPT_CODEX|REQUEST_REVISION|BLOCKED' "$f" || true)"
+  lines="$(grep -E '^(VERDICT|STATUS|HANDOFF):' "$f" | head -3 | tr '\n' ' ' || true)"
+  if [[ -n "$verdict" || -n "$lines" ]]; then
+    [[ "$lines" == *VERDICT:* ]] && verdict=""
+    printf '%s%s' "${verdict:+VERDICT: $verdict :: }" "$lines"
+  else
+    head -c 400 "$f" | tr '\n' ' '
+  fi
+}
+
 get_field() {
   grep -m1 -E "^$2:" "$1" | sed -E "s/^$2:[[:space:]]*//" || true
 }
@@ -87,13 +123,7 @@ get_status() {
 handoff_file="$run_dir/handoff.md"
 : > "$handoff_file"
 
-push_handoff() {
-  {
-    echo "## $1"
-    extract_block "$2"
-    echo
-  } >> "$handoff_file"
-
+trim_handoff() {
   awk -v keep="$history_turns" '
     /^## / { s++ }
     { lines[NR] = $0; sec[NR] = s }
@@ -101,9 +131,21 @@ push_handoff() {
   ' "$handoff_file" > "$handoff_file.tmp" && mv "$handoff_file.tmp" "$handoff_file"
 }
 
+push_handoff() {
+  {
+    echo "## $1"
+    extract_block "$2"
+    echo
+  } >> "$handoff_file"
+  trim_handoff
+}
+
 push_note() {
   printf '## %s\n\n' "$1" >> "$handoff_file"
+  trim_handoff
 }
+
+round_verify_failed=0
 
 run_verify() {
   local round="$1" agent="$2" log rc
@@ -112,7 +154,13 @@ run_verify() {
   ( cd "$workspace" && timeout "$verify_timeout" bash -c "$verify_cmd" ) > "$log" 2>&1
   rc=$?
   set -e
-  push_note "GROUND TRUTH after $agent (round $round): \`$verify_cmd\` exit=$rc :: $(tail -c 300 "$log" | tr '\n' ' ')"
+  if [[ $rc -eq 0 ]]; then
+    round_verify_failed=0
+    push_note "GROUND TRUTH after $agent (round $round): \`$verify_cmd\` exit=0 :: $(tail -c 300 "$log" | tr '\n' ' ')"
+  else
+    round_verify_failed=1
+    push_note "GROUND TRUTH FAILED after $agent (round $round): \`$verify_cmd\` exit=$rc - VERIFIED/COMPLETE will be rejected this round :: $(tail -c 300 "$log" | tr '\n' ' ')"
+  fi
   echo "  verify: exit=$rc ($log)"
 }
 
@@ -138,31 +186,56 @@ claude_session_id=""
 total_cost="0"
 
 call_claude() {
-  local prompt="$1" out="$2" raw="$2.json"
+  local prompt="$1" out="$2" raw="$2.json" rc result cost
   local -a cmd=(claude -p --permission-mode acceptEdits --add-dir "$workspace")
   if [[ "$resume_claude" == "1" ]]; then
     cmd+=(--output-format json)
     [[ -n "$claude_session_id" ]] && cmd+=(--resume "$claude_session_id")
+    set +e
     ( cd "$workspace" && timeout "$turn_timeout" "${cmd[@]}" < "$prompt" > "$raw" )
-    jq -r '.result' "$raw" > "$out"
-    claude_session_id="$(jq -r '.session_id // empty' "$raw")"
-    local cost
-    cost="$(jq -r '.total_cost_usd // 0' "$raw")"
+    rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+      synth_block "$out" "claude CLI failed (exit=$rc, timeout=${turn_timeout}s); raw output: $raw"
+      return 1
+    fi
+    result="$(jq -r '.result // empty' "$raw" 2>/dev/null || true)"
+    if [[ -z "$result" ]]; then
+      synth_block "$out" "claude returned unparseable/empty JSON; raw output: $raw"
+      return 1
+    fi
+    printf '%s\n' "$result" > "$out"
+    claude_session_id="$(jq -r '.session_id // empty' "$raw" 2>/dev/null || true)"
+    cost="$(jq -r '.total_cost_usd // 0' "$raw" 2>/dev/null || echo 0)"
     total_cost="$(awk -v a="$total_cost" -v b="$cost" 'BEGIN{printf "%.4f", a+b}')"
     echo "  claude: \$${cost} (cumulative \$${total_cost})"
   else
     cmd+=(--output-format text)
+    set +e
     ( cd "$workspace" && timeout "$turn_timeout" "${cmd[@]}" < "$prompt" > "$out" )
+    rc=$?
+    set -e
+    if [[ $rc -ne 0 ]]; then
+      synth_block "$out" "claude CLI failed (exit=$rc, timeout=${turn_timeout}s)"
+      return 1
+    fi
   fi
 }
 
 call_codex() {
-  local prompt="$1" out="$2"
+  local prompt="$1" out="$2" rc
   local -a cmd=(codex --ask-for-approval never exec --cd "$workspace" --sandbox workspace-write)
   if [[ "$resume_codex" == "1" ]]; then
     cmd=(codex --ask-for-approval never exec resume --last --cd "$workspace" --sandbox workspace-write)
   fi
+  set +e
   timeout "$turn_timeout" "${cmd[@]}" --output-last-message "$out" - < "$prompt"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 || ! -s "$out" ]]; then
+    synth_block "$out" "codex CLI failed (exit=$rc, timeout=${turn_timeout}s) or wrote empty output"
+    return 1
+  fi
 }
 
 call_judge() {
@@ -180,8 +253,16 @@ call_judge() {
     echo "Arbitrate. Return one verdict: ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED, with one reason."
   } > "$prompt"
   echo "  escalating to OpenCode judge..."
+  local jrc
+  set +e
   timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
-  push_note "JUDGE VERDICT (round $round): $(head -c 400 "$out" | tr '\n' ' ')"
+  jrc=$?
+  set -e
+  if [[ $jrc -ne 0 || ! -s "$out" ]]; then
+    push_note "JUDGE UNAVAILABLE (round $round, exit=$jrc): continue without arbitration; operator review advised"
+    return 0
+  fi
+  push_note "JUDGE VERDICT (round $round): $(judge_summary "$out")"
 }
 
 changed_something() {
@@ -197,13 +278,19 @@ claude_status=""
 codex_status=""
 
 for ((round=1; round<=rounds; round++)); do
+  round_verify_failed=0
+
   printf '\n=== Round %d: Claude ===\n' "$round"
   c_prompt="$run_dir/round-${round}-claude.prompt.md"
   c_out="$run_dir/round-${round}-claude.out.md"
   build_prompt "$c_prompt" "Claude (implementer/planner)" \
     "Make concrete progress toward the goal, or revise per the latest feedback/verdict." \
     "Modify the workspace only if needed."
-  call_claude "$c_prompt" "$c_out"
+  if ! call_claude "$c_prompt" "$c_out"; then
+    push_handoff "Round $round - Claude" "$c_out"
+    final_state="CLAUDE_ERROR"
+    break
+  fi
   push_handoff "Round $round - Claude" "$c_out"
   claude_status="$(get_status "$c_out")"
   echo "  claude STATUS: ${claude_status:-?}"
@@ -215,7 +302,11 @@ for ((round=1; round<=rounds; round++)); do
   verify_hint="Independently verify Claude's latest claim. Respond VERIFIED only if you checked it yourself."
   [[ "$claude_status" == "COMPLETE" ]] && verify_hint="Claude claims COMPLETE. Verify independently; respond VERIFIED or DISAGREE with evidence."
   build_prompt "$x_prompt" "Codex (reviewer/verifier)" "$verify_hint"
-  call_codex "$x_prompt" "$x_out"
+  if ! call_codex "$x_prompt" "$x_out"; then
+    push_handoff "Round $round - Codex" "$x_out"
+    final_state="CODEX_ERROR"
+    break
+  fi
   push_handoff "Round $round - Codex" "$x_out"
   codex_status="$(get_status "$x_out")"
   echo "  codex STATUS: ${codex_status:-?}"
@@ -223,8 +314,14 @@ for ((round=1; round<=rounds; round++)); do
 
   case "$codex_status" in
     VERIFIED|COMPLETE)
-      final_state="CONSENSUS"
-      break
+      if [[ "$round_verify_failed" -eq 1 ]]; then
+        push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth command is failing; fix it before closing"
+        echo "  consensus REJECTED: verify failing"
+        final_state="VERIFY_FAILING"
+      else
+        final_state="CONSENSUS"
+        break
+      fi
       ;;
     BLOCKED)
       final_state="BLOCKED"

@@ -62,7 +62,13 @@ One agent should not close its own unverified implementation. The other agent ve
 | `AGENT_BRIDGE_TIMEOUT` | `900` | Seconds per agent turn |
 | `AGENT_BRIDGE_VERIFY_CMD` | empty | Ground-truth command after changed turns |
 | `AGENT_BRIDGE_VERIFY_TIMEOUT` | `300` | Seconds for verify command |
-| `AGENT_BRIDGE_HISTORY_TURNS` | `2` | Recent protocol sections retained |
+| `AGENT_BRIDGE_HISTORY_TURNS` | `2`, or `4` when verify is enabled | Recent protocol sections retained |
 | `AGENT_BRIDGE_RESUME` | `1` | Claude session resume and cost tracking when `jq` exists |
 | `AGENT_BRIDGE_CODEX_RESUME` | `0` | Codex resume via recent CLI |
 | `AGENT_BRIDGE_MAX_FALLBACK_CHARS` | `1200` | Fallback when an agent ignores protocol |
+
+Final states:
+
+```text
+CONSENSUS | BLOCKED | VERIFY_FAILING | CLAUDE_ERROR | CODEX_ERROR | MAX_ROUNDS
+```

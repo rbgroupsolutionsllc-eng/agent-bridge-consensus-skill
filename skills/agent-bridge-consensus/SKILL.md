@@ -49,6 +49,8 @@ For ground-truth verification after changed turns:
 AGENT_BRIDGE_VERIFY_CMD="pytest -q" agent-turns /path/to/project "shared goal" 2
 ```
 
+If the ground-truth command fails, the orchestrator rejects `VERIFIED` or `COMPLETE` for that round and continues until the command passes or rounds are exhausted.
+
 Round guidance:
 
 - `1`: Claude works, Codex reviews.
@@ -91,3 +93,5 @@ ask-opencode /path/to/project prompt.md output.md
 - Complex: 3 rounds, OpenCode only on disagreement.
 
 The orchestrator only propagates the 5 protocol fields from recent turns. Do not paste logs; reference files in the run artifacts directory.
+
+Final states are `CONSENSUS`, `BLOCKED`, `VERIFY_FAILING`, `CLAUDE_ERROR`, `CODEX_ERROR`, and `MAX_ROUNDS`.
