@@ -1,6 +1,6 @@
 ---
 name: agent-bridge-consensus
-description: Coordinate Claude Code, Codex, and optionally OpenCode as a local multi-agent team. Use when the user wants agents to talk, take turns, invoke each other, review each other, resolve disagreements, conserve tokens with compact handoffs, or reach a shared goal through consensus.
+description: Coordinate Claude Code, Codex, and optionally OpenCode as a local multi-agent team. Use when the user wants agents to talk, take turns, invoke each other, review each other, resolve disagreements, or reach a shared goal through consensus.
 ---
 
 # Agent Bridge Consensus
@@ -43,10 +43,10 @@ Use:
 agent-turns /path/to/project "shared goal" 2
 ```
 
-For lower token use:
+For ground-truth verification after changed turns:
 
 ```bash
-AGENT_BRIDGE_MAX_SUMMARY_CHARS=2000 agent-turns /path/to/project "shared goal" 2
+AGENT_BRIDGE_VERIFY_CMD="pytest -q" agent-turns /path/to/project "shared goal" 2
 ```
 
 Round guidance:
@@ -86,8 +86,8 @@ ask-opencode /path/to/project prompt.md output.md
 
 ## Token Budget
 
-- Simple: 1 round, compact summary 2000 chars.
-- Normal: 2 rounds, compact summary 2000-4000 chars.
+- Simple: 1 round.
+- Normal: 2 rounds.
 - Complex: 3 rounds, OpenCode only on disagreement.
 
-Avoid pasting full logs. Summarize with changed files, commands run, and results.
+The orchestrator only propagates the 5 protocol fields from recent turns. Do not paste logs; reference files in the run artifacts directory.

@@ -1,128 +1,246 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-usage() {
-  cat >&2 <<'EOF'
-Usage:
-  agent-turns <workspace> <goal> [rounds]
-EOF
-}
+# agent-turns v2 - token-efficient consensus loop
+#
+# Env vars:
+#   AGENT_BRIDGE_HOME            base dir for runs (default: ~/agent-bridge)
+#   AGENT_BRIDGE_TIMEOUT         seconds per agent turn (default: 900)
+#   AGENT_BRIDGE_VERIFY_CMD      ground-truth command run after a turn that changed files
+#   AGENT_BRIDGE_VERIFY_TIMEOUT  seconds for verify cmd (default: 300)
+#   AGENT_BRIDGE_HISTORY_TURNS   extracted blocks kept in handoff (default: 2)
+#   AGENT_BRIDGE_RESUME          1 = resume Claude session across rounds (default: 1, needs jq)
+#   AGENT_BRIDGE_CODEX_RESUME    1 = codex exec resume --last (default: 0, needs recent codex CLI)
+#   AGENT_BRIDGE_MAX_FALLBACK_CHARS  chars kept when output has no STATUS block (default: 1200)
 
-if [[ $# -lt 2 ]]; then
-  usage
-  exit 2
-fi
+usage() { echo "Usage: agent-turns <workspace> <goal> [rounds]" >&2; }
+
+[[ $# -ge 2 ]] || { usage; exit 2; }
 
 workspace="$1"
 goal="$2"
-rounds="${3:-3}"
+rounds="${3:-2}"
 
 [[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
 [[ "$rounds" =~ ^[0-9]+$ && "$rounds" -ge 1 ]] || { echo "Rounds must be a positive integer" >&2; exit 2; }
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bridge_dir="${AGENT_BRIDGE_HOME:-$HOME/agent-bridge}"
-run_id="$(date +%Y%m%d-%H%M%S)"
+run_id="$(date +%Y%m%d-%H%M%S)-$$"
 run_dir="$bridge_dir/runs/$run_id"
-max_summary_chars="${AGENT_BRIDGE_MAX_SUMMARY_CHARS:-4000}"
+turn_timeout="${AGENT_BRIDGE_TIMEOUT:-900}"
+verify_cmd="${AGENT_BRIDGE_VERIFY_CMD:-}"
+verify_timeout="${AGENT_BRIDGE_VERIFY_TIMEOUT:-300}"
+history_turns="${AGENT_BRIDGE_HISTORY_TURNS:-2}"
+fallback_chars="${AGENT_BRIDGE_MAX_FALLBACK_CHARS:-1200}"
+resume_claude="${AGENT_BRIDGE_RESUME:-1}"
+resume_codex="${AGENT_BRIDGE_CODEX_RESUME:-0}"
 mkdir -p "$run_dir"
 
-compact_output() {
-  local file="$1"
-  if [[ "$(wc -c < "$file")" -le "$max_summary_chars" ]]; then
-    cat "$file"
+have_jq=0
+command -v jq >/dev/null 2>&1 && have_jq=1
+if [[ "$resume_claude" == "1" && "$have_jq" -ne 1 ]]; then
+  echo "jq not found: disabling Claude session resume + cost tracking." >&2
+  resume_claude=0
+fi
+
+protocol="$run_dir/protocol.md"
+cat > "$protocol" <<'EOF'
+# Bridge Protocol (compact mode)
+
+Respond with EXACTLY this shape, 12 lines max, no narration:
+
+STATUS: PROPOSED | VERIFIED | DISAGREE | REVISE | BLOCKED | COMPLETE
+CHANGED: files or "none"
+EVIDENCE: command/result or "not run"
+NEXT: one concrete next action or "none"
+HANDOFF: one sentence to the next agent
+
+Rules:
+- Prefer evidence over explanation. Small, verifiable changes.
+- Do not undo the other agent's work unless it is clearly wrong.
+- Never mark COMPLETE for your own unverified implementation.
+- VERIFIED means you independently checked the other agent's work and it holds.
+- If you DISAGREE: one concrete reason + one proposed correction.
+EOF
+
+extract_block() {
+  local file="$1" block
+  block="$(grep -E '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$file" | head -5 || true)"
+  if [[ -n "$block" ]]; then
+    printf '%s\n' "$block"
   else
-    echo "[output truncated to last $max_summary_chars chars]"
-    tail -c "$max_summary_chars" "$file"
+    echo "[no protocol block found; head of raw output]"
+    head -c "$fallback_chars" "$file"
+    echo
   fi
 }
 
-marked_complete() {
-  local file="$1"
-  grep -Eqi '^(STATUS:[[:space:]]*)?COMPLETE\b|^#[[:space:]]*COMPLETE\b|^FINAL_VERDICT:[[:space:]]*COMPLETE\b' "$file"
+get_field() {
+  grep -m1 -E "^$2:" "$1" | sed -E "s/^$2:[[:space:]]*//" || true
 }
 
-summary="$run_dir/shared-summary.md"
-cat > "$summary" <<EOF
-# Shared Goal
+get_status() {
+  get_field "$1" STATUS | tr '[:lower:]' '[:upper:]' | awk '{print $1}'
+}
 
-$goal
+handoff_file="$run_dir/handoff.md"
+: > "$handoff_file"
 
-# Protocol
+push_handoff() {
+  {
+    echo "## $1"
+    extract_block "$2"
+    echo
+  } >> "$handoff_file"
 
-- Claude and Codex are working toward the same goal.
-- Use compact mode: short, precise, no narration unless needed.
-- Maximum final answer per turn: 12 lines.
-- Use this exact shape:
-  STATUS: PROPOSED | VERIFIED | DISAGREE | REVISE | BLOCKED | COMPLETE
-  CHANGED: files or "none"
-  EVIDENCE: command/result or "not run"
-  NEXT: one concrete next action or "none"
-  HANDOFF: one sentence to the next agent
-- Avoid undoing the other agent's work unless it is clearly wrong.
-- Prefer small, verifiable changes.
-- Do not mark COMPLETE for your own unverified implementation unless the task only asks for your direct answer.
-EOF
+  awk -v keep="$history_turns" '
+    /^## / { s++ }
+    { lines[NR] = $0; sec[NR] = s }
+    END { for (i = 1; i <= NR; i++) if (sec[i] > s - keep) print lines[i] }
+  ' "$handoff_file" > "$handoff_file.tmp" && mv "$handoff_file.tmp" "$handoff_file"
+}
+
+push_note() {
+  printf '## %s\n\n' "$1" >> "$handoff_file"
+}
+
+run_verify() {
+  local round="$1" agent="$2" log rc
+  log="$run_dir/verify-r${round}-${agent}.log"
+  set +e
+  ( cd "$workspace" && timeout "$verify_timeout" bash -c "$verify_cmd" ) > "$log" 2>&1
+  rc=$?
+  set -e
+  push_note "GROUND TRUTH after $agent (round $round): \`$verify_cmd\` exit=$rc :: $(tail -c 300 "$log" | tr '\n' ' ')"
+  echo "  verify: exit=$rc ($log)"
+}
+
+build_prompt() {
+  local out="$1" agent="$2"
+  shift 2
+  {
+    cat "$protocol"
+    echo
+    echo "GOAL: $goal"
+    echo "WORKSPACE: $workspace"
+    echo "YOU ARE: $agent"
+    echo
+    echo "# Recent turns"
+    if [[ -s "$handoff_file" ]]; then cat "$handoff_file"; else echo "(first turn)"; fi
+    echo
+    echo "# Your turn"
+    printf '%s\n' "$@"
+  } > "$out"
+}
+
+claude_session_id=""
+total_cost="0"
+
+call_claude() {
+  local prompt="$1" out="$2" raw="$2.json"
+  local -a cmd=(claude -p --permission-mode acceptEdits --add-dir "$workspace")
+  if [[ "$resume_claude" == "1" ]]; then
+    cmd+=(--output-format json)
+    [[ -n "$claude_session_id" ]] && cmd+=(--resume "$claude_session_id")
+    ( cd "$workspace" && timeout "$turn_timeout" "${cmd[@]}" < "$prompt" > "$raw" )
+    jq -r '.result' "$raw" > "$out"
+    claude_session_id="$(jq -r '.session_id // empty' "$raw")"
+    local cost
+    cost="$(jq -r '.total_cost_usd // 0' "$raw")"
+    total_cost="$(awk -v a="$total_cost" -v b="$cost" 'BEGIN{printf "%.4f", a+b}')"
+    echo "  claude: \$${cost} (cumulative \$${total_cost})"
+  else
+    cmd+=(--output-format text)
+    ( cd "$workspace" && timeout "$turn_timeout" "${cmd[@]}" < "$prompt" > "$out" )
+  fi
+}
+
+call_codex() {
+  local prompt="$1" out="$2"
+  local -a cmd=(codex --ask-for-approval never exec --cd "$workspace" --sandbox workspace-write)
+  if [[ "$resume_codex" == "1" ]]; then
+    cmd=(codex --ask-for-approval never exec resume --last --cd "$workspace" --sandbox workspace-write)
+  fi
+  timeout "$turn_timeout" "${cmd[@]}" --output-last-message "$out" - < "$prompt"
+}
+
+call_judge() {
+  local round="$1" prompt="$run_dir/round-${round}-judge.prompt.md" out="$run_dir/round-${round}-judge.out.md"
+  {
+    cat "$protocol"
+    echo
+    echo "GOAL: $goal"
+    echo "YOU ARE: OpenCode, third-party judge. Do NOT edit files."
+    echo
+    echo "# Dispute"
+    cat "$handoff_file"
+    echo
+    echo "# Your turn"
+    echo "Arbitrate. Return one verdict: ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED, with one reason."
+  } > "$prompt"
+  echo "  escalating to OpenCode judge..."
+  timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
+  push_note "JUDGE VERDICT (round $round): $(head -c 400 "$out" | tr '\n' ' ')"
+}
+
+changed_something() {
+  local changed
+  changed="$(get_field "$1" CHANGED | tr '[:upper:]' '[:lower:]')"
+  [[ -n "$changed" && "$changed" != "none" && "$changed" != '"none"' ]]
+}
 
 echo "Run: $run_dir"
 
+final_state="MAX_ROUNDS"
+claude_status=""
+codex_status=""
+
 for ((round=1; round<=rounds; round++)); do
-  printf "\n=== Round %d: Claude ===\n" "$round"
-  claude_prompt="$run_dir/round-${round}-claude.prompt.md"
-  claude_out="$run_dir/round-${round}-claude.out.md"
-  cat > "$claude_prompt" <<EOF
-You are Claude Code in a two-agent local bridge.
+  printf '\n=== Round %d: Claude ===\n' "$round"
+  c_prompt="$run_dir/round-${round}-claude.prompt.md"
+  c_out="$run_dir/round-${round}-claude.out.md"
+  build_prompt "$c_prompt" "Claude (implementer/planner)" \
+    "Make concrete progress toward the goal, or revise per the latest feedback/verdict." \
+    "Modify the workspace only if needed."
+  call_claude "$c_prompt" "$c_out"
+  push_handoff "Round $round - Claude" "$c_out"
+  claude_status="$(get_status "$c_out")"
+  echo "  claude STATUS: ${claude_status:-?}"
+  [[ -n "$verify_cmd" ]] && changed_something "$c_out" && run_verify "$round" claude
 
-Workspace: $workspace
+  printf '\n=== Round %d: Codex ===\n' "$round"
+  x_prompt="$run_dir/round-${round}-codex.prompt.md"
+  x_out="$run_dir/round-${round}-codex.out.md"
+  verify_hint="Independently verify Claude's latest claim. Respond VERIFIED only if you checked it yourself."
+  [[ "$claude_status" == "COMPLETE" ]] && verify_hint="Claude claims COMPLETE. Verify independently; respond VERIFIED or DISAGREE with evidence."
+  build_prompt "$x_prompt" "Codex (reviewer/verifier)" "$verify_hint"
+  call_codex "$x_prompt" "$x_out"
+  push_handoff "Round $round - Codex" "$x_out"
+  codex_status="$(get_status "$x_out")"
+  echo "  codex STATUS: ${codex_status:-?}"
+  [[ -n "$verify_cmd" ]] && changed_something "$x_out" && run_verify "$round" codex
 
-$(cat "$summary")
-
-Your turn:
-1. Inspect or modify the workspace only if needed for the shared goal.
-2. Make progress or produce a concrete plan for Codex.
-3. Keep the response short and use the required compact shape.
-EOF
-  "$script_dir/ask-claude" "$workspace" "$claude_prompt" "$claude_out"
-  cat >> "$summary" <<EOF
-
-# Round $round Claude
-
-$(compact_output "$claude_out")
-EOF
-
-  if marked_complete "$claude_out"; then
-    echo "Claude marked COMPLETE; Codex will still verify before stopping."
-  fi
-
-  printf "\n=== Round %d: Codex ===\n" "$round"
-  codex_prompt="$run_dir/round-${round}-codex.prompt.md"
-  codex_out="$run_dir/round-${round}-codex.out.md"
-  cat > "$codex_prompt" <<EOF
-You are Codex in a two-agent local bridge.
-
-Workspace: $workspace
-
-$(cat "$summary")
-
-Your turn:
-1. Inspect or modify the workspace only if needed for the shared goal.
-2. Make progress, verify what changed, or correct the plan.
-3. Keep the response short and use the required compact shape.
-EOF
-  "$script_dir/ask-codex" "$workspace" "$codex_prompt" "$codex_out"
-  cat >> "$summary" <<EOF
-
-# Round $round Codex
-
-$(compact_output "$codex_out")
-EOF
-
-  if marked_complete "$codex_out"; then
-    echo "Codex marked the goal complete."
-    break
-  fi
+  case "$codex_status" in
+    VERIFIED|COMPLETE)
+      final_state="CONSENSUS"
+      break
+      ;;
+    BLOCKED)
+      final_state="BLOCKED"
+      break
+      ;;
+    DISAGREE)
+      if [[ "$claude_status" == "DISAGREE" || "$claude_status" == "REVISE" ]]; then
+        call_judge "$round"
+      fi
+      ;;
+  esac
 done
 
 echo
-echo "Final shared summary:"
-echo "$summary"
+echo "=== Done: $final_state ==="
+[[ "$resume_claude" == "1" ]] && echo "Total Claude cost: \$${total_cost}"
+echo "Artifacts: $run_dir"
+echo "Final handoff state:"
+cat "$handoff_file"
