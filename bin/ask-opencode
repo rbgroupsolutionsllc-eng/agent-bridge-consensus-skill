@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: ask-opencode <workspace> <prompt-file> [output-file]" >&2
+  exit 2
+fi
+
+workspace="$1"
+prompt_file="$2"
+output_file="${3:-}"
+
+[[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
+[[ -f "$prompt_file" ]] || { echo "Prompt file not found: $prompt_file" >&2; exit 2; }
+
+if [[ -n "$output_file" ]]; then
+  opencode run --pure --dir "$workspace" "$(cat "$prompt_file")" > "$output_file"
+else
+  opencode run --pure --dir "$workspace" "$(cat "$prompt_file")"
+fi

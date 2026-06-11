@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+mkdir -p "$HOME/.codex/skills/agent-bridge-consensus"
+mkdir -p "$HOME/.claude/skills/agent-bridge-consensus"
+mkdir -p "$HOME/.local/bin"
+mkdir -p "$HOME/.config/opencode"
+
+cp "$repo_dir/skills/agent-bridge-consensus/SKILL.md" "$HOME/.codex/skills/agent-bridge-consensus/SKILL.md"
+cp "$repo_dir/skills/agent-bridge-consensus/SKILL.md" "$HOME/.claude/skills/agent-bridge-consensus/SKILL.md"
+cp "$repo_dir/bin/agent-turns" "$HOME/.local/bin/agent-turns"
+cp "$repo_dir/bin/ask-claude" "$HOME/.local/bin/ask-claude"
+cp "$repo_dir/bin/ask-codex" "$HOME/.local/bin/ask-codex"
+cp "$repo_dir/bin/ask-opencode" "$HOME/.local/bin/ask-opencode"
+chmod +x "$HOME/.local/bin/agent-turns" "$HOME/.local/bin/ask-claude" "$HOME/.local/bin/ask-codex" "$HOME/.local/bin/ask-opencode"
+
+opencode_agents="$HOME/.config/opencode/AGENTS.md"
+touch "$opencode_agents"
+if ! grep -q "## Agent Bridge Consensus" "$opencode_agents"; then
+  cat >> "$opencode_agents" <<'EOF'
+
+## Agent Bridge Consensus
+
+When asked to act in the Claude/Codex/OpenCode bridge, use compact judge mode:
+
+```text
+STATUS: VERIFIED | DISAGREE | BLOCKED | COMPLETE
+CHANGED: none unless explicitly asked to edit
+EVIDENCE: one concrete observation
+NEXT: one concrete next action or none
+HANDOFF: one sentence
+```
+
+Default role: OpenCode is the third-party judge, not the implementer. Return one verdict when arbitrating: `ACCEPT_CLAUDE`, `ACCEPT_CODEX`, `REQUEST_REVISION`, or `BLOCKED`, with one reason.
+EOF
+fi
+
+echo "Installed agent-bridge-consensus."

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: ask-codex <workspace> <prompt-file> [output-file]" >&2
+  exit 2
+fi
+
+workspace="$1"
+prompt_file="$2"
+output_file="${3:-}"
+
+[[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
+[[ -f "$prompt_file" ]] || { echo "Prompt file not found: $prompt_file" >&2; exit 2; }
+
+if [[ -n "$output_file" ]]; then
+  codex --ask-for-approval never exec --cd "$workspace" --sandbox workspace-write --output-last-message "$output_file" - < "$prompt_file"
+else
+  codex --ask-for-approval never exec --cd "$workspace" --sandbox workspace-write - < "$prompt_file"
+fi

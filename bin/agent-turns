@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+Usage:
+  agent-turns <workspace> <goal> [rounds]
+EOF
+}
+
+if [[ $# -lt 2 ]]; then
+  usage
+  exit 2
+fi
+
+workspace="$1"
+goal="$2"
+rounds="${3:-3}"
+
+[[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
+[[ "$rounds" =~ ^[0-9]+$ && "$rounds" -ge 1 ]] || { echo "Rounds must be a positive integer" >&2; exit 2; }
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bridge_dir="${AGENT_BRIDGE_HOME:-$HOME/agent-bridge}"
+run_id="$(date +%Y%m%d-%H%M%S)"
+run_dir="$bridge_dir/runs/$run_id"
+max_summary_chars="${AGENT_BRIDGE_MAX_SUMMARY_CHARS:-4000}"
+mkdir -p "$run_dir"
+
+compact_output() {
+  local file="$1"
+  if [[ "$(wc -c < "$file")" -le "$max_summary_chars" ]]; then
+    cat "$file"
+  else
+    echo "[output truncated to last $max_summary_chars chars]"
+    tail -c "$max_summary_chars" "$file"
+  fi
+}
+
+marked_complete() {
+  local file="$1"
+  grep -Eqi '^(STATUS:[[:space:]]*)?COMPLETE\b|^#[[:space:]]*COMPLETE\b|^FINAL_VERDICT:[[:space:]]*COMPLETE\b' "$file"
+}
+
+summary="$run_dir/shared-summary.md"
+cat > "$summary" <<EOF
+# Shared Goal
+
+$goal
+
+# Protocol
+
+- Claude and Codex are working toward the same goal.
+- Use compact mode: short, precise, no narration unless needed.
+- Maximum final answer per turn: 12 lines.
+- Use this exact shape:
+  STATUS: PROPOSED | VERIFIED | DISAGREE | REVISE | BLOCKED | COMPLETE
+  CHANGED: files or "none"
+  EVIDENCE: command/result or "not run"
+  NEXT: one concrete next action or "none"
+  HANDOFF: one sentence to the next agent
+- Avoid undoing the other agent's work unless it is clearly wrong.
+- Prefer small, verifiable changes.
+- Do not mark COMPLETE for your own unverified implementation unless the task only asks for your direct answer.
+EOF
+
+echo "Run: $run_dir"
+
+for ((round=1; round<=rounds; round++)); do
+  printf "\n=== Round %d: Claude ===\n" "$round"
+  claude_prompt="$run_dir/round-${round}-claude.prompt.md"
+  claude_out="$run_dir/round-${round}-claude.out.md"
+  cat > "$claude_prompt" <<EOF
+You are Claude Code in a two-agent local bridge.
+
+Workspace: $workspace
+
+$(cat "$summary")
+
+Your turn:
+1. Inspect or modify the workspace only if needed for the shared goal.
+2. Make progress or produce a concrete plan for Codex.
+3. Keep the response short and use the required compact shape.
+EOF
+  "$script_dir/ask-claude" "$workspace" "$claude_prompt" "$claude_out"
+  cat >> "$summary" <<EOF
+
+# Round $round Claude
+
+$(compact_output "$claude_out")
+EOF
+
+  if marked_complete "$claude_out"; then
+    echo "Claude marked COMPLETE; Codex will still verify before stopping."
+  fi
+
+  printf "\n=== Round %d: Codex ===\n" "$round"
+  codex_prompt="$run_dir/round-${round}-codex.prompt.md"
+  codex_out="$run_dir/round-${round}-codex.out.md"
+  cat > "$codex_prompt" <<EOF
+You are Codex in a two-agent local bridge.
+
+Workspace: $workspace
+
+$(cat "$summary")
+
+Your turn:
+1. Inspect or modify the workspace only if needed for the shared goal.
+2. Make progress, verify what changed, or correct the plan.
+3. Keep the response short and use the required compact shape.
+EOF
+  "$script_dir/ask-codex" "$workspace" "$codex_prompt" "$codex_out"
+  cat >> "$summary" <<EOF
+
+# Round $round Codex
+
+$(compact_output "$codex_out")
+EOF
+
+  if marked_complete "$codex_out"; then
+    echo "Codex marked the goal complete."
+    break
+  fi
+done
+
+echo
+echo "Final shared summary:"
+echo "$summary"

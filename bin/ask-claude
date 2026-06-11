@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: ask-claude <workspace> <prompt-file> [output-file]" >&2
+  exit 2
+fi
+
+workspace="$1"
+prompt_file="$2"
+output_file="${3:-}"
+
+[[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
+[[ -f "$prompt_file" ]] || { echo "Prompt file not found: $prompt_file" >&2; exit 2; }
+
+cd "$workspace"
+
+if [[ -n "$output_file" ]]; then
+  claude -p --permission-mode acceptEdits --output-format text --add-dir "$workspace" - < "$prompt_file" > "$output_file"
+else
+  claude -p --permission-mode acceptEdits --output-format text --add-dir "$workspace" - < "$prompt_file"
+fi
