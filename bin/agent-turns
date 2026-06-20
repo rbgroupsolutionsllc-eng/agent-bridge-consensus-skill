@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# agent-turns v2.1.1 - token-efficient consensus loop
+# agent-turns v2.3.0 - token-efficient consensus loop with symmetric provider fallback
 #
 # Env vars:
 #   AGENT_BRIDGE_HOME            base dir for runs (default: ~/agent-bridge)
@@ -12,6 +12,9 @@ set -euo pipefail
 #   AGENT_BRIDGE_RESUME          1 = resume Claude session across rounds (default: 1, needs jq)
 #   AGENT_BRIDGE_CODEX_RESUME    1 = codex exec resume --last (default: 0, needs recent codex CLI)
 #   AGENT_BRIDGE_MAX_FALLBACK_CHARS  chars kept when output has no STATUS block (default: 1200)
+#   AGENT_BRIDGE_FALLBACKS        comma-separated fallback providers (default: opencode,agy)
+#   AGENT_BRIDGE_OPENCODE_MODEL   OpenCode model (default: opencode-go/minimax-m3); inline: [opencode:model]
+#   AGENT_BRIDGE_ANTIGRAVITY_MODEL  agy model (default: Gemini 3.5 Flash (Medium)); inline: [agy:model]
 
 usage() { echo "Usage: agent-turns <workspace> <goal> [rounds]" >&2; }
 
@@ -23,6 +26,14 @@ rounds="${3:-2}"
 
 [[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
 [[ "$rounds" =~ ^[0-9]+$ && "$rounds" -ge 1 ]] || { echo "Rounds must be a positive integer" >&2; exit 2; }
+
+# Parse inline model directives from goal: [opencode:model] [agy:model]
+_re='\[opencode:([^]]+)\]'
+if [[ "$goal" =~ $_re ]]; then AGENT_BRIDGE_OPENCODE_MODEL="${BASH_REMATCH[1]}"; fi
+_re='\[agy:([^]]+)\]'
+if [[ "$goal" =~ $_re ]]; then AGENT_BRIDGE_ANTIGRAVITY_MODEL="${BASH_REMATCH[1]}"; fi
+goal="$(printf '%s' "$goal" | sed 's/\[[a-z]*:[^]]*\]//g;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+unset _re
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bridge_dir="${AGENT_BRIDGE_HOME:-$HOME/agent-bridge}"
@@ -41,7 +52,13 @@ fi
 fallback_chars="${AGENT_BRIDGE_MAX_FALLBACK_CHARS:-1200}"
 resume_claude="${AGENT_BRIDGE_RESUME:-1}"
 resume_codex="${AGENT_BRIDGE_CODEX_RESUME:-0}"
+fallbacks="${AGENT_BRIDGE_FALLBACKS:-opencode,agy}"
 mkdir -p "$run_dir"
+
+# Session-wide provider failure tracking — any provider that fails is skipped for the rest of the session
+_failed_providers=" "
+mark_failed() { _failed_providers+="${1} "; echo "  provider unavailable for this session: $1" >&2; }
+is_failed()   { [[ "$_failed_providers" == *" ${1} "* ]]; }
 
 have_jq=0
 command -v jq >/dev/null 2>&1 && have_jq=1
@@ -71,6 +88,7 @@ NEXT: one concrete next action or "none"
 HANDOFF: one sentence to the next agent
 
 Rules:
+- Token rule: output the protocol block only. No preamble, no narration. Omit EVIDENCE if "not run".
 - Prefer evidence over explanation. Small, verifiable changes.
 - Do not undo the other agent's work unless it is clearly wrong.
 - Never mark COMPLETE for your own unverified implementation.
@@ -187,6 +205,7 @@ total_cost="0"
 
 call_claude() {
   local prompt="$1" out="$2" raw="$2.json" rc result cost
+  is_failed claude && return 1
   local -a cmd=(claude -p --permission-mode acceptEdits --add-dir "$workspace")
   if [[ "$resume_claude" == "1" ]]; then
     cmd+=(--output-format json)
@@ -196,11 +215,13 @@ call_claude() {
     rc=$?
     set -e
     if [[ $rc -ne 0 ]]; then
+      mark_failed claude
       synth_block "$out" "claude CLI failed (exit=$rc, timeout=${turn_timeout}s); raw output: $raw"
       return 1
     fi
     result="$(jq -r '.result // empty' "$raw" 2>/dev/null || true)"
     if [[ -z "$result" ]]; then
+      mark_failed claude
       synth_block "$out" "claude returned unparseable/empty JSON; raw output: $raw"
       return 1
     fi
@@ -216,6 +237,7 @@ call_claude() {
     rc=$?
     set -e
     if [[ $rc -ne 0 ]]; then
+      mark_failed claude
       synth_block "$out" "claude CLI failed (exit=$rc, timeout=${turn_timeout}s)"
       return 1
     fi
@@ -224,6 +246,7 @@ call_claude() {
 
 call_codex() {
   local prompt="$1" out="$2" rc
+  is_failed codex && return 1
   local -a cmd=(codex --ask-for-approval never exec --cd "$workspace" --sandbox workspace-write)
   if [[ "$resume_codex" == "1" ]]; then
     cmd=(codex --ask-for-approval never exec resume --last --cd "$workspace" --sandbox workspace-write)
@@ -233,9 +256,55 @@ call_codex() {
   rc=$?
   set -e
   if [[ $rc -ne 0 || ! -s "$out" ]]; then
+    mark_failed codex
     synth_block "$out" "codex CLI failed (exit=$rc, timeout=${turn_timeout}s) or wrote empty output"
     return 1
   fi
+}
+
+call_fallback() {
+  local role="$1" prompt="$2" out="$3" provider rc candidate
+  local -a providers
+  IFS=',' read -r -a providers <<< "$fallbacks"
+
+  for provider in "${providers[@]}"; do
+    provider="${provider//[[:space:]]/}"
+    [[ "$provider" == "antigravity" ]] && provider="agy"
+    [[ -n "$provider" ]] || continue
+    if is_failed "$provider"; then
+      echo "  fallback: skipping $provider (unavailable this session)"
+      continue
+    fi
+    echo "  fallback: trying $provider for $role..."
+    candidate="${out}.fallback.$$"
+    rm -f "$candidate"
+    set +e
+    case "$provider" in
+      opencode)
+        timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$candidate"
+        rc=$?
+        ;;
+      agy|antigravity)
+        timeout "$turn_timeout" "$script_dir/ask-antigravity" "$workspace" "$prompt" "$candidate"
+        rc=$?
+        ;;
+      *)
+        echo "  fallback: unsupported provider '$provider'" >&2
+        rc=2
+        ;;
+    esac
+    set -e
+
+    if [[ $rc -eq 0 && -s "$candidate" ]] && grep -qE '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$candidate"; then
+      mv "$candidate" "$out"
+      echo "  fallback: $provider answered for $role"
+      return 0
+    fi
+    rm -f "$candidate"
+    mark_failed "$provider"
+    echo "  fallback: $provider unavailable (exit=$rc)"
+  done
+  return 1
 }
 
 call_judge() {
@@ -244,7 +313,7 @@ call_judge() {
     cat "$protocol"
     echo
     echo "GOAL: $goal"
-    echo "YOU ARE: OpenCode, third-party judge. Do NOT edit files."
+    echo "YOU ARE: third-party judge. Do NOT edit files."
     echo
     echo "# Dispute"
     cat "$handoff_file"
@@ -252,14 +321,35 @@ call_judge() {
     echo "# Your turn"
     echo "Arbitrate. Return one verdict: ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED, with one reason."
   } > "$prompt"
-  echo "  escalating to OpenCode judge..."
+
   local jrc
-  set +e
-  timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
-  jrc=$?
-  set -e
-  if [[ $jrc -ne 0 || ! -s "$out" ]]; then
-    push_note "JUDGE UNAVAILABLE (round $round, exit=$jrc): continue without arbitration; operator review advised"
+  # Primary judge: OpenCode
+  if ! is_failed opencode; then
+    echo "  escalating to OpenCode judge..."
+    set +e
+    timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
+    jrc=$?
+    set -e
+    if [[ $jrc -ne 0 || ! -s "$out" ]] || ! grep -qE '^(STATUS|VERDICT):' "$out"; then
+      mark_failed opencode
+      rm -f "$out"
+    fi
+  fi
+  # Fallback judge: agy
+  if is_failed opencode && ! is_failed agy; then
+    echo "  judge: OpenCode unavailable, trying agy..."
+    rm -f "$out"
+    set +e
+    timeout "$turn_timeout" "$script_dir/ask-antigravity" "$workspace" "$prompt" "$out"
+    jrc=$?
+    set -e
+    if [[ $jrc -ne 0 || ! -s "$out" ]] || ! grep -qE '^(STATUS|VERDICT):' "$out"; then
+      mark_failed agy
+      rm -f "$out"
+    fi
+  fi
+  if [[ ! -s "$out" ]]; then
+    push_note "JUDGE UNAVAILABLE (round $round): all judge providers unavailable; operator review advised"
     return 0
   fi
   push_note "JUDGE VERDICT (round $round): $(judge_summary "$out")"
@@ -287,9 +377,13 @@ for ((round=1; round<=rounds; round++)); do
     "Make concrete progress toward the goal, or revise per the latest feedback/verdict." \
     "Modify the workspace only if needed."
   if ! call_claude "$c_prompt" "$c_out"; then
-    push_handoff "Round $round - Claude" "$c_out"
-    final_state="CLAUDE_ERROR"
-    break
+    echo "  claude unavailable; starting automatic fallback"
+    if ! call_fallback "Claude implementer" "$c_prompt" "$c_out"; then
+      [[ -s "$c_out" ]] || synth_block "$c_out" "Claude and configured fallback providers failed"
+      push_handoff "Round $round - Claude" "$c_out"
+      final_state="CLAUDE_ERROR"
+      break
+    fi
   fi
   push_handoff "Round $round - Claude" "$c_out"
   claude_status="$(get_status "$c_out")"
@@ -303,9 +397,13 @@ for ((round=1; round<=rounds; round++)); do
   [[ "$claude_status" == "COMPLETE" ]] && verify_hint="Claude claims COMPLETE. Verify independently; respond VERIFIED or DISAGREE with evidence."
   build_prompt "$x_prompt" "Codex (reviewer/verifier)" "$verify_hint"
   if ! call_codex "$x_prompt" "$x_out"; then
-    push_handoff "Round $round - Codex" "$x_out"
-    final_state="CODEX_ERROR"
-    break
+    echo "  codex unavailable; starting automatic fallback"
+    if ! call_fallback "Codex reviewer" "$x_prompt" "$x_out"; then
+      [[ -s "$x_out" ]] || synth_block "$x_out" "Codex and configured fallback providers failed"
+      push_handoff "Round $round - Codex" "$x_out"
+      final_state="CODEX_ERROR"
+      break
+    fi
   fi
   push_handoff "Round $round - Codex" "$x_out"
   codex_status="$(get_status "$x_out")"

@@ -37,6 +37,9 @@ if [[ "$json" == "1" && "${MOCK_SCENARIO}" == "claude_bad_json" ]]; then
 fi
 
 case "${MOCK_SCENARIO}" in
+  fallback_opencode|fallback_antigravity|skip_failed_primary)
+    exit 1
+    ;;
   consensus_round2|json_resume|verify_fail_gate|verify_window)
     result='STATUS: PROPOSED
 CHANGED: changed.txt
@@ -97,7 +100,7 @@ done
 [[ -n "$out" ]] || { echo "missing --output-last-message" >&2; exit 2; }
 
 case "${MOCK_SCENARIO}" in
-  consensus_round2|json_resume)
+  consensus_round2|json_resume|skip_failed_primary)
     if [[ "$count" == "1" ]]; then status="DISAGREE"; else status="VERIFIED"; fi
     ;;
   verify_fail_gate|verify_window)
@@ -123,11 +126,22 @@ EOF
 cat > "$mockbin/opencode" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+printf '%s\n' "$*" >> "${MOCK_STATE}/opencode-args.log"
+if [[ "${MOCK_SCENARIO}" == "fallback_antigravity" ]]; then
+  exit 1
+fi
 if [[ "${MOCK_SCENARIO}" == "judge_noise" ]]; then
   printf 'noise line 1\nnoise line 2\nnoise line 3\nSTATUS: VERIFIED\nHANDOFF: judge says revise\nVERDICT: REQUEST_REVISION\n'
 else
   printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock judge\nNEXT: none\nHANDOFF: verdict issued\nVERDICT: ACCEPT_CLAUDE\n'
 fi
+EOF
+
+cat > "$mockbin/agy" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$*" >> "${MOCK_STATE}/agy-args.log"
+printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy fallback\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
 EOF
 
 cat > "$mockbin/jq" <<'EOF'
@@ -155,7 +169,7 @@ else:
 PY
 EOF
 
-chmod +x "$mockbin/claude" "$mockbin/codex" "$mockbin/opencode" "$mockbin/jq"
+chmod +x "$mockbin/claude" "$mockbin/codex" "$mockbin/opencode" "$mockbin/agy" "$mockbin/jq"
 
 run_case() {
   local name="$1"
@@ -219,7 +233,7 @@ assert_contains "$state/stdout.log" "consensus REJECTED: verify failing"
 assert_contains "$state/stdout.log" "=== Done: VERIFY_FAILING ==="
 assert_contains "$state/stdout.log" "ORCHESTRATOR REJECTED VERIFIED"
 
-state="$(MOCK_SCENARIO=claude_bad_json run_case claude_bad_json "$repo_dir/bin/agent-turns" "$workspace" "mock bad json" 2)"
+state="$(MOCK_SCENARIO=claude_bad_json AGENT_BRIDGE_FALLBACKS=disabled run_case claude_bad_json "$repo_dir/bin/agent-turns" "$workspace" "mock bad json" 2)"
 assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
 assert_contains "$state/stdout.log" "STATUS: BLOCKED"
 assert_contains "$state/stdout.log" "claude returned unparseable/empty JSON"
@@ -239,5 +253,21 @@ assert_contains "$state/stderr.log" "does not support 'exec resume'"
 state="$(MOCK_SCENARIO=json_resume AGENT_BRIDGE_RESUME=1 run_case json_resume "$repo_dir/bin/agent-turns" "$workspace" "mock json resume" 2)"
 assert_contains "$state/stdout.log" 'Total Claude cost: $0.0300'
 assert_contains "$state/claude-args.log" "--resume sid-1"
+
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 run_case fallback_opencode "$repo_dir/bin/agent-turns" "$workspace" "mock opencode fallback" 1)"
+assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+assert_contains "$state/opencode-args.log" "--model opencode-go/minimax-m3"
+
+state="$(MOCK_SCENARIO=fallback_antigravity AGENT_BRIDGE_RESUME=0 run_case fallback_antigravity "$repo_dir/bin/agent-turns" "$workspace" "mock antigravity fallback" 1)"
+assert_contains "$state/stdout.log" "fallback: opencode unavailable"
+assert_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+assert_contains "$state/agy-args.log" "--model"
+
+state="$(MOCK_SCENARIO=skip_failed_primary AGENT_BRIDGE_RESUME=0 run_case skip_failed_primary "$repo_dir/bin/agent-turns" "$workspace" "mock failed provider skip" 2)"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+[[ "$(cat "$state/claude-count")" == "1" ]]
+[[ "$(cat "$state/codex-count")" == "2" ]]
 
 echo "mock-agent-turns: ok"
