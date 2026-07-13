@@ -19,7 +19,11 @@ mkdir -p "$(dirname "$output_file")"
 tmp_output="${output_file}.tmp.$$"
 trap 'rm -f "$tmp_output"' EXIT
 
-agy --print --model "$model" --add-dir "$workspace" < "$prompt_file" > "$tmp_output"
+skill_dir="$HOME/.local/share/agent-bridge"
+cmd=(agy --print --model "$model" --add-dir "$workspace")
+[[ -d "$skill_dir" ]] && cmd+=(--add-dir "$skill_dir")
+
+"${cmd[@]}" < "$prompt_file" > "$tmp_output"
 
 [[ -s "$tmp_output" ]] || { echo "agy returned empty output (model: $model)" >&2; exit 1; }
 grep -qE '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$tmp_output" || {

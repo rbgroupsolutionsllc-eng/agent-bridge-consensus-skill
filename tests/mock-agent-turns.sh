@@ -270,4 +270,24 @@ assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 [[ "$(cat "$state/claude-count")" == "1" ]]
 [[ "$(cat "$state/codex-count")" == "2" ]]
 
+# ask-antigravity: shared skill dir is only passed to agy when it exists.
+skill_dir_present="$tmp_root/skill-dir-present"
+skill_dir_absent="$tmp_root/skill-dir-absent"
+mkdir -p "$skill_dir_present/state" "$skill_dir_absent/state"
+prompt_file="$tmp_root/antigravity-prompt.md"
+printf 'GOAL: mock\n' > "$prompt_file"
+
+HOME="$skill_dir_present" MOCK_STATE="$skill_dir_present/state" PATH="$mockbin:$PATH" \
+  bash -c 'mkdir -p "$HOME/.local/share/agent-bridge" && "$0" "$1" "$2" "$3"' \
+  "$repo_dir/bin/ask-antigravity" "$workspace" "$prompt_file" "$skill_dir_present/out.md"
+assert_contains "$skill_dir_present/state/agy-args.log" "--add-dir $skill_dir_present/.local/share/agent-bridge"
+
+HOME="$skill_dir_absent" MOCK_STATE="$skill_dir_absent/state" PATH="$mockbin:$PATH" \
+  "$repo_dir/bin/ask-antigravity" "$workspace" "$prompt_file" "$skill_dir_absent/out.md"
+agy_args="$(cat "$skill_dir_absent/state/agy-args.log")"
+[[ "$agy_args" != *"$skill_dir_absent/.local/share/agent-bridge"* ]] || {
+  echo "expected no --add-dir for missing skill dir, got: $agy_args" >&2
+  exit 1
+}
+
 echo "mock-agent-turns: ok"

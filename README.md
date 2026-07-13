@@ -22,13 +22,18 @@ This installs the skill into:
 ```text
 ~/.codex/skills/agent-bridge-consensus/SKILL.md
 ~/.claude/skills/agent-bridge-consensus/SKILL.md
+~/.local/share/agent-bridge/SKILL.md
 ```
 
-It also appends an OpenCode judge note to:
+The third copy is a shared reference file. `agy` has no native skills directory, so `ask-antigravity` passes it via `--add-dir` on every call, when the directory exists.
+
+It also rewrites the OpenCode judge note in:
 
 ```text
 ~/.config/opencode/AGENTS.md
 ```
+
+Re-running `install-local` always replaces the `## Agent Bridge Consensus` section with the current one from this repo — the install is idempotent, not append-once.
 
 ## Use
 

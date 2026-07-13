@@ -1,41 +1,71 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
 
 mkdir -p "$HOME/.codex/skills/agent-bridge-consensus"
 mkdir -p "$HOME/.claude/skills/agent-bridge-consensus"
 mkdir -p "$HOME/.local/bin"
 mkdir -p "$HOME/.config/opencode"
+mkdir -p "$HOME/.local/share/agent-bridge"
 
+# Claude Code and Codex — full SKILL.md, loaded automatically at startup
 cp "$repo_dir/skills/agent-bridge-consensus/SKILL.md" "$HOME/.codex/skills/agent-bridge-consensus/SKILL.md"
 cp "$repo_dir/skills/agent-bridge-consensus/SKILL.md" "$HOME/.claude/skills/agent-bridge-consensus/SKILL.md"
-cp "$repo_dir/bin/agent-turns" "$HOME/.local/bin/agent-turns"
-cp "$repo_dir/bin/ask-claude" "$HOME/.local/bin/ask-claude"
-cp "$repo_dir/bin/ask-codex" "$HOME/.local/bin/ask-codex"
-cp "$repo_dir/bin/ask-opencode" "$HOME/.local/bin/ask-opencode"
-cp "$repo_dir/bin/ask-antigravity" "$HOME/.local/bin/ask-antigravity"
-chmod +x "$HOME/.local/bin/agent-turns" "$HOME/.local/bin/ask-claude" "$HOME/.local/bin/ask-codex" "$HOME/.local/bin/ask-opencode" "$HOME/.local/bin/ask-antigravity"
 
+# Shared reference file — any agent can read it; agy gets it via --add-dir per call
+cp "$repo_dir/skills/agent-bridge-consensus/SKILL.md" "$HOME/.local/share/agent-bridge/SKILL.md"
+
+# Binaries
+cp "$repo_dir/bin/agent-turns"     "$HOME/.local/bin/agent-turns"
+cp "$repo_dir/bin/ask-claude"      "$HOME/.local/bin/ask-claude"
+cp "$repo_dir/bin/ask-codex"       "$HOME/.local/bin/ask-codex"
+cp "$repo_dir/bin/ask-opencode"    "$HOME/.local/bin/ask-opencode"
+cp "$repo_dir/bin/ask-antigravity" "$HOME/.local/bin/ask-antigravity"
+chmod +x \
+  "$HOME/.local/bin/agent-turns" \
+  "$HOME/.local/bin/ask-claude" \
+  "$HOME/.local/bin/ask-codex" \
+  "$HOME/.local/bin/ask-opencode" \
+  "$HOME/.local/bin/ask-antigravity"
+
+# OpenCode — update AGENTS.md (idempotent: removes old section then re-adds)
 opencode_agents="$HOME/.config/opencode/AGENTS.md"
 touch "$opencode_agents"
-if ! grep -q "## Agent Bridge Consensus" "$opencode_agents"; then
-  cat >> "$opencode_agents" <<'EOF'
+python3 - "$opencode_agents" <<'PY'
+import sys, re
+content = open(sys.argv[1]).read()
+content = re.sub(r'\n## Agent Bridge Consensus\n.*?(?=\n## |\Z)', '', content, flags=re.DOTALL)
+open(sys.argv[1], 'w').write(content.rstrip())
+PY
+cat >> "$opencode_agents" <<'EOF'
 
 ## Agent Bridge Consensus
 
-When asked to act in the Claude/Codex/OpenCode bridge, use compact judge mode:
+You are part of a 4-agent team: Claude (implementer), Codex (reviewer), OpenCode (judge + 1st fallback), agy (2nd fallback).
 
-```text
-STATUS: VERIFIED | DISAGREE | BLOCKED | COMPLETE
-CHANGED: none unless explicitly asked to edit
-EVIDENCE: one concrete observation
-NEXT: one concrete next action or none
-HANDOFF: one sentence
+You may be called in any of these roles — check the "YOU ARE" line in each prompt:
+
+- **Judge** (default when arbitrating): return one verdict — `ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED` — with one reason.
+- **Fallback implementer** (when Claude is unavailable): make concrete progress toward the goal.
+- **Fallback reviewer** (when Codex is unavailable): independently verify the other agent's claim.
+
+Compact protocol — always respond with exactly this shape, 12 lines max, no narration:
+
+```
+STATUS: PROPOSED | VERIFIED | DISAGREE | REVISE | BLOCKED | COMPLETE
+CHANGED: files or "none"
+EVIDENCE: command/result — omit this line if "not run"
+NEXT: one concrete next action or "none"
+HANDOFF: one sentence to the next agent
 ```
 
-Default role: OpenCode is the third-party judge, not the implementer. Return one verdict when arbitrating: `ACCEPT_CLAUDE`, `ACCEPT_CODEX`, `REQUEST_REVISION`, or `BLOCKED`, with one reason.
+Token rule: protocol block only. No preamble. Do not mark COMPLETE for your own unverified work.
+VERIFIED means you independently checked the other agent's claim and it holds.
 EOF
-fi
 
 echo "Installed agent-bridge-consensus."
+echo "  Claude Code : ~/.claude/skills/agent-bridge-consensus/SKILL.md"
+echo "  Codex       : ~/.codex/skills/agent-bridge-consensus/SKILL.md"
+echo "  OpenCode    : ~/.config/opencode/AGENTS.md (## Agent Bridge Consensus)"
+echo "  agy         : ~/.local/share/agent-bridge/SKILL.md (passed per-call via --add-dir)"
