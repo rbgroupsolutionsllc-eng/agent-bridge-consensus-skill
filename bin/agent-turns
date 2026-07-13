@@ -231,8 +231,11 @@ normalize_provider() {
 #   - STATUS value must be one of: PROPOSED VERIFIED DISAGREE REVISE BLOCKED COMPLETE.
 #   - Every non-blank line in the file must be a recognized protocol field
 #     line (single-line values only) — any other line (narration before,
-#     between, or after the block) causes rejection. Blank lines are
-#     tolerated since they introduce no ambiguity.
+#     between, or after the block) causes rejection. Empty and
+#     whitespace-only lines are tolerated since they introduce no
+#     ambiguity; leading whitespace/indentation before a protocol key is
+#     NOT stripped from the line itself, so an indented key (e.g. "  STATUS:
+#     VERIFIED") is still rejected as an unrecognized line.
 _valid_status_re='^(PROPOSED|VERIFIED|DISAGREE|REVISE|BLOCKED|COMPLETE)$'
 
 validate_turn_protocol() {
@@ -243,7 +246,7 @@ validate_turn_protocol() {
   local status_v="" changed_v="" next_v="" handoff_v=""
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
+    [[ -z "${line//[[:space:]]/}" ]] && continue
     case "$line" in
       STATUS:*)   status_n=$((status_n + 1));   status_v="${line#STATUS:}" ;;
       CHANGED:*)  changed_n=$((changed_n + 1)); changed_v="${line#CHANGED:}" ;;

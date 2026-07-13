@@ -40,7 +40,9 @@ case "${MOCK_SCENARIO}" in
   fallback_opencode|fallback_antigravity|skip_failed_primary|distinct_fallback_reviewer|independent_reviewer_unavailable| \
   proto_only_status|proto_only_changed|proto_missing_handoff|proto_missing_next|proto_empty_required_value| \
   proto_invalid_status|proto_duplicate_status|proto_duplicate_handoff|proto_narration_before|proto_narration_after| \
-  proto_evidence_omitted|proto_complete|proto_malformed_then_valid|proto_all_malformed)
+  proto_evidence_omitted|proto_complete|proto_malformed_then_valid|proto_all_malformed| \
+  proto_ws_before_space|proto_ws_between_space|proto_ws_after_space|proto_ws_before_tab|proto_ws_between_tab| \
+  proto_ws_after_tab|proto_ws_between_mixed|proto_ws_indented_key)
     exit 1
     ;;
   consensus_round2|json_resume|verify_fail_gate|verify_window)
@@ -50,7 +52,7 @@ EVIDENCE: mock claude changed
 NEXT: codex verifies
 HANDOFF: verify this'
     ;;
-  judge|judge_noise)
+  judge|judge_noise|judge_clean)
     result='STATUS: DISAGREE
 CHANGED: none
 EVIDENCE: claude disagrees
@@ -115,7 +117,7 @@ case "${MOCK_SCENARIO}" in
   verify_fail_gate|verify_window)
     status="VERIFIED"
     ;;
-  judge|judge_noise)
+  judge|judge_noise|judge_clean)
     if [[ "$count" == "1" ]]; then status="DISAGREE"; else status="VERIFIED"; fi
     ;;
   *)
@@ -184,6 +186,33 @@ case "${MOCK_SCENARIO}" in
   proto_complete)
     printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock complete evidence\nNEXT: none\nHANDOFF: fallback response ready\n'
     ;;
+  proto_ws_before_space)
+    printf ' \nSTATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
+    ;;
+  proto_ws_between_space)
+    printf 'STATUS: VERIFIED\nCHANGED: none\n   \nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
+    ;;
+  proto_ws_after_space)
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n  \n'
+    ;;
+  proto_ws_before_tab)
+    printf '\t\nSTATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
+    ;;
+  proto_ws_between_tab)
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\n\t\nNEXT: none\nHANDOFF: complete\n'
+    ;;
+  proto_ws_after_tab)
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n\t\n'
+    ;;
+  proto_ws_between_mixed)
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\n \t \nNEXT: none\nHANDOFF: complete\n'
+    ;;
+  proto_ws_indented_key)
+    printf '  STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
+    ;;
+  judge_clean)
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: clean mock judge\nNEXT: apply accepted proposal\nHANDOFF: clean judge verdict issued\nVERDICT: ACCEPT_CLAUDE\n'
+    ;;
   *)
     printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock judge\nNEXT: none\nHANDOFF: verdict issued\n'
     ;;
@@ -235,6 +264,9 @@ case "${MOCK_SCENARIO:-}" in
     ;;
   proto_malformed_then_valid)
     printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy second fallback\nNEXT: none\nHANDOFF: valid second fallback response\n'
+    ;;
+  proto_ws_indented_key)
+    printf '  STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
     ;;
   *)
     printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy fallback\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
@@ -476,5 +508,53 @@ assert_contains "$state/stderr.log" "provider unavailable for this session: open
 assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
 assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
 assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+
+# --- Whitespace-only lines must be tolerated like blank lines (P2 fix) ---
+# A structurally valid protocol response must be accepted regardless of
+# spaces-only, tabs-only, or mixed-whitespace-only lines appearing before,
+# between, or after the protocol fields.
+for proto_case in \
+  proto_ws_before_space proto_ws_between_space proto_ws_after_space \
+  proto_ws_before_tab proto_ws_between_tab proto_ws_after_tab \
+  proto_ws_between_mixed
+do
+  state="$(MOCK_SCENARIO="$proto_case" AGENT_BRIDGE_RESUME=0 run_case "$proto_case" "$repo_dir/bin/agent-turns" "$workspace" "mock $proto_case" 1)"
+  assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+  assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+done
+
+# Leading whitespace/indentation before a protocol key must NOT be trimmed
+# away — an indented "  STATUS: VERIFIED" line is not a recognized field
+# line and must still be rejected, same as any other narration line.
+state="$(MOCK_SCENARIO=proto_ws_indented_key AGENT_BRIDGE_RESUME=0 run_case proto_ws_indented_key "$repo_dir/bin/agent-turns" "$workspace" "mock proto_ws_indented_key" 1)"
+assert_not_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_not_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
+assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
+assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+
+# --- Clean judge scenario: a properly anchored VERDICT line in a genuine
+# judge response must reach the next agent prompt (P2 fix). Claude and
+# Codex both DISAGREE, forcing escalation to the OpenCode judge, whose
+# response here is a clean, complete protocol block with a VERDICT line
+# (distinct from judge_noise, which exercises narration tolerance).
+state="$(MOCK_SCENARIO=judge_clean run_case judge_clean "$repo_dir/bin/agent-turns" "$workspace" "mock judge clean" 2)"
+assert_contains "$state/stdout.log" "escalating to OpenCode judge"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+# Judge escalation actually occurred: the raw judge artifact was produced.
+[[ -s "$judge_run_dir/round-1-judge.out.md" ]] || {
+  echo "expected judge artifact round-1-judge.out.md to exist" >&2
+  exit 1
+}
+# The anchored VERDICT line exists verbatim in the judge's own output.
+grep -q '^VERDICT: ACCEPT_CLAUDE$' "$judge_run_dir/round-1-judge.out.md" || {
+  echo "expected anchored VERDICT: ACCEPT_CLAUDE line in judge artifact" >&2
+  cat "$judge_run_dir/round-1-judge.out.md" >&2
+  exit 1
+}
+# The verdict propagates into the next agent's (round 2 Claude) prompt.
+assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_CLAUDE"
+assert_contains "$judge_run_dir/round-2-claude.prompt.md" "clean judge verdict issued"
 
 echo "mock-agent-turns: ok"
