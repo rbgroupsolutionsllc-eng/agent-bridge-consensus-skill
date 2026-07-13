@@ -217,6 +217,59 @@ normalize_provider() {
   printf '%s' "$p"
 }
 
+# Strict, local, deterministic validation of a normal turn protocol response
+# (STATUS/CHANGED/EVIDENCE/NEXT/HANDOFF). This is the single authoritative
+# acceptance check for fallback candidates in call_fallback below; wrapper
+# scripts (e.g. ask-antigravity) may run their own coarse pre-check to fail
+# fast, but only this function decides whether a candidate response is
+# accepted into the run. Does NOT parse or touch judge VERDICT: output.
+#
+# Contract:
+#   - STATUS, CHANGED, NEXT, HANDOFF must each appear exactly once, anchored
+#     at line start, with a non-empty value after trimming whitespace.
+#   - EVIDENCE may appear at most once (optional).
+#   - STATUS value must be one of: PROPOSED VERIFIED DISAGREE REVISE BLOCKED COMPLETE.
+#   - Every non-blank line in the file must be a recognized protocol field
+#     line (single-line values only) — any other line (narration before,
+#     between, or after the block) causes rejection. Blank lines are
+#     tolerated since they introduce no ambiguity.
+_valid_status_re='^(PROPOSED|VERIFIED|DISAGREE|REVISE|BLOCKED|COMPLETE)$'
+
+validate_turn_protocol() {
+  local file="$1"
+  [[ -s "$file" ]] || return 1
+
+  local line status_n=0 changed_n=0 evidence_n=0 next_n=0 handoff_n=0
+  local status_v="" changed_v="" next_v="" handoff_v=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      STATUS:*)   status_n=$((status_n + 1));   status_v="${line#STATUS:}" ;;
+      CHANGED:*)  changed_n=$((changed_n + 1)); changed_v="${line#CHANGED:}" ;;
+      EVIDENCE:*) evidence_n=$((evidence_n + 1)) ;;
+      NEXT:*)     next_n=$((next_n + 1));       next_v="${line#NEXT:}" ;;
+      HANDOFF:*)  handoff_n=$((handoff_n + 1)); handoff_v="${line#HANDOFF:}" ;;
+      *)
+        return 1
+        ;;
+    esac
+  done < "$file"
+
+  [[ "$status_n" -eq 1 && "$changed_n" -eq 1 && "$next_n" -eq 1 && "$handoff_n" -eq 1 ]] || return 1
+  [[ "$evidence_n" -le 1 ]] || return 1
+
+  status_v="$(printf '%s' "$status_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  changed_v="$(printf '%s' "$changed_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  next_v="$(printf '%s' "$next_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  handoff_v="$(printf '%s' "$handoff_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+  [[ -n "$status_v" && -n "$changed_v" && -n "$next_v" && -n "$handoff_v" ]] || return 1
+  [[ "$status_v" =~ $_valid_status_re ]] || return 1
+
+  return 0
+}
+
 call_claude() {
   local prompt="$1" out="$2" raw="$2.json" rc result cost
   is_failed claude && return 1
@@ -320,7 +373,7 @@ call_fallback() {
     esac
     set -e
 
-    if [[ $rc -eq 0 && -s "$candidate" ]] && grep -qE '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$candidate"; then
+    if [[ $rc -eq 0 && -s "$candidate" ]] && validate_turn_protocol "$candidate"; then
       mv "$candidate" "$out"
       echo "  fallback: $provider answered for $role"
       _last_fallback_provider="$provider"

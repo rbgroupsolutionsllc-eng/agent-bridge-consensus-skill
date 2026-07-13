@@ -37,7 +37,10 @@ if [[ "$json" == "1" && "${MOCK_SCENARIO}" == "claude_bad_json" ]]; then
 fi
 
 case "${MOCK_SCENARIO}" in
-  fallback_opencode|fallback_antigravity|skip_failed_primary|distinct_fallback_reviewer|independent_reviewer_unavailable)
+  fallback_opencode|fallback_antigravity|skip_failed_primary|distinct_fallback_reviewer|independent_reviewer_unavailable| \
+  proto_only_status|proto_only_changed|proto_missing_handoff|proto_missing_next|proto_empty_required_value| \
+  proto_invalid_status|proto_duplicate_status|proto_duplicate_handoff|proto_narration_before|proto_narration_after| \
+  proto_evidence_omitted|proto_complete|proto_malformed_then_valid|proto_all_malformed)
     exit 1
     ;;
   consensus_round2|json_resume|verify_fail_gate|verify_window)
@@ -141,11 +144,50 @@ printf '%s\n' "$*" >> "${MOCK_STATE}/opencode-args.log"
 if [[ "${MOCK_SCENARIO}" == "fallback_antigravity" ]]; then
   exit 1
 fi
-if [[ "${MOCK_SCENARIO}" == "judge_noise" ]]; then
-  printf 'noise line 1\nnoise line 2\nnoise line 3\nSTATUS: VERIFIED\nHANDOFF: judge says revise\nVERDICT: REQUEST_REVISION\n'
-else
-  printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock judge\nNEXT: none\nHANDOFF: verdict issued\nVERDICT: ACCEPT_CLAUDE\n'
-fi
+case "${MOCK_SCENARIO}" in
+  judge_noise)
+    printf 'noise line 1\nnoise line 2\nnoise line 3\nSTATUS: VERIFIED\nHANDOFF: judge says revise\nVERDICT: REQUEST_REVISION\n'
+    ;;
+  proto_only_status|proto_malformed_then_valid|proto_all_malformed)
+    printf 'STATUS: VERIFIED\n'
+    ;;
+  proto_only_changed)
+    printf 'CHANGED: none\n'
+    ;;
+  proto_missing_handoff)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\n'
+    ;;
+  proto_missing_next)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nHANDOFF: done\n'
+    ;;
+  proto_empty_required_value)
+    printf 'STATUS:\nCHANGED: none\nNEXT: none\nHANDOFF: done\n'
+    ;;
+  proto_invalid_status)
+    printf 'STATUS: SUCCESS\nCHANGED: none\nNEXT: none\nHANDOFF: done\n'
+    ;;
+  proto_duplicate_status)
+    printf 'STATUS: PROPOSED\nSTATUS: VERIFIED\nCHANGED: none\nNEXT: none\nHANDOFF: done\n'
+    ;;
+  proto_duplicate_handoff)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nHANDOFF: done again\n'
+    ;;
+  proto_narration_before)
+    printf 'Hey, quick update:\nSTATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\n'
+    ;;
+  proto_narration_after)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nThanks for reading!\n'
+    ;;
+  proto_evidence_omitted)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: fallback response ready\n'
+    ;;
+  proto_complete)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock complete evidence\nNEXT: none\nHANDOFF: fallback response ready\n'
+    ;;
+  *)
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock judge\nNEXT: none\nHANDOFF: verdict issued\n'
+    ;;
+esac
 EOF
 
 cat > "$mockbin/agy" <<'EOF'
@@ -157,11 +199,47 @@ count=0
 count=$((count + 1))
 echo "$count" > "$count_file"
 printf '%s\n' "$*" >> "${MOCK_STATE}/agy-args.log"
-if [[ "${MOCK_SCENARIO:-}" == "distinct_fallback_reviewer" ]]; then
-  printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock agy independent review\nNEXT: none\nHANDOFF: reviewed independently as a distinct provider\n'
-else
-  printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy fallback\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
-fi
+case "${MOCK_SCENARIO:-}" in
+  distinct_fallback_reviewer)
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock agy independent review\nNEXT: none\nHANDOFF: reviewed independently as a distinct provider\n'
+    ;;
+  proto_only_status|proto_all_malformed)
+    printf 'STATUS: VERIFIED\n'
+    ;;
+  proto_only_changed)
+    printf 'CHANGED: none\n'
+    ;;
+  proto_missing_handoff)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\n'
+    ;;
+  proto_missing_next)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nHANDOFF: done\n'
+    ;;
+  proto_empty_required_value)
+    printf 'STATUS:\nCHANGED: none\nNEXT: none\nHANDOFF: done\n'
+    ;;
+  proto_invalid_status)
+    printf 'STATUS: SUCCESS\nCHANGED: none\nNEXT: none\nHANDOFF: done\n'
+    ;;
+  proto_duplicate_status)
+    printf 'STATUS: PROPOSED\nSTATUS: VERIFIED\nCHANGED: none\nNEXT: none\nHANDOFF: done\n'
+    ;;
+  proto_duplicate_handoff)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nHANDOFF: done again\n'
+    ;;
+  proto_narration_before)
+    printf 'Hey, quick update:\nSTATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\n'
+    ;;
+  proto_narration_after)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nThanks for reading!\n'
+    ;;
+  proto_malformed_then_valid)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy second fallback\nNEXT: none\nHANDOFF: valid second fallback response\n'
+    ;;
+  *)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy fallback\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
+    ;;
+esac
 EOF
 
 cat > "$mockbin/jq" <<'EOF'
@@ -337,5 +415,66 @@ if grep -Fq -- "=== Done: CONSENSUS ===" "$state/stdout.log"; then
 fi
 opencode_calls="$(cat "$state/opencode-count")"
 [[ "$opencode_calls" == "1" ]] || { echo "expected opencode invoked exactly once, got $opencode_calls" >&2; exit 1; }
+
+assert_not_contains() {
+  local file="$1" pattern="$2"
+  if grep -Fq -- "$pattern" "$file"; then
+    echo "unexpected pattern found: $pattern" >&2
+    echo "--- $file ---" >&2
+    cat "$file" >&2
+    exit 1
+  fi
+}
+
+# --- Strict turn protocol validation (P1 fix) ---------------------------
+# Primary Claude/Codex are made to fail so every case below exercises
+# call_fallback's acceptance check directly. Both opencode and agy (the
+# default AGENT_BRIDGE_FALLBACKS chain) return the same malformed body for
+# the pure-rejection cases so the outcome is deterministic regardless of
+# fallback order: neither provider's malformed output may be accepted, both
+# get marked unavailable, and the run must fail closed (no CONSENSUS).
+for proto_case in \
+  proto_only_status proto_only_changed proto_missing_handoff proto_missing_next \
+  proto_empty_required_value proto_invalid_status proto_duplicate_status \
+  proto_duplicate_handoff proto_narration_before proto_narration_after
+do
+  state="$(MOCK_SCENARIO="$proto_case" AGENT_BRIDGE_RESUME=0 run_case "$proto_case" "$repo_dir/bin/agent-turns" "$workspace" "mock $proto_case" 1)"
+  assert_not_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+  assert_not_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+  assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+  assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
+  assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
+  assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+done
+
+# EVIDENCE is optional: a complete protocol response missing EVIDENCE must
+# still be accepted.
+state="$(MOCK_SCENARIO=proto_evidence_omitted AGENT_BRIDGE_RESUME=0 run_case proto_evidence_omitted "$repo_dir/bin/agent-turns" "$workspace" "mock proto_evidence_omitted" 1)"
+assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+
+# Fully complete protocol (all five fields, EVIDENCE included once) must be
+# accepted.
+state="$(MOCK_SCENARIO=proto_complete AGENT_BRIDGE_RESUME=0 run_case proto_complete "$repo_dir/bin/agent-turns" "$workspace" "mock proto_complete" 1)"
+assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+
+# First fallback (opencode) returns a malformed/partial protocol and must be
+# marked unavailable; the chain must proceed to the next fallback (agy),
+# whose complete valid protocol is accepted and the run continues normally.
+state="$(MOCK_SCENARIO=proto_malformed_then_valid AGENT_BRIDGE_RESUME=0 run_case proto_malformed_then_valid "$repo_dir/bin/agent-turns" "$workspace" "mock proto_malformed_then_valid" 1)"
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_not_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+
+# Every configured fallback returns a malformed/partial protocol: no
+# malformed response may be accepted, no CONSENSUS may be emitted, and the
+# run must terminate in a deterministic non-success state.
+state="$(MOCK_SCENARIO=proto_all_malformed AGENT_BRIDGE_RESUME=0 run_case proto_all_malformed "$repo_dir/bin/agent-turns" "$workspace" "mock proto_all_malformed" 1)"
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
+assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
+assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 
 echo "mock-agent-turns: ok"

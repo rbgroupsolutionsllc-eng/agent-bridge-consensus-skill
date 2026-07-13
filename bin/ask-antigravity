@@ -26,6 +26,11 @@ cmd=(agy --print --model "$model" --add-dir "$workspace")
 "${cmd[@]}" < "$prompt_file" > "$tmp_output"
 
 [[ -s "$tmp_output" ]] || { echo "agy returned empty output (model: $model)" >&2; exit 1; }
+# Coarse pre-check only: fail fast when no protocol field is present at all.
+# This is NOT the authoritative protocol validator — bin/agent-turns'
+# validate_turn_protocol() (used in call_fallback) is authoritative and
+# re-validates this output (full structure, required fields exactly once,
+# allowed STATUS values, no narration) before it is ever accepted.
 grep -qE '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$tmp_output" || {
   echo "agy output missing bridge protocol; head: $(head -3 "$tmp_output")" >&2
   exit 1
