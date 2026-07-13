@@ -101,6 +101,7 @@ OpenCode and `agy` both enforce model selection via `--model`. Run `opencode mod
 5. If disagreement persists, call OpenCode as judge.
 6. After judge verdict, one agent makes the smallest needed change and the other verifies.
 7. If Claude or Codex is unavailable, try OpenCode and then Antigravity automatically.
+8. A provider that already served as implementer this round is excluded from reviewer fallback selection the same round — it can never review its own implementation. If no distinct provider identity remains to review, the run fails closed (`NO_INDEPENDENT_REVIEWER`) instead of declaring consensus.
 
 ## Token Budget
 
@@ -110,4 +111,4 @@ OpenCode and `agy` both enforce model selection via `--model`. Run `opencode mod
 
 The orchestrator only propagates the 5 protocol fields from recent turns. Do not paste logs; reference files in the run artifacts directory.
 
-Final states are `CONSENSUS`, `BLOCKED`, `VERIFY_FAILING`, `CLAUDE_ERROR`, `CODEX_ERROR`, and `MAX_ROUNDS`.
+Final states are `CONSENSUS`, `BLOCKED`, `VERIFY_FAILING`, `CLAUDE_ERROR`, `CODEX_ERROR`, `NO_INDEPENDENT_REVIEWER`, and `MAX_ROUNDS`. `NO_INDEPENDENT_REVIEWER` means the implementer's provider identity was the only remaining fallback candidate for review, so the orchestrator refused to fabricate consensus via self-review.

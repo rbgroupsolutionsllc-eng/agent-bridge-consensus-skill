@@ -37,7 +37,7 @@ if [[ "$json" == "1" && "${MOCK_SCENARIO}" == "claude_bad_json" ]]; then
 fi
 
 case "${MOCK_SCENARIO}" in
-  fallback_opencode|fallback_antigravity|skip_failed_primary)
+  fallback_opencode|fallback_antigravity|skip_failed_primary|distinct_fallback_reviewer|independent_reviewer_unavailable)
     exit 1
     ;;
   consensus_round2|json_resume|verify_fail_gate|verify_window)
@@ -100,6 +100,12 @@ done
 [[ -n "$out" ]] || { echo "missing --output-last-message" >&2; exit 2; }
 
 case "${MOCK_SCENARIO}" in
+  distinct_fallback_reviewer|independent_reviewer_unavailable)
+    exit 1
+    ;;
+esac
+
+case "${MOCK_SCENARIO}" in
   consensus_round2|json_resume|skip_failed_primary)
     if [[ "$count" == "1" ]]; then status="DISAGREE"; else status="VERIFIED"; fi
     ;;
@@ -126,6 +132,11 @@ EOF
 cat > "$mockbin/opencode" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+count_file="${MOCK_STATE}/opencode-count"
+count=0
+[[ -f "$count_file" ]] && count="$(cat "$count_file")"
+count=$((count + 1))
+echo "$count" > "$count_file"
 printf '%s\n' "$*" >> "${MOCK_STATE}/opencode-args.log"
 if [[ "${MOCK_SCENARIO}" == "fallback_antigravity" ]]; then
   exit 1
@@ -140,8 +151,17 @@ EOF
 cat > "$mockbin/agy" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+count_file="${MOCK_STATE}/agy-count"
+count=0
+[[ -f "$count_file" ]] && count="$(cat "$count_file")"
+count=$((count + 1))
+echo "$count" > "$count_file"
 printf '%s\n' "$*" >> "${MOCK_STATE}/agy-args.log"
-printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy fallback\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
+if [[ "${MOCK_SCENARIO:-}" == "distinct_fallback_reviewer" ]]; then
+  printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock agy independent review\nNEXT: none\nHANDOFF: reviewed independently as a distinct provider\n'
+else
+  printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy fallback\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
+fi
 EOF
 
 cat > "$mockbin/jq" <<'EOF'
@@ -289,5 +309,33 @@ agy_args="$(cat "$skill_dir_absent/state/agy-args.log")"
   echo "expected no --add-dir for missing skill dir, got: $agy_args" >&2
   exit 1
 }
+
+# P0 regression: implementer provider must never also serve as reviewer in
+# the same round. Claude and Codex both fail; OpenCode fills in as the
+# fallback implementer; OpenCode must be excluded from reviewer fallback
+# selection so a distinct provider (agy) performs the independent review.
+state="$(MOCK_SCENARIO=distinct_fallback_reviewer AGENT_BRIDGE_RESUME=0 run_case distinct_fallback_reviewer "$repo_dir/bin/agent-turns" "$workspace" "mock distinct fallback reviewer" 1)"
+assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "fallback: agy answered for Codex reviewer"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+opencode_calls="$(cat "$state/opencode-count")"
+agy_calls="$(cat "$state/agy-count")"
+[[ "$opencode_calls" == "1" ]] || { echo "expected opencode invoked exactly once, got $opencode_calls" >&2; exit 1; }
+[[ "$agy_calls" == "1" ]] || { echo "expected agy invoked exactly once, got $agy_calls" >&2; exit 1; }
+
+# P0 regression: when the only configured fallback already served as
+# implementer, no distinct reviewer identity remains. The orchestrator must
+# fail closed instead of accepting the implementer's own provider as the
+# reviewer.
+state="$(MOCK_SCENARIO=independent_reviewer_unavailable AGENT_BRIDGE_RESUME=0 AGENT_BRIDGE_FALLBACKS=opencode run_case independent_reviewer_unavailable "$repo_dir/bin/agent-turns" "$workspace" "mock independent reviewer unavailable" 1)"
+assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "independent reviewer unavailable"
+if grep -Fq -- "=== Done: CONSENSUS ===" "$state/stdout.log"; then
+  echo "expected no CONSENSUS terminal state, but found one" >&2
+  cat "$state/stdout.log" >&2
+  exit 1
+fi
+opencode_calls="$(cat "$state/opencode-count")"
+[[ "$opencode_calls" == "1" ]] || { echo "expected opencode invoked exactly once, got $opencode_calls" >&2; exit 1; }
 
 echo "mock-agent-turns: ok"

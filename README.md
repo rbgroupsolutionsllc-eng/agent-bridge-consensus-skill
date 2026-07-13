@@ -88,8 +88,10 @@ Both OpenCode and `agy` enforce model selection via `--model`. Run `opencode mod
 
 Any provider that fails (any exit code, timeout, or empty response) is automatically marked unavailable for the rest of the session. The fallback chain retries remaining providers without operator intervention.
 
+**Independent review enforcement:** the orchestrator tracks the actual provider identity (not role labels, filenames, PIDs, response content, or call order) that fulfilled the implementer role each round. That identity is excluded from reviewer fallback selection for the same round — a provider can never review its own implementation. If no distinct provider identity remains to serve as reviewer (all other fallbacks failed or the only fallback already implemented), the run fails closed as `NO_INDEPENDENT_REVIEWER` rather than emitting `CONSENSUS`. This exclusion is round-scoped only: an excluded provider is not marked failed and remains eligible in later rounds or other roles.
+
 Final states:
 
 ```text
-CONSENSUS | BLOCKED | VERIFY_FAILING | CLAUDE_ERROR | CODEX_ERROR | MAX_ROUNDS
+CONSENSUS | BLOCKED | VERIFY_FAILING | CLAUDE_ERROR | CODEX_ERROR | NO_INDEPENDENT_REVIEWER | MAX_ROUNDS
 ```

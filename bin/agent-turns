@@ -203,6 +203,20 @@ build_prompt() {
 claude_session_id=""
 total_cost="0"
 
+# Round-scoped provider-identity tracking (independent-review enforcement).
+# Canonical identities: claude, codex, opencode, agy. Aliases (e.g.
+# "antigravity") are normalized to their canonical form before any
+# comparison. This is keyed strictly on which actual provider produced the
+# accepted output for a role — never on role text, filename, PID, response
+# content, model self-claims, or call order.
+_last_fallback_provider=""
+
+normalize_provider() {
+  local p="${1//[[:space:]]/}"
+  [[ "$p" == "antigravity" ]] && p="agy"
+  printf '%s' "$p"
+}
+
 call_claude() {
   local prompt="$1" out="$2" raw="$2.json" rc result cost
   is_failed claude && return 1
@@ -263,16 +277,27 @@ call_codex() {
 }
 
 call_fallback() {
-  local role="$1" prompt="$2" out="$3" provider rc candidate
+  # $4 (exclude) is the provider identity that already fulfilled a role this
+  # round (e.g. the implementer). It must never be selected again as the
+  # reviewer for the same round. Exclusion is round-scoped and MUST NOT be
+  # recorded via mark_failed: an excluded provider did not fail, and must
+  # remain eligible for other rounds/roles where independence is not at risk.
+  local role="$1" prompt="$2" out="$3" exclude provider rc candidate
+  exclude="$(normalize_provider "${4:-}")"
   local -a providers
   IFS=',' read -r -a providers <<< "$fallbacks"
 
+  _last_fallback_provider=""
+
   for provider in "${providers[@]}"; do
-    provider="${provider//[[:space:]]/}"
-    [[ "$provider" == "antigravity" ]] && provider="agy"
+    provider="$(normalize_provider "$provider")"
     [[ -n "$provider" ]] || continue
     if is_failed "$provider"; then
       echo "  fallback: skipping $provider (unavailable this session)"
+      continue
+    fi
+    if [[ -n "$exclude" && "$provider" == "$exclude" ]]; then
+      echo "  fallback: skipping $provider (already participated this round as a different role; independent review requires a distinct provider identity)"
       continue
     fi
     echo "  fallback: trying $provider for $role..."
@@ -298,6 +323,7 @@ call_fallback() {
     if [[ $rc -eq 0 && -s "$candidate" ]] && grep -qE '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$candidate"; then
       mv "$candidate" "$out"
       echo "  fallback: $provider answered for $role"
+      _last_fallback_provider="$provider"
       return 0
     fi
     rm -f "$candidate"
@@ -369,6 +395,8 @@ codex_status=""
 
 for ((round=1; round<=rounds; round++)); do
   round_verify_failed=0
+  impl_provider=""
+  review_provider=""
 
   printf '\n=== Round %d: Claude ===\n' "$round"
   c_prompt="$run_dir/round-${round}-claude.prompt.md"
@@ -378,12 +406,15 @@ for ((round=1; round<=rounds; round++)); do
     "Modify the workspace only if needed."
   if ! call_claude "$c_prompt" "$c_out"; then
     echo "  claude unavailable; starting automatic fallback"
-    if ! call_fallback "Claude implementer" "$c_prompt" "$c_out"; then
+    if ! call_fallback "Claude implementer" "$c_prompt" "$c_out" ""; then
       [[ -s "$c_out" ]] || synth_block "$c_out" "Claude and configured fallback providers failed"
       push_handoff "Round $round - Claude" "$c_out"
       final_state="CLAUDE_ERROR"
       break
     fi
+    impl_provider="$_last_fallback_provider"
+  else
+    impl_provider="claude"
   fi
   push_handoff "Round $round - Claude" "$c_out"
   claude_status="$(get_status "$c_out")"
@@ -398,17 +429,32 @@ for ((round=1; round<=rounds; round++)); do
   build_prompt "$x_prompt" "Codex (reviewer/verifier)" "$verify_hint"
   if ! call_codex "$x_prompt" "$x_out"; then
     echo "  codex unavailable; starting automatic fallback"
-    if ! call_fallback "Codex reviewer" "$x_prompt" "$x_out"; then
+    if ! call_fallback "Codex reviewer" "$x_prompt" "$x_out" "$impl_provider"; then
       [[ -s "$x_out" ]] || synth_block "$x_out" "Codex and configured fallback providers failed"
       push_handoff "Round $round - Codex" "$x_out"
-      final_state="CODEX_ERROR"
+      push_note "INDEPENDENT REVIEW UNAVAILABLE (round $round): implementer provider '$impl_provider' has no distinct fallback provider left to serve as reviewer; refusing to emit consensus"
+      echo "  independent reviewer unavailable: no distinct provider identity remains to review '$impl_provider' this round"
+      final_state="NO_INDEPENDENT_REVIEWER"
       break
     fi
+    review_provider="$_last_fallback_provider"
+  else
+    review_provider="codex"
   fi
   push_handoff "Round $round - Codex" "$x_out"
   codex_status="$(get_status "$x_out")"
   echo "  codex STATUS: ${codex_status:-?}"
   [[ -n "$verify_cmd" ]] && changed_something "$x_out" && run_verify "$round" codex
+
+  # Defense in depth: even if selection logic above is ever bypassed, never
+  # accept a reviewer identity that matches the implementer identity for
+  # this round. Independence is decided by provider identity alone.
+  if [[ -n "$review_provider" && -n "$impl_provider" && "$review_provider" == "$impl_provider" ]]; then
+    push_note "ORCHESTRATOR REJECTED (round $round): reviewer provider '$review_provider' is the same identity that implemented this round; independent review unavailable"
+    echo "  independent reviewer unavailable: provider '$review_provider' cannot review its own implementation"
+    final_state="NO_INDEPENDENT_REVIEWER"
+    break
+  fi
 
   case "$codex_status" in
     VERIFIED|COMPLETE)
