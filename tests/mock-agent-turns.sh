@@ -42,7 +42,7 @@ case "${MOCK_SCENARIO}" in
   proto_invalid_status|proto_duplicate_status|proto_duplicate_handoff|proto_narration_before|proto_narration_after| \
   proto_evidence_omitted|proto_complete|proto_malformed_then_valid|proto_all_malformed| \
   proto_ws_before_space|proto_ws_between_space|proto_ws_after_space|proto_ws_before_tab|proto_ws_between_tab| \
-  proto_ws_after_tab|proto_ws_between_mixed|proto_ws_indented_key)
+  proto_ws_after_tab|proto_ws_between_mixed|proto_ws_indented_key|proto_verdict_line)
     exit 1
     ;;
   consensus_round2|json_resume|verify_fail_gate|verify_window)
@@ -52,7 +52,7 @@ EVIDENCE: mock claude changed
 NEXT: codex verifies
 HANDOFF: verify this'
     ;;
-  judge|judge_noise|judge_clean)
+  judge|judge_noise|judge_clean|judgeproto_*)
     result='STATUS: DISAGREE
 CHANGED: none
 EVIDENCE: claude disagrees
@@ -117,7 +117,7 @@ case "${MOCK_SCENARIO}" in
   verify_fail_gate|verify_window)
     status="VERIFIED"
     ;;
-  judge|judge_noise|judge_clean)
+  judge|judge_noise|judge_clean|judgeproto_*)
     if [[ "$count" == "1" ]]; then status="DISAGREE"; else status="VERIFIED"; fi
     ;;
   *)
@@ -210,8 +210,16 @@ case "${MOCK_SCENARIO}" in
   proto_ws_indented_key)
     printf '  STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
     ;;
+  proto_verdict_line)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nVERDICT: ACCEPT_CLAUDE\n'
+    ;;
   judge_clean)
     printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: clean mock judge\nNEXT: apply accepted proposal\nHANDOFF: clean judge verdict issued\nVERDICT: ACCEPT_CLAUDE\n'
+    ;;
+  judgeproto_*)
+    if [[ -n "${MOCK_JUDGE_BODY_OPENCODE:-}" && -f "${MOCK_JUDGE_BODY_OPENCODE:-}" ]]; then
+      cat "$MOCK_JUDGE_BODY_OPENCODE"
+    fi
     ;;
   *)
     printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock judge\nNEXT: none\nHANDOFF: verdict issued\n'
@@ -267,6 +275,20 @@ case "${MOCK_SCENARIO:-}" in
     ;;
   proto_ws_indented_key)
     printf '  STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
+    ;;
+  proto_verdict_line)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nVERDICT: ACCEPT_CLAUDE\n'
+    ;;
+  judge_noise)
+    # OpenCode's decoy/noise output is invalid and rejected; agy is the
+    # distinct fallback judge that returns a complete, valid protocol with a
+    # real anchored VERDICT line.
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock agy judge\nNEXT: none\nHANDOFF: judge says revise\nVERDICT: REQUEST_REVISION\n'
+    ;;
+  judgeproto_*)
+    if [[ -n "${MOCK_JUDGE_BODY_AGY:-}" && -f "${MOCK_JUDGE_BODY_AGY:-}" ]]; then
+      cat "$MOCK_JUDGE_BODY_AGY"
+    fi
     ;;
   *)
     printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy fallback\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
@@ -347,6 +369,16 @@ assert_section_count() {
   }
 }
 
+assert_not_contains() {
+  local file="$1" pattern="$2"
+  if grep -Fq -- "$pattern" "$file"; then
+    echo "unexpected pattern found: $pattern" >&2
+    echo "--- $file ---" >&2
+    cat "$file" >&2
+    exit 1
+  fi
+}
+
 state="$(MOCK_SCENARIO=consensus_round2 run_case consensus_round2 "$repo_dir/bin/agent-turns" "$workspace" "mock consensus" 3)"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 assert_contains "$state/stdout.log" 'Total Claude cost: $0.0300'
@@ -355,8 +387,18 @@ assert_contains "$state/stdout.log" 'Total Claude cost: $0.0300'
 state="$(MOCK_SCENARIO=judge_noise run_case judge_noise "$repo_dir/bin/agent-turns" "$workspace" "mock judge" 2)"
 assert_contains "$state/stdout.log" "escalating to OpenCode judge"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+# OpenCode's decoy narration (STATUS anchored, no VERDICT, narration lines,
+# missing CHANGED/NEXT) is structurally invalid and must be rejected, not
+# accepted merely because a STATUS: line exists somewhere in the text.
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_contains "$state/stdout.log" "judge: OpenCode unavailable, trying agy"
+# agy is the distinct fallback judge and its real, anchored VERDICT
+# propagates into the next round's prompt.
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: REQUEST_REVISION"
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "HANDOFF: judge says revise"
+# The decoy "ACCEPT_CODEX" narration from OpenCode's rejected output must
+# never surface as a verdict token in the propagated prompt.
+assert_not_contains "$judge_run_dir/round-2-claude.prompt.md" "ACCEPT_CODEX"
 
 state="$(MOCK_SCENARIO=verify_fail_gate AGENT_BRIDGE_VERIFY_CMD='exit 1' run_case verify_fail_gate "$repo_dir/bin/agent-turns" "$workspace" "mock verify fail" 2)"
 assert_contains "$state/stdout.log" "consensus REJECTED: verify failing"
@@ -447,16 +489,6 @@ if grep -Fq -- "=== Done: CONSENSUS ===" "$state/stdout.log"; then
 fi
 opencode_calls="$(cat "$state/opencode-count")"
 [[ "$opencode_calls" == "1" ]] || { echo "expected opencode invoked exactly once, got $opencode_calls" >&2; exit 1; }
-
-assert_not_contains() {
-  local file="$1" pattern="$2"
-  if grep -Fq -- "$pattern" "$file"; then
-    echo "unexpected pattern found: $pattern" >&2
-    echo "--- $file ---" >&2
-    cat "$file" >&2
-    exit 1
-  fi
-}
 
 # --- Strict turn protocol validation (P1 fix) ---------------------------
 # Primary Claude/Codex are made to fail so every case below exercises
@@ -556,5 +588,302 @@ grep -q '^VERDICT: ACCEPT_CLAUDE$' "$judge_run_dir/round-1-judge.out.md" || {
 # The verdict propagates into the next agent's (round 2 Claude) prompt.
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_CLAUDE"
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "clean judge verdict issued"
+
+write_judge_body() {
+  local path="$1"
+  shift
+  printf '%s\n' "$@" > "$path"
+}
+
+judge_count=0
+run_judge_case() {
+  # run_judge_case <name> <opencode-body-file-or-empty> <agy-body-file-or-empty> <rounds>
+  # Default rounds=1: with only one round, the judge note is always among
+  # the last two handoff sections (never evicted by trim_handoff), so
+  # handoff.md reliably reflects the judge outcome at run end. Tests that
+  # need to see propagation into a SUBSEQUENT round's prompt pass rounds=2
+  # explicitly and assert against the round-2 prompt file instead (built
+  # before that round's own trims run).
+  local name="$1" rounds="${4:-1}"
+  judge_count=$((judge_count + 1))
+  MOCK_SCENARIO="judgeproto_$name" MOCK_JUDGE_BODY_OPENCODE="$2" MOCK_JUDGE_BODY_AGY="$3" \
+    run_case "judgeproto_$name" "$repo_dir/bin/agent-turns" "$workspace" "mock judgeproto $name" "$rounds"
+}
+
+# ==========================================================================
+# STRICT JUDGE VERDICT VALIDATION (P1 fix)
+#
+# A judge response is accepted only when it satisfies the complete judge
+# protocol: STATUS/CHANGED/NEXT/HANDOFF/VERDICT exactly once each, EVIDENCE
+# 0-1 times, allowed STATUS/VERDICT enums, no narration/unknown lines, no
+# Markdown fences. Verdict tokens appearing in narration or other fields
+# must never be picked up as the verdict. Applies uniformly to the OpenCode
+# primary judge and the agy fallback judge.
+# ==========================================================================
+
+# --- RED regression: decoy narration without an anchored VERDICT line must
+# never manufacture a false verdict (this exact case was PROVEN to leak
+# "VERDICT: ACCEPT_CODEX" into the next round's prompt before this fix,
+# via the pre-fix whole-file token search in judge_summary combined with the
+# pre-fix acceptance check that only required an anchored STATUS: or
+# VERDICT: line ANYWHERE).
+decoy_no_verdict_body="$tmp_root/judgeproto-decoy-no-verdict.md"
+write_judge_body "$decoy_no_verdict_body" \
+  'STATUS: VERIFIED' \
+  'CHANGED: none' \
+  'EVIDENCE: ACCEPT_CODEX was considered but rejected' \
+  'NEXT: none' \
+  'HANDOFF: judge reviewed both proposals'
+state="$(run_judge_case decoy_narration_no_verdict "$decoy_no_verdict_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
+[[ ! -e "$judge_run_dir/round-1-judge.out.md" ]] || {
+  echo "expected invalid judge artifact to be removed, but it survived" >&2
+  exit 1
+}
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+assert_not_contains "$judge_run_dir/handoff.md" "ACCEPT_CODEX"
+
+# --- Incomplete protocol shapes must all be rejected ---------------------
+judge_status_only_body="$tmp_root/judgeproto-status-only.md"
+write_judge_body "$judge_status_only_body" 'STATUS: VERIFIED'
+state="$(run_judge_case status_only "$judge_status_only_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+judge_verdict_only_body="$tmp_root/judgeproto-verdict-only.md"
+write_judge_body "$judge_verdict_only_body" 'VERDICT: ACCEPT_CLAUDE'
+state="$(run_judge_case verdict_only "$judge_verdict_only_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+judge_empty_verdict_body="$tmp_root/judgeproto-empty-verdict.md"
+write_judge_body "$judge_empty_verdict_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' 'VERDICT:'
+state="$(run_judge_case empty_verdict "$judge_empty_verdict_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+judge_ws_verdict_body="$tmp_root/judgeproto-ws-verdict.md"
+write_judge_body "$judge_ws_verdict_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' 'VERDICT:    '
+state="$(run_judge_case whitespace_verdict "$judge_ws_verdict_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+# --- Invalid VERDICT tokens (enum enforcement) ---------------------------
+invalid_verdict_idx=0
+for bad_token in "ACCEPT_BOTH" "SUCCESS" "VERIFIED" "1"; do
+  invalid_verdict_idx=$((invalid_verdict_idx + 1))
+  body="$tmp_root/judgeproto-invalid-verdict-$invalid_verdict_idx.md"
+  write_judge_body "$body" \
+    'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' "VERDICT: $bad_token"
+  state="$(run_judge_case "invalid_verdict_$invalid_verdict_idx" "$body" "")"
+  judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+  assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+  assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+done
+
+# --- Case sensitivity: lowercase verdict rejected -------------------------
+judge_lowercase_body="$tmp_root/judgeproto-lowercase.md"
+write_judge_body "$judge_lowercase_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' 'VERDICT: accept_claude'
+state="$(run_judge_case lowercase_verdict "$judge_lowercase_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+# --- Extended/trailing-content verdict lines rejected ---------------------
+extended_idx=0
+for bad_line in "VERDICT: ACCEPT_CLAUDE extra" "VERDICT: ACCEPT_CLAUDE:" "VERDICT: ACCEPT_CLAUDE REQUEST_REVISION"; do
+  extended_idx=$((extended_idx + 1))
+  body="$tmp_root/judgeproto-extended-$extended_idx.md"
+  write_judge_body "$body" 'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' "$bad_line"
+  state="$(run_judge_case "extended_verdict_$extended_idx" "$body" "")"
+  judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+  assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+  assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+done
+
+# --- Duplicate VERDICT line rejected --------------------------------------
+judge_dup_verdict_body="$tmp_root/judgeproto-dup-verdict.md"
+write_judge_body "$judge_dup_verdict_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' \
+  'VERDICT: ACCEPT_CLAUDE' 'VERDICT: ACCEPT_CODEX'
+state="$(run_judge_case duplicate_verdict "$judge_dup_verdict_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+# --- Decoy token in EVIDENCE (no VERDICT line) rejected -------------------
+judge_decoy_evidence_body="$tmp_root/judgeproto-decoy-evidence.md"
+write_judge_body "$judge_decoy_evidence_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' \
+  'EVIDENCE: ACCEPT_CODEX appeared in a prior proposal' \
+  'NEXT: none' 'HANDOFF: done'
+state="$(run_judge_case decoy_in_evidence "$judge_decoy_evidence_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+assert_not_contains "$judge_run_dir/handoff.md" "ACCEPT_CODEX"
+
+# --- Decoy token in HANDOFF (no VERDICT line) rejected ---------------------
+judge_decoy_handoff_body="$tmp_root/judgeproto-decoy-handoff.md"
+write_judge_body "$judge_decoy_handoff_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' \
+  'HANDOFF: do not use ACCEPT_CLAUDE yet'
+state="$(run_judge_case decoy_in_handoff "$judge_decoy_handoff_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+assert_not_contains "$judge_run_dir/handoff.md" "VERDICT: ACCEPT_CLAUDE"
+
+# --- Malformed key spellings rejected --------------------------------------
+malformed_idx=0
+for bad_key_line in "XVERDICT: ACCEPT_CLAUDE" "VERDICT : ACCEPT_CLAUDE" " VERDICT: ACCEPT_CLAUDE" "VERDICTX: ACCEPT_CLAUDE"; do
+  malformed_idx=$((malformed_idx + 1))
+  body="$tmp_root/judgeproto-malformed-key-$malformed_idx.md"
+  write_judge_body "$body" 'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' "$bad_key_line"
+  state="$(run_judge_case "malformed_key_$malformed_idx" "$body" "")"
+  judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+  assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+  assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+done
+
+# --- Unknown extra line rejected (protocol otherwise complete/valid) ------
+judge_unknown_line_body="$tmp_root/judgeproto-unknown-line.md"
+write_judge_body "$judge_unknown_line_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' \
+  'VERDICT: ACCEPT_CLAUDE' 'NOTE: extra explanation'
+state="$(run_judge_case unknown_line "$judge_unknown_line_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+# --- Markdown-fenced protocol rejected -------------------------------------
+judge_fence_body="$tmp_root/judgeproto-fence.md"
+write_judge_body "$judge_fence_body" \
+  '```' 'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' \
+  'VERDICT: ACCEPT_CLAUDE' '```'
+state="$(run_judge_case markdown_fence "$judge_fence_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+# --- Duplicate STATUS line rejected ----------------------------------------
+judge_dup_status_body="$tmp_root/judgeproto-dup-status.md"
+write_judge_body "$judge_dup_status_body" \
+  'STATUS: VERIFIED' 'STATUS: BLOCKED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' \
+  'VERDICT: ACCEPT_CLAUDE'
+state="$(run_judge_case duplicate_status "$judge_dup_status_body" "")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+
+# --- Missing required field (each of the 5 independently) rejected --------
+missing_idx=0
+for field in STATUS CHANGED NEXT HANDOFF VERDICT; do
+  missing_idx=$((missing_idx + 1))
+  declare -a full_lines=('STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' 'VERDICT: ACCEPT_CLAUDE')
+  declare -a filtered=()
+  for l in "${full_lines[@]}"; do
+    [[ "$l" == "$field:"* ]] && continue
+    filtered+=("$l")
+  done
+  body="$tmp_root/judgeproto-missing-$missing_idx.md"
+  write_judge_body "$body" "${filtered[@]}"
+  state="$(run_judge_case "missing_${field}" "$body" "")"
+  judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+  assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+  assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+done
+
+# --- Each allowed verdict individually accepted, correct verdict extracted
+for verdict in ACCEPT_CLAUDE ACCEPT_CODEX REQUEST_REVISION BLOCKED; do
+  body="$tmp_root/judgeproto-valid-$verdict.md"
+  write_judge_body "$body" \
+    'STATUS: VERIFIED' 'CHANGED: none' 'EVIDENCE: reviewed both proposals' \
+    'NEXT: apply the accepted verdict' "HANDOFF: valid $verdict verdict" "VERDICT: $verdict"
+  state="$(run_judge_case "valid_$verdict" "$body" "" 2)"
+  judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+  # round-2-claude.prompt.md is built from the handoff BEFORE round 2's own
+  # sections are pushed/trimmed, so it reliably captures round 1's judge
+  # verdict propagation regardless of later trim_handoff eviction.
+  assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: $verdict"
+done
+
+# --- Decoy token in EVIDENCE PLUS a real anchored VERDICT: only the
+# anchored verdict may propagate; the decoy token must never become the
+# verdict or appear as a VERDICT: line itself.
+decoy_plus_real_body="$tmp_root/judgeproto-decoy-plus-real.md"
+write_judge_body "$decoy_plus_real_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' \
+  'EVIDENCE: ACCEPT_CODEX was discussed but not selected' \
+  'NEXT: none' 'HANDOFF: only the anchored verdict counts' \
+  'VERDICT: REQUEST_REVISION'
+state="$(run_judge_case decoy_plus_real_verdict "$decoy_plus_real_body" "" 2)"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: REQUEST_REVISION"
+assert_not_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_CODEX"
+
+# --- OpenCode judge invalid, agy judge valid: agy's verdict propagates,
+# OpenCode's malformed output contributes nothing.
+agy_valid_body="$tmp_root/judgeproto-agy-valid.md"
+write_judge_body "$agy_valid_body" \
+  'STATUS: VERIFIED' 'CHANGED: none' 'EVIDENCE: agy independent judge review' \
+  'NEXT: none' 'HANDOFF: agy fallback judge verdict' 'VERDICT: ACCEPT_CODEX'
+state="$(run_judge_case opencode_invalid_then_agy_valid "$judge_status_only_body" "$agy_valid_body" 2)"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_contains "$state/stdout.log" "judge: OpenCode unavailable, trying agy"
+assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_CODEX"
+assert_contains "$judge_run_dir/round-2-claude.prompt.md" "agy fallback judge verdict"
+opencode_calls="$(cat "$state/opencode-count" 2>/dev/null || echo 0)"
+agy_calls="$(cat "$state/agy-count" 2>/dev/null || echo 0)"
+[[ "$opencode_calls" == "1" ]] || { echo "expected opencode judge invoked exactly once, got $opencode_calls" >&2; exit 1; }
+[[ "$agy_calls" == "1" ]] || { echo "expected agy judge invoked exactly once, got $agy_calls" >&2; exit 1; }
+
+# --- Both judges invalid: fails closed, JUDGE UNAVAILABLE recorded, no
+# fake verdict reaches the next prompt, no consensus produced.
+state="$(run_judge_case all_invalid "$judge_status_only_body" "$judge_status_only_body")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
+assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
+assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
+assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+opencode_calls="$(cat "$state/opencode-count" 2>/dev/null || echo 0)"
+agy_calls="$(cat "$state/agy-count" 2>/dev/null || echo 0)"
+[[ "$opencode_calls" == "1" ]] || { echo "expected opencode judge invoked exactly once, got $opencode_calls" >&2; exit 1; }
+[[ "$agy_calls" == "1" ]] || { echo "expected agy judge invoked exactly once, got $agy_calls" >&2; exit 1; }
+
+# --- Stale judge artifact cannot be reused: a prior valid-looking output
+# file must not survive to be reused by a later failed/malformed judge call.
+# OpenCode is invoked first (invalid, output removed); confirm the judge
+# output path does not retain any artifact once the whole call fails closed.
+state="$(run_judge_case stale_artifact "$judge_status_only_body" "$judge_status_only_body")"
+judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+[[ ! -e "$judge_run_dir/round-1-judge.out.md" ]] || {
+  echo "expected no stale judge artifact to survive an all-invalid judge call" >&2
+  exit 1
+}
+
+# --- Normal (non-judge) turn protocol must still reject a VERDICT line;
+# VERDICT is judge-only and must never be treated as satisfying a normal
+# turn's protocol (validate_turn_protocol has no VERDICT case, so a VERDICT:
+# line is an unrecognized line and the whole response is rejected).
+state="$(MOCK_SCENARIO=proto_verdict_line AGENT_BRIDGE_RESUME=0 run_case proto_verdict_line "$repo_dir/bin/agent-turns" "$workspace" "mock proto_verdict_line" 1)"
+assert_not_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_not_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
+assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
+assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 
 echo "mock-agent-turns: ok"

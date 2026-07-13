@@ -118,18 +118,6 @@ HANDOFF: orchestrator-generated block; the agent call failed or returned unparse
 EOF
 }
 
-judge_summary() {
-  local f="$1" verdict lines
-  verdict="$(grep -m1 -oE 'ACCEPT_CLAUDE|ACCEPT_CODEX|REQUEST_REVISION|BLOCKED' "$f" || true)"
-  lines="$(grep -E '^(VERDICT|STATUS|HANDOFF):' "$f" | head -3 | tr '\n' ' ' || true)"
-  if [[ -n "$verdict" || -n "$lines" ]]; then
-    [[ "$lines" == *VERDICT:* ]] && verdict=""
-    printf '%s%s' "${verdict:+VERDICT: $verdict :: }" "$lines"
-  else
-    head -c 400 "$f" | tr '\n' ' '
-  fi
-}
-
 get_field() {
   grep -m1 -E "^$2:" "$1" | sed -E "s/^$2:[[:space:]]*//" || true
 }
@@ -273,6 +261,92 @@ validate_turn_protocol() {
   return 0
 }
 
+# Strict, local, deterministic validation of a judge response
+# (STATUS/CHANGED/EVIDENCE/NEXT/HANDOFF/VERDICT). This is the single
+# authoritative acceptance check for judge candidates (both the primary
+# OpenCode judge and the agy fallback judge) in call_judge below. A judge
+# response is accepted only when it satisfies the COMPLETE protocol below —
+# never merely because a STATUS: or VERDICT: line exists somewhere in the
+# text.
+#
+# Contract (same structural rules as validate_turn_protocol, plus VERDICT):
+#   - STATUS, CHANGED, NEXT, HANDOFF, VERDICT must each appear exactly once,
+#     anchored at line start, with a non-empty value after trimming
+#     whitespace.
+#   - EVIDENCE may appear at most once (optional).
+#   - STATUS value must be one of: PROPOSED VERIFIED DISAGREE REVISE BLOCKED
+#     COMPLETE (same enum as validate_turn_protocol).
+#   - VERDICT value must be exactly one of: ACCEPT_CLAUDE ACCEPT_CODEX
+#     REQUEST_REVISION BLOCKED (case-sensitive, no extra text on the line).
+#   - Every non-blank line in the file must be a recognized protocol field
+#     line; any other line (narration, Markdown fences, unknown fields,
+#     decoy verdict tokens embedded in another field's value) causes
+#     rejection. Empty and whitespace-only lines are tolerated using the
+#     exact same blank-line logic as validate_turn_protocol; leading
+#     whitespace/indentation before a protocol key is NOT stripped, so an
+#     indented key is rejected as an unrecognized line.
+#   - A verdict token appearing inside STATUS/CHANGED/EVIDENCE/NEXT/HANDOFF
+#     values, or in any unrecognized narration line, never counts as the
+#     verdict and never causes acceptance on its own.
+_valid_verdict_re='^(ACCEPT_CLAUDE|ACCEPT_CODEX|REQUEST_REVISION|BLOCKED)$'
+
+validate_judge_protocol() {
+  local file="$1"
+  [[ -s "$file" ]] || return 1
+
+  local line status_n=0 changed_n=0 evidence_n=0 next_n=0 handoff_n=0 verdict_n=0
+  local status_v="" changed_v="" next_v="" handoff_v="" verdict_v=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    case "$line" in
+      STATUS:*)   status_n=$((status_n + 1));   status_v="${line#STATUS:}" ;;
+      CHANGED:*)  changed_n=$((changed_n + 1)); changed_v="${line#CHANGED:}" ;;
+      EVIDENCE:*) evidence_n=$((evidence_n + 1)) ;;
+      NEXT:*)     next_n=$((next_n + 1));       next_v="${line#NEXT:}" ;;
+      HANDOFF:*)  handoff_n=$((handoff_n + 1)); handoff_v="${line#HANDOFF:}" ;;
+      VERDICT:*)  verdict_n=$((verdict_n + 1)); verdict_v="${line#VERDICT:}" ;;
+      *)
+        return 1
+        ;;
+    esac
+  done < "$file"
+
+  [[ "$status_n" -eq 1 && "$changed_n" -eq 1 && "$next_n" -eq 1 && "$handoff_n" -eq 1 && "$verdict_n" -eq 1 ]] || return 1
+  [[ "$evidence_n" -le 1 ]] || return 1
+
+  status_v="$(printf '%s' "$status_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  changed_v="$(printf '%s' "$changed_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  next_v="$(printf '%s' "$next_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  handoff_v="$(printf '%s' "$handoff_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  verdict_v="$(printf '%s' "$verdict_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+  [[ -n "$status_v" && -n "$changed_v" && -n "$next_v" && -n "$handoff_v" && -n "$verdict_v" ]] || return 1
+  [[ "$status_v" =~ $_valid_status_re ]] || return 1
+  [[ "$verdict_v" =~ $_valid_verdict_re ]] || return 1
+
+  return 0
+}
+
+# Anchored, defense-in-depth verdict extraction. Assumes the input already
+# passed validate_judge_protocol, but still reads ONLY the anchored
+# `VERDICT: ` field line rather than trusting prior validation blindly or
+# searching arbitrary file text for a bare token.
+judge_verdict() {
+  local f="$1" line
+  line="$(grep -m1 -E '^VERDICT:' "$f" || true)"
+  [[ -n "$line" ]] || { printf ''; return 0; }
+  printf '%s' "${line#VERDICT:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+# Human-readable summary of an already-validated judge response, built ONLY
+# from anchored field lines (never a whole-file token search).
+judge_summary() {
+  local f="$1"
+  printf 'VERDICT: %s :: STATUS: %s :: HANDOFF: %s' \
+    "$(judge_verdict "$f")" "$(get_field "$f" STATUS)" "$(get_field "$f" HANDOFF)"
+}
+
 call_claude() {
   local prompt="$1" out="$2" raw="$2.json" rc result cost
   is_failed claude && return 1
@@ -401,10 +475,13 @@ call_judge() {
     cat "$handoff_file"
     echo
     echo "# Your turn"
-    echo "Arbitrate. Return one verdict: ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED, with one reason."
+    echo "Arbitrate. Respond with the COMPLETE protocol block above (STATUS/CHANGED/NEXT/HANDOFF; EVIDENCE optional) PLUS exactly one additional line:"
+    echo "VERDICT: ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED"
+    echo "Rules: exactly one VERDICT line, containing one allowed value only (no extra words, no trailing punctuation). No narration, no Markdown fences, no lines other than the protocol fields."
   } > "$prompt"
 
   local jrc
+  rm -f "$out"
   # Primary judge: OpenCode
   if ! is_failed opencode; then
     echo "  escalating to OpenCode judge..."
@@ -412,20 +489,20 @@ call_judge() {
     timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
     jrc=$?
     set -e
-    if [[ $jrc -ne 0 || ! -s "$out" ]] || ! grep -qE '^(STATUS|VERDICT):' "$out"; then
+    if [[ $jrc -ne 0 || ! -s "$out" ]] || ! validate_judge_protocol "$out"; then
       mark_failed opencode
       rm -f "$out"
     fi
   fi
   # Fallback judge: agy
-  if is_failed opencode && ! is_failed agy; then
+  if [[ ! -s "$out" ]] && is_failed opencode && ! is_failed agy; then
     echo "  judge: OpenCode unavailable, trying agy..."
     rm -f "$out"
     set +e
     timeout "$turn_timeout" "$script_dir/ask-antigravity" "$workspace" "$prompt" "$out"
     jrc=$?
     set -e
-    if [[ $jrc -ne 0 || ! -s "$out" ]] || ! grep -qE '^(STATUS|VERDICT):' "$out"; then
+    if [[ $jrc -ne 0 || ! -s "$out" ]] || ! validate_judge_protocol "$out"; then
       mark_failed agy
       rm -f "$out"
     fi
