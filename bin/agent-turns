@@ -240,11 +240,19 @@ total_cost="0"
 # accepted output for a role — never on role text, filename, PID, response
 # content, model self-claims, or call order.
 _last_fallback_provider=""
+_last_fallback_outcome=""
 
 normalize_provider() {
   local p="${1//[[:space:]]/}"
   [[ "$p" == "antigravity" ]] && p="agy"
   printf '%s' "$p"
+}
+
+is_supported_fallback_provider() {
+  case "$1" in
+    opencode|agy) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # Strict, local, deterministic validation of a normal turn protocol response
@@ -460,6 +468,19 @@ call_fallback() {
   IFS=',' read -r -a providers <<< "$fallbacks"
 
   _last_fallback_provider=""
+  _last_fallback_outcome=""
+
+  local distinct_supported=" " distinct_supported_count=0
+  for provider in "${providers[@]}"; do
+    provider="$(normalize_provider "$provider")"
+    [[ -n "$provider" ]] || continue
+    is_supported_fallback_provider "$provider" || continue
+    [[ -n "$exclude" && "$provider" == "$exclude" ]] && continue
+    if [[ "$distinct_supported" != *" ${provider} "* ]]; then
+      distinct_supported+="${provider} "
+      distinct_supported_count=$((distinct_supported_count + 1))
+    fi
+  done
 
   for provider in "${providers[@]}"; do
     provider="$(normalize_provider "$provider")"
@@ -496,12 +517,18 @@ call_fallback() {
       mv "$candidate" "$out"
       echo "  fallback: $provider answered for $role"
       _last_fallback_provider="$provider"
+      _last_fallback_outcome="success"
       return 0
     fi
     rm -f "$candidate"
     mark_failed "$provider"
     echo "  fallback: $provider unavailable (exit=$rc)"
   done
+  if [[ "$distinct_supported_count" -eq 0 ]]; then
+    _last_fallback_outcome="no_distinct_candidate"
+  else
+    _last_fallback_outcome="candidates_failed"
+  fi
   return 1
 }
 
@@ -605,12 +632,32 @@ for ((round=1; round<=rounds; round++)); do
   if ! call_codex "$x_prompt" "$x_out"; then
     echo "  codex unavailable; starting automatic fallback"
     if ! call_fallback "reviewer" "$x_prompt" "$x_out" "$impl_provider"; then
-      [[ -s "$x_out" ]] || synth_block "$x_out" "Codex and configured fallback providers failed"
-      push_handoff "Round $round - Reviewer (unavailable)" "$x_out"
-      push_note "INDEPENDENT REVIEW UNAVAILABLE (round $round): implementer provider '$impl_provider' has no distinct fallback provider left to serve as reviewer; refusing to emit consensus"
-      echo "  independent reviewer unavailable: no distinct provider identity remains to review '$impl_provider' this round"
-      final_state="NO_INDEPENDENT_REVIEWER"
-      break
+      case "${_last_fallback_outcome:-}" in
+        no_distinct_candidate)
+          synth_block "$x_out" "independent reviewer unavailable: no distinct supported fallback reviewer is configured"
+          push_handoff "Round $round - Reviewer (unavailable)" "$x_out"
+          push_note "INDEPENDENT REVIEW UNAVAILABLE (round $round): no distinct supported fallback reviewer is configured after excluding implementer provider '$impl_provider'; refusing to emit consensus"
+          echo "  independent reviewer unavailable: no distinct supported fallback reviewer is configured"
+          final_state="NO_INDEPENDENT_REVIEWER"
+          break
+          ;;
+        candidates_failed)
+          synth_block "$x_out" "independent reviewer failed: distinct supported fallback reviewer candidates existed but all were unavailable or failed"
+          push_handoff "Round $round - Reviewer (failed)" "$x_out"
+          push_note "INDEPENDENT REVIEW FAILED (round $round): distinct supported fallback reviewer candidates existed but all were unavailable or failed; refusing to emit consensus"
+          echo "  independent reviewer failed: distinct supported fallback reviewer candidates existed but all were unavailable or failed"
+          final_state="CODEX_ERROR"
+          break
+          ;;
+        *)
+          synth_block "$x_out" "internal fallback classification failure while selecting independent reviewer"
+          push_handoff "Round $round - Reviewer (classification failure)" "$x_out"
+          push_note "INTERNAL FALLBACK CLASSIFICATION FAILURE (round $round): reviewer fallback outcome '${_last_fallback_outcome:-unset}' was not recognized; refusing to emit consensus"
+          echo "  independent reviewer failed: internal fallback classification failure"
+          final_state="CODEX_ERROR"
+          break
+          ;;
+      esac
     fi
     review_provider="$_last_fallback_provider"
   else

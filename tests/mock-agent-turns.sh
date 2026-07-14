@@ -45,6 +45,7 @@ fi
 
 case "${MOCK_SCENARIO}" in
   fallback_opencode|fallback_antigravity|fallback_identity_verify|skip_failed_primary|distinct_fallback_reviewer|independent_reviewer_unavailable| \
+  independent_reviewer_failed|independent_reviewer_prefailed| \
   proto_only_status|proto_only_changed|proto_missing_handoff|proto_missing_next|proto_empty_required_value| \
   proto_invalid_status|proto_duplicate_status|proto_duplicate_handoff|proto_narration_before|proto_narration_after| \
   proto_evidence_omitted|proto_complete|proto_malformed_then_valid|proto_all_malformed| \
@@ -113,7 +114,7 @@ done
 [[ -n "$out" ]] || { echo "missing --output-last-message" >&2; exit 2; }
 
 case "${MOCK_SCENARIO}" in
-  distinct_fallback_reviewer|independent_reviewer_unavailable|mixed_provider_directive)
+  distinct_fallback_reviewer|independent_reviewer_unavailable|independent_reviewer_failed|independent_reviewer_prefailed|mixed_provider_directive)
     exit 1
     ;;
   directive_*)
@@ -160,6 +161,10 @@ printf '%s\n' "$*" >> "${MOCK_STATE}/opencode-args.log"
 printf '%s\0' "$@" > "${MOCK_STATE}/opencode-argv-${count}.nul"
 if [[ "${MOCK_SCENARIO}" == "fallback_antigravity" || "${MOCK_SCENARIO}" == "directive_model_agy" ]]; then
   exit 1
+fi
+if [[ "${MOCK_SCENARIO}" == "independent_reviewer_prefailed" && "$count" == "2" ]]; then
+  printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock opencode independent review should not run\nNEXT: none\nHANDOFF: invalid self-review\n'
+  exit 0
 fi
 case "${MOCK_SCENARIO}" in
   mixed_provider_directive)
@@ -259,6 +264,9 @@ echo "$count" > "$count_file"
 printf '%s\n' "$*" >> "${MOCK_STATE}/agy-args.log"
 printf '%s\0' "$@" > "${MOCK_STATE}/agy-argv-${count}.nul"
 case "${MOCK_SCENARIO:-}" in
+  independent_reviewer_failed|independent_reviewer_prefailed)
+    exit 1
+    ;;
   mixed_provider_directive)
     printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock agy independent review via directive\nNEXT: none\nHANDOFF: agy reviewed independently via directive\n'
     ;;
@@ -633,15 +641,80 @@ agy_calls="$(cat "$state/agy-count")"
 # fail closed instead of accepting the implementer's own provider as the
 # reviewer.
 state="$(MOCK_SCENARIO=independent_reviewer_unavailable AGENT_BRIDGE_RESUME=0 AGENT_BRIDGE_FALLBACKS=opencode run_case independent_reviewer_unavailable "$repo_dir/bin/agent-turns" "$workspace" "mock independent reviewer unavailable" 1)"
+unavailable_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
-assert_contains "$state/stdout.log" "independent reviewer unavailable"
-if grep -Fq -- "=== Done: CONSENSUS ===" "$state/stdout.log"; then
-  echo "expected no CONSENSUS terminal state, but found one" >&2
-  cat "$state/stdout.log" >&2
-  exit 1
-fi
+assert_contains "$state/stdout.log" "independent reviewer unavailable: no distinct supported fallback reviewer is configured"
+assert_contains "$unavailable_run_dir/handoff.md" "INDEPENDENT REVIEW UNAVAILABLE"
+assert_not_contains "$unavailable_run_dir/handoff.md" "INDEPENDENT REVIEW FAILED"
+assert_contains "$state/stdout.log" "=== Done: NO_INDEPENDENT_REVIEWER ==="
+assert_not_contains "$state/stdout.log" "=== Done: CODEX_ERROR ==="
+assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 opencode_calls="$(cat "$state/opencode-count")"
 [[ "$opencode_calls" == "1" ]] || { echo "expected opencode invoked exactly once, got $opencode_calls" >&2; exit 1; }
+
+# Adversarial counting checks that do not increment the normal suite case
+# counter: empty entries, unsupported names, and duplicate supported
+# identities must not create a distinct supported reviewer after the
+# implementer is excluded.
+adv_state="$tmp_root/state-independent_reviewer_unavailable_adversarial"
+mkdir -p "$adv_state"
+MOCK_SCENARIO=independent_reviewer_unavailable \
+MOCK_STATE="$adv_state" \
+PATH="$mockbin:$PATH" \
+AGENT_BRIDGE_HOME="$bridge_home/independent_reviewer_unavailable_adversarial" \
+AGENT_BRIDGE_RESUME=0 \
+AGENT_BRIDGE_FALLBACKS=",unsupported,opencode,opencode," \
+  "$repo_dir/bin/agent-turns" "$workspace" "mock independent reviewer unavailable adversarial" 1 > "$adv_state/stdout.log" 2> "$adv_state/stderr.log"
+adv_run_dir="$(awk '/^Artifacts: / { print $2 }' "$adv_state/stdout.log")"
+assert_contains "$adv_state/stdout.log" "fallback: opencode answered for implementer"
+assert_contains "$adv_state/stdout.log" "independent reviewer unavailable: no distinct supported fallback reviewer is configured"
+assert_contains "$adv_run_dir/handoff.md" "INDEPENDENT REVIEW UNAVAILABLE"
+assert_not_contains "$adv_run_dir/handoff.md" "INDEPENDENT REVIEW FAILED"
+assert_contains "$adv_state/stdout.log" "=== Done: NO_INDEPENDENT_REVIEWER ==="
+assert_not_contains "$adv_state/stdout.log" "=== Done: CODEX_ERROR ==="
+assert_not_contains "$adv_state/stdout.log" "=== Done: CONSENSUS ==="
+opencode_calls="$(cat "$adv_state/opencode-count")"
+[[ "$opencode_calls" == "1" ]] || { echo "expected duplicate opencode entries not to inflate invocation count, got $opencode_calls" >&2; exit 1; }
+
+# P3 regression: when a distinct supported fallback reviewer exists but the
+# reviewer attempt fails, the orchestrator must fail closed as CODEX_ERROR
+# with a failure diagnostic, not report that no independent reviewer was
+# configured.
+state="$(MOCK_SCENARIO=independent_reviewer_failed AGENT_BRIDGE_RESUME=0 AGENT_BRIDGE_FALLBACKS=opencode,agy run_case independent_reviewer_failed "$repo_dir/bin/agent-turns" "$workspace" "mock independent reviewer failed" 1)"
+failed_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+assert_contains "$state/stdout.log" "fallback: trying agy for reviewer"
+assert_contains "$state/stdout.log" "independent reviewer failed: distinct supported fallback reviewer candidates existed but all were unavailable or failed"
+assert_contains "$failed_run_dir/handoff.md" "INDEPENDENT REVIEW FAILED"
+assert_not_contains "$failed_run_dir/handoff.md" "INDEPENDENT REVIEW UNAVAILABLE"
+assert_contains "$state/stdout.log" "=== Done: CODEX_ERROR ==="
+assert_not_contains "$state/stdout.log" "=== Done: NO_INDEPENDENT_REVIEWER ==="
+assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+opencode_calls="$(cat "$state/opencode-count")"
+agy_calls="$(cat "$state/agy-count")"
+[[ "$opencode_calls" == "1" ]] || { echo "expected opencode invoked exactly once, got $opencode_calls" >&2; exit 1; }
+[[ "$agy_calls" == "1" ]] || { echo "expected agy invoked exactly once, got $agy_calls" >&2; exit 1; }
+
+# P3 regression: a distinct supported reviewer that failed earlier in the
+# same session still proves that an independent reviewer candidate existed.
+# It must be classified as reviewer failure, not reviewer absence. The
+# antigravity alias canonicalizes to agy and does not inflate the candidate
+# count or create a second invocation.
+state="$(MOCK_SCENARIO=independent_reviewer_prefailed AGENT_BRIDGE_RESUME=0 AGENT_BRIDGE_FALLBACKS=agy,antigravity,opencode run_case independent_reviewer_prefailed "$repo_dir/bin/agent-turns" "$workspace" "mock independent reviewer prefailed" 1)"
+prefailed_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$state/stdout.log" "fallback: agy unavailable"
+assert_contains "$state/stdout.log" "fallback: skipping agy (unavailable this session)"
+assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+assert_contains "$state/stdout.log" "independent reviewer failed: distinct supported fallback reviewer candidates existed but all were unavailable or failed"
+assert_contains "$prefailed_run_dir/handoff.md" "INDEPENDENT REVIEW FAILED"
+assert_not_contains "$prefailed_run_dir/handoff.md" "INDEPENDENT REVIEW UNAVAILABLE"
+assert_contains "$state/stdout.log" "=== Done: CODEX_ERROR ==="
+assert_not_contains "$state/stdout.log" "=== Done: NO_INDEPENDENT_REVIEWER ==="
+assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+opencode_calls="$(cat "$state/opencode-count")"
+agy_calls="$(cat "$state/agy-count")"
+[[ "$opencode_calls" == "1" ]] || { echo "expected opencode invoked exactly once, got $opencode_calls" >&2; exit 1; }
+[[ "$agy_calls" == "1" ]] || { echo "expected agy invoked exactly once during implementer fallback, got $agy_calls" >&2; exit 1; }
 
 # --- Strict turn protocol validation (P1 fix) ---------------------------
 # Primary Claude/Codex are made to fail so every case below exercises
