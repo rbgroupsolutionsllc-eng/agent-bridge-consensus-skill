@@ -28,11 +28,19 @@ rounds="${3:-2}"
 [[ "$rounds" =~ ^[0-9]+$ && "$rounds" -ge 1 ]] || { echo "Rounds must be a positive integer" >&2; exit 2; }
 
 # Parse inline model directives from goal: [opencode:model] [agy:model]
+# Only these two lowercase provider names are supported. Provider names are
+# case-sensitive; the value must be non-empty. The first valid occurrence per
+# provider selects the model; all valid occurrences are removed from the goal.
+# Unrelated bracket metadata (e.g. [owner:backend]) is preserved unchanged.
 _re='\[opencode:([^]]+)\]'
-if [[ "$goal" =~ $_re ]]; then AGENT_BRIDGE_OPENCODE_MODEL="${BASH_REMATCH[1]}"; fi
+if [[ "$goal" =~ $_re ]]; then export AGENT_BRIDGE_OPENCODE_MODEL="${BASH_REMATCH[1]}"; fi
 _re='\[agy:([^]]+)\]'
-if [[ "$goal" =~ $_re ]]; then AGENT_BRIDGE_ANTIGRAVITY_MODEL="${BASH_REMATCH[1]}"; fi
-goal="$(printf '%s' "$goal" | sed 's/\[[a-z]*:[^]]*\]//g;s/^[[:space:]]*//;s/[[:space:]]*$//')"
+if [[ "$goal" =~ $_re ]]; then export AGENT_BRIDGE_ANTIGRAVITY_MODEL="${BASH_REMATCH[1]}"; fi
+goal="$(printf '%s' "$goal" | sed -E \
+  -e 's/\[opencode:[^]]+\]//g' \
+  -e 's/\[agy:[^]]+\]//g' \
+  -e 's/^[[:space:]]*//' \
+  -e 's/[[:space:]]*$//')"
 unset _re
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

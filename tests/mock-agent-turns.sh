@@ -42,7 +42,8 @@ case "${MOCK_SCENARIO}" in
   proto_invalid_status|proto_duplicate_status|proto_duplicate_handoff|proto_narration_before|proto_narration_after| \
   proto_evidence_omitted|proto_complete|proto_malformed_then_valid|proto_all_malformed| \
   proto_ws_before_space|proto_ws_between_space|proto_ws_after_space|proto_ws_before_tab|proto_ws_between_tab| \
-  proto_ws_after_tab|proto_ws_between_mixed|proto_ws_indented_key|proto_verdict_line)
+  proto_ws_after_tab|proto_ws_between_mixed|proto_ws_indented_key|proto_verdict_line| \
+  directive_model_agy)
     exit 1
     ;;
   consensus_round2|json_resume|verify_fail_gate|verify_window)
@@ -108,6 +109,9 @@ case "${MOCK_SCENARIO}" in
   distinct_fallback_reviewer|independent_reviewer_unavailable)
     exit 1
     ;;
+  directive_*)
+    exit 1
+    ;;
 esac
 
 case "${MOCK_SCENARIO}" in
@@ -118,6 +122,9 @@ case "${MOCK_SCENARIO}" in
     status="VERIFIED"
     ;;
   judge|judge_noise|judge_clean|judgeproto_*)
+    if [[ "$count" == "1" ]]; then status="DISAGREE"; else status="VERIFIED"; fi
+    ;;
+  directive_*)
     if [[ "$count" == "1" ]]; then status="DISAGREE"; else status="VERIFIED"; fi
     ;;
   *)
@@ -143,7 +150,7 @@ count=0
 count=$((count + 1))
 echo "$count" > "$count_file"
 printf '%s\n' "$*" >> "${MOCK_STATE}/opencode-args.log"
-if [[ "${MOCK_SCENARIO}" == "fallback_antigravity" ]]; then
+if [[ "${MOCK_SCENARIO}" == "fallback_antigravity" || "${MOCK_SCENARIO}" == "directive_model_agy" ]]; then
   exit 1
 fi
 case "${MOCK_SCENARIO}" in
@@ -289,6 +296,9 @@ case "${MOCK_SCENARIO:-}" in
     if [[ -n "${MOCK_JUDGE_BODY_AGY:-}" && -f "${MOCK_JUDGE_BODY_AGY:-}" ]]; then
       cat "$MOCK_JUDGE_BODY_AGY"
     fi
+    ;;
+  directive_model_agy)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy with directive model\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
     ;;
   *)
     printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock agy fallback\nNEXT: codex verifies\nHANDOFF: fallback response ready\n'
@@ -885,5 +895,123 @@ assert_contains "$state/stderr.log" "provider unavailable for this session: open
 assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
 assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
 assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+
+# ===========================================================================
+# Directive parsing: only [opencode:<value>] and [agy:<value>] are stripped
+# from the goal. Unrelated metadata (e.g. [owner:backend]) must be preserved.
+# ===========================================================================
+
+run_directive_case() {
+  local name="$1" goal="$2" expected_cleaned="$3"
+  local state
+  state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+    run_case "$name" "$repo_dir/bin/agent-turns" "$workspace" "$goal" 1)"
+  # Find the prompt artifact containing the GOAL line
+  local run_dir
+  run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+  local prompt_file="$run_dir/round-1-claude.prompt.md"
+  assert_contains "$prompt_file" "GOAL: $expected_cleaned"
+  assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+  assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+  echo "$state"
+}
+
+# --- Unsupported tags must be preserved ---
+run_directive_case "dir_owner" "Deploy API [owner:backend]" "Deploy API [owner:backend]"
+run_directive_case "dir_ticket" "[ticket:ABC-123] Deploy service" "[ticket:ABC-123] Deploy service"
+run_directive_case "dir_status" "Review change [status:ready]" "Review change [status:ready]"
+run_directive_case "dir_foo" "[foo:bar]" "[foo:bar]"
+run_directive_case "dir_owner_empty" "[owner:]" "[owner:]"
+run_directive_case "dir_uppercase_opencode" "[OPENCODE:model-x]" "[OPENCODE:model-x]"
+run_directive_case "dir_capital_agy" "[Agy:model-x]" "[Agy:model-x]"
+run_directive_case "dir_malformed_opencode" "[opencode:model" "[opencode:model"
+run_directive_case "dir_malformed_agy" "[agy:model" "[agy:model"
+run_directive_case "dir_trailing_opencode" "text opencode:model]" "text opencode:model]"
+run_directive_case "dir_trailing_agy" "text agy:model]" "text agy:model]"
+run_directive_case "dir_plain" "[plain-brackets]" "[plain-brackets]"
+run_directive_case "dir_empty" "[]" "[]"
+run_directive_case "dir_unicode" "Revisar módulo [owner:operación] — 日本語 [nota:prueba]" "Revisar módulo [owner:operación] — 日本語 [nota:prueba]"
+run_directive_case "dir_no_directive" "Run with no directive" "Run with no directive"
+
+# --- Multiple unsupported tags in one goal ---
+run_directive_case "dir_multi_unsupported" "[owner:backend] Deploy [status:ready] service [ticket:ABC-123]" "[owner:backend] Deploy [status:ready] service [ticket:ABC-123]"
+
+# --- Valid opencode directive: removed from goal, model delivered ---
+state="$(run_directive_case "dir_opencode_valid" "Deploy [opencode:openai/gpt-5] service" "Deploy  service")"
+assert_contains "$state/opencode-args.log" "--model openai/gpt-5"
+
+# --- Valid agy directive: removed from goal, model delivered ---
+# Need both providers to fail to reach agy; directive_model_agy makes
+# both Claude and OpenCode fail so agy is used as fallback.
+# agy implements but can't also be reviewer (independence), so we just
+# verify the GOAL line and model delivery — no consensus expected.
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_agy_valid" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Review [agy:Gemini 3.5 Flash (Medium)] change" 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Review  change"
+assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+assert_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_contains "$state/agy-args.log" "--model Gemini 3.5 Flash (Medium)"
+
+# --- Both providers plus metadata ---
+run_directive_case "dir_both_plus_meta" \
+  "[owner:backend] Deploy [opencode:provider/model] then review [agy:Gemini 3.5 Flash (Medium)] [ticket:ABC-123]" \
+  "[owner:backend] Deploy  then review  [ticket:ABC-123]"
+
+# --- Valid directive at beginning ---
+run_directive_case "dir_position_begin" "[opencode:my-model] Deploy service" "Deploy service"
+
+# --- Valid directive in middle ---
+run_directive_case "dir_position_mid" "Deploy [opencode:my-model] service" "Deploy  service"
+
+# --- Valid directive at end ---
+run_directive_case "dir_position_end" "Deploy service [opencode:my-model]" "Deploy service"
+
+# --- Adjacent to punctuation ---
+run_directive_case "dir_adjunct_punct" "Deploy,[opencode:my-model] service." "Deploy, service."
+
+# --- Adjacent to unsupported metadata ---
+run_directive_case "dir_adjunct_meta" "[owner:backend][opencode:my-model] Deploy" "[owner:backend] Deploy"
+
+# --- Duplicate opencode: first-match selects, both removed ---
+run_directive_case "dir_dup_opencode" \
+  "Run [opencode:first/model] then [opencode:second/model]" \
+  "Run  then"
+
+# --- Duplicate agy: first-match selects, both removed ---
+run_directive_case "dir_dup_agy" \
+  "Run [agy:first/model] then [agy:second/model]" \
+  "Run  then"
+
+# --- Colon value ---
+run_directive_case "dir_colon_value" "[opencode:provider/model:variant]" ""
+
+# --- Empty supported directives preserved ---
+run_directive_case "dir_empty_opencode" "[opencode:] text" "[opencode:] text"
+run_directive_case "dir_empty_agy" "[agy:] text" "[agy:] text"
+
+# --- Shell metacharacters: no command injection ---
+state="$(run_directive_case "dir_shell_opencode" "[opencode:model;printf PWNED]" "")"
+[[ ! -e "$state/PWNED" ]] || { echo "FAIL: command injection via opencode directive" >&2; exit 1; }
+state="$(run_directive_case "dir_shell_agy" "[agy:model\$(printf PWNED)]" "")"
+[[ ! -e "$state/PWNED" ]] || { echo "FAIL: command injection via agy directive" >&2; exit 1; }
+
+# --- Model delivery: opencode directive overrides env default ---
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_model_opencode" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Deploy [opencode:custom/provider:v2] service" 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+assert_contains "$state/opencode-args.log" "--model custom/provider:v2"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+
+# --- Model delivery: agy directive overrides env default ---
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_model_agy" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Review [agy:Qwen3 Coder free] change" 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Review  change"
+assert_contains "$state/agy-args.log" "--model Qwen3 Coder free"
 
 echo "mock-agent-turns: ok"
