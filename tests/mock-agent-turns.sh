@@ -1394,41 +1394,78 @@ assert_not_contains "$state/stdout.log" "independent reviewer unavailable"
 # ===========================================================================
 
 run_installer_case() {
-  local name="$1" input="$2"
-  local case_home="$tmp_root/installer-$name"
-  mkdir -p "$case_home/.config/opencode"
-  printf '%s' "$input" > "$case_home/.config/opencode/AGENTS.md"
-  local state
-  # Increment test counter (file-based, persists across subshells)
+  local name="$1" mode="$2" input="${3:-}" explicit_home="${4:-}"
+  local case_home="${explicit_home:-$tmp_root/installer-$name}"
+  case "$mode" in
+    missing)
+      mkdir -p "$case_home/.config/opencode"
+      ;;
+    empty)
+      mkdir -p "$case_home/.config/opencode"
+      printf '' > "$case_home/.config/opencode/AGENTS.md"
+      ;;
+    content)
+      mkdir -p "$case_home/.config/opencode"
+      printf '%s' "$input" > "$case_home/.config/opencode/AGENTS.md"
+      ;;
+    rerun)
+      [[ -n "$explicit_home" ]] || {
+        echo "run_installer_case: rerun requires explicit HOME" >&2
+        return 2
+      }
+      [[ -f "$case_home/.config/opencode/AGENTS.md" ]] || {
+        echo "run_installer_case: rerun target AGENTS.md does not exist" >&2
+        return 2
+      }
+      ;;
+    *)
+      echo "run_installer_case: unsupported mode: $mode" >&2
+      return 2
+      ;;
+  esac
   local n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
   echo $((n + 1)) > "$TEST_COUNT_FILE"
-  state="$(HOME="$case_home" MOCK_STATE="$case_home/state" PATH="$mockbin:$PATH" \
-    AGENT_BRIDGE_HOME="$bridge_home/$name" bash -c 'mkdir -p "$HOME/.config/opencode" && '"$repo_dir/bin/install-local" 2>&1)"
+  HOME="$case_home" MOCK_STATE="$case_home/state" PATH="$mockbin:$PATH" \
+    AGENT_BRIDGE_HOME="$bridge_home/$name" bash -c 'mkdir -p "$HOME/.config/opencode" && '"$repo_dir/bin/install-local" >/dev/null 2>&1
   echo "$case_home"
 }
 
-# CASE 1 — FILE DOES NOT EXIST
-# (rm -f to ensure no file, then run)
-case_home="$(run_installer_case file_missing "")"
+# CASE 1 — FILE DOES NOT EXIST (truly absent AGENTS.md)
+case_home="$tmp_root/installer-file_missing"
+mkdir -p "$case_home/.config/opencode"
+test ! -e "$case_home/.config/opencode/AGENTS.md" || { echo "pre-condition failed: AGENTS.md exists" >&2; exit 1; }
+n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
+echo $((n + 1)) > "$TEST_COUNT_FILE"
+HOME="$case_home" bash "$repo_dir/bin/install-local" >/dev/null 2>&1
+test -e "$case_home/.config/opencode/AGENTS.md" || { echo "AGENTS.md not created" >&2; exit 1; }
 assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team: Claude (implementer), Codex (reviewer), OpenCode (judge + 1st fallback), agy (2nd fallback)."
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
+last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
+[[ "$last_byte" == "0a" ]] || { echo "expected final LF, got $last_byte" >&2; exit 1; }
 
-# CASE 2 — EMPTY FILE
-case_home="$(run_installer_case empty_file "")"
+# CASE 2 — EMPTY FILE (separate from missing-file case)
+case_home="$tmp_root/installer-empty_file"
+mkdir -p "$case_home/.config/opencode"
+printf '' > "$case_home/.config/opencode/AGENTS.md"
+test -e "$case_home/.config/opencode/AGENTS.md" || { echo "pre-condition failed: no file" >&2; exit 1; }
+test ! -s "$case_home/.config/opencode/AGENTS.md" || { echo "pre-condition failed: file not empty" >&2; exit 1; }
+n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
+echo $((n + 1)) > "$TEST_COUNT_FILE"
+HOME="$case_home" bash "$repo_dir/bin/install-local" >/dev/null 2>&1
 assert_contains "$case_home/.config/opencode/AGENTS.md" "Token rule: protocol block only. No preamble. Do not mark COMPLETE for your own unverified work."
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
 # CASE 3 — MANAGED SECTION AT FIRST LINE THROUGH EOF
-case_home="$(run_installer_case first_line_eof $'## Agent Bridge Consensus\n\nOLD FIRST-LINE CONTENT')"
+case_home="$(run_installer_case first_line_eof content $'## Agent Bridge Consensus\n\nOLD FIRST-LINE CONTENT')"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD FIRST-LINE CONTENT"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team: Claude (implementer), Codex (reviewer), OpenCode (judge + 1st fallback), agy (2nd fallback)."
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
 # CASE 4 — FIRST LINE FOLLOWED BY ANOTHER H2
-case_home="$(run_installer_case first_line_following_h2 $'## Agent Bridge Consensus\n\nOLD CONTENT\n\n## Existing Project Rules\n\nKEEP THIS RULE')"
+case_home="$(run_installer_case first_line_following_h2 content $'## Agent Bridge Consensus\n\nOLD CONTENT\n\n## Existing Project Rules\n\nKEEP THIS RULE')"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD CONTENT"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "## Existing Project Rules"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "KEEP THIS RULE"
@@ -1436,7 +1473,7 @@ count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENT
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
 # CASE 5 — MANAGED SECTION IN MIDDLE
-case_home="$(run_installer_case middle_section $'PREFACE\n\n## Agent Bridge Consensus\n\nOLD MIDDLE CONTENT\n\n## Existing Rules\n\nKEEP THIS')"
+case_home="$(run_installer_case middle_section content $'PREFACE\n\n## Agent Bridge Consensus\n\nOLD MIDDLE CONTENT\n\n## Existing Rules\n\nKEEP THIS')"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "PREFACE"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "## Existing Rules"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "KEEP THIS"
@@ -1445,7 +1482,7 @@ count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENT
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
 # CASE 6 — MANAGED SECTION AT END
-case_home="$(run_installer_case end_section $'# Preface\n\nSome intro content.\n\n## Agent Bridge Consensus\n\nOLD AT END')"
+case_home="$(run_installer_case end_section content $'# Preface\n\nSome intro content.\n\n## Agent Bridge Consensus\n\nOLD AT END')"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "Preface"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "Some intro content"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD AT END"
@@ -1453,7 +1490,7 @@ count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENT
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
 # CASE 7 — TWO PREEXISTING MANAGED SECTIONS
-case_home="$(run_installer_case two_sections $'intro\n\n## Agent Bridge Consensus\n\nOLD ONE\n\n## Other\n\nKEEP\n\n## Agent Bridge Consensus\n\nOLD TWO')"
+case_home="$(run_installer_case two_sections content $'intro\n\n## Agent Bridge Consensus\n\nOLD ONE\n\n## Other\n\nKEEP\n\n## Agent Bridge Consensus\n\nOLD TWO')"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD ONE"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD TWO"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "intro"
@@ -1463,7 +1500,7 @@ count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENT
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
 # CASE 8 — THREE PREEXISTING MANAGED SECTIONS
-case_home="$(run_installer_case three_sections $'intro\n\n## Agent Bridge Consensus\n\nOLD ONE\n\n## Other\n\nKEEP\n\n## Agent Bridge Consensus\n\nOLD TWO\n\n## More\n\nKEEP2\n\n## Agent Bridge Consensus\n\nOLD THREE')"
+case_home="$(run_installer_case three_sections content $'intro\n\n## Agent Bridge Consensus\n\nOLD ONE\n\n## Other\n\nKEEP\n\n## Agent Bridge Consensus\n\nOLD TWO\n\n## More\n\nKEEP2\n\n## Agent Bridge Consensus\n\nOLD THREE')"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD ONE"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD TWO"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD THREE"
@@ -1476,7 +1513,7 @@ count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENT
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
 # CASE 9 — SIMILAR HEADINGS MUST NOT MATCH
-case_home="$(run_installer_case similar_headings $'### Agent Bridge Consensus\n\n## Agent Bridge Consensus Extra\n\n## agent bridge consensus\n\nText mentioning Agent Bridge Consensus in prose.\n\n## Agent Bridge Consensus\n\nOLD CONTENT')"
+case_home="$(run_installer_case similar_headings content $'### Agent Bridge Consensus\n\n## Agent Bridge Consensus Extra\n\n## agent bridge consensus\n\nText mentioning Agent Bridge Consensus in prose.\n\n## Agent Bridge Consensus\n\nOLD CONTENT')"
 # All similar headings preserved
 assert_contains "$case_home/.config/opencode/AGENTS.md" "### Agent Bridge Consensus"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "## Agent Bridge Consensus Extra"
@@ -1488,46 +1525,77 @@ count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENT
 [[ "$count" == "1" ]] || { echo "expected 1 exact managed heading, got $count" >&2; exit 1; }
 
 # CASE 10 — INPUT WITHOUT FINAL NEWLINE
-case_home="$(run_installer_case no_final_newline $'# Test\n\nContent without newline')"
+case_home="$(run_installer_case no_final_newline content $'# Test\n\nContent without newline')"
 # Should end with exactly one LF
 last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
 [[ "$last_byte" == "0a" ]] || { echo "expected final LF, got $last_byte" >&2; exit 1; }
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
-# CASE 11 — BLANK-LINE STABILITY (three runs)
-case_home="$(run_installer_case blank_line_stability_1 $'\n\n## Agent Bridge Consensus\n\n\nOLD\n\n\n')"
-out1="$(cat "$case_home/.config/opencode/AGENTS.md")"
-case_home="$(run_installer_case blank_line_stability_2 "$out1")"
-out2="$(cat "$case_home/.config/opencode/AGENTS.md")"
-case_home="$(run_installer_case blank_line_stability_3 "$out2")"
-out3="$(cat "$case_home/.config/opencode/AGENTS.md")"
-[[ "$out1" == "$out2" ]] || { echo "blank-line growth detected: run1 != run2" >&2; exit 1; }
-[[ "$out2" == "$out3" ]] || { echo "blank-line growth detected: run2 != run3" >&2; exit 1; }
+# CASE 11 — BLANK-LINE STABILITY (three runs, same physical file)
+case_home="$(run_installer_case blank_line_stability_1 content $'\n\n## Agent Bridge Consensus\n\n\nOLD\n\n\n')"
+h1=$(sha256sum "$case_home/.config/opencode/AGENTS.md" | cut -d' ' -f1)
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
-[[ "$count" == "1" ]] || { echo "expected 1 managed heading after 3 runs, got $count" >&2; exit 1; }
+[[ "$count" == "1" ]] || { echo "expected 1 managed heading after run 1, got $count" >&2; exit 1; }
+last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
+[[ "$last_byte" == "0a" ]] || { echo "expected final LF after run 1" >&2; exit 1; }
+# Run 2: same HOME, no file rewrite
+run_installer_case blank_line_rerun2 rerun "" "$case_home" >/dev/null 2>&1
+h2=$(sha256sum "$case_home/.config/opencode/AGENTS.md" | cut -d' ' -f1)
+count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
+[[ "$count" == "1" ]] || { echo "expected 1 managed heading after run 2, got $count" >&2; exit 1; }
+last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
+[[ "$last_byte" == "0a" ]] || { echo "expected final LF after run 2" >&2; exit 1; }
+# Run 3: same HOME, no file rewrite
+run_installer_case blank_line_rerun3 rerun "" "$case_home" >/dev/null 2>&1
+h3=$(sha256sum "$case_home/.config/opencode/AGENTS.md" | cut -d' ' -f1)
+count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
+[[ "$count" == "1" ]] || { echo "expected 1 managed heading after run 3, got $count" >&2; exit 1; }
+last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
+[[ "$last_byte" == "0a" ]] || { echo "expected final LF after run 3" >&2; exit 1; }
+# All three hashes must be identical
+[[ "$h1" == "$h2" ]] && [[ "$h2" == "$h3" ]] || { echo "blank-line growth detected: $h1 $h2 $h3" >&2; exit 1; }
 
 # CASE 12 — UNICODE CONTENT
-case_home="$(run_installer_case unicode $'# Привет\n\nПривет мир 🌍\n\n## Agent Bridge Consensus\n\nOLD')"
+case_home="$(run_installer_case unicode content $'# Привет\n\nПривет мир 🌍\n\n## Agent Bridge Consensus\n\nOLD')"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "Привет"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "🌍"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD"
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 
-# CASE 13 — THREE-RUN IDEMPOTENCE FROM CLEAN FILE
-case_home="$(run_installer_case idempotence_1 $'## Agent Bridge Consensus\n\nOLD')"
+# CASE 13 — THREE-RUN IDEMPOTENCE (same physical file, no command substitution)
+case_home="$(run_installer_case idempotence_1 content $'## Agent Bridge Consensus\n\nOLD')"
 h1=$(sha256sum "$case_home/.config/opencode/AGENTS.md" | cut -d' ' -f1)
-case_home="$(run_installer_case idempotence_2 "$(cat "$case_home/.config/opencode/AGENTS.md")")"
-h2=$(sha256sum "$case_home/.config/opencode/AGENTS.md" | cut -d' ' -f1)
-case_home="$(run_installer_case idempotence_3 "$(cat "$case_home/.config/opencode/AGENTS.md")")"
-h3=$(sha256sum "$case_home/.config/opencode/AGENTS.md" | cut -d' ' -f1)
-[[ "$h1" == "$h2" ]] && [[ "$h2" == "$h3" ]] || { echo "idempotence hash mismatch: $h1 $h2 $h3" >&2; exit 1; }
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
-[[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
+[[ "$count" == "1" ]] || { echo "expected 1 managed heading after run 1, got $count" >&2; exit 1; }
+assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team"
+assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD"
+last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
+[[ "$last_byte" == "0a" ]] || { echo "expected final LF after run 1" >&2; exit 1; }
+# Run 2: same HOME, no file rewrite
+run_installer_case idem_rerun2 rerun "" "$case_home" >/dev/null 2>&1
+h2=$(sha256sum "$case_home/.config/opencode/AGENTS.md" | cut -d' ' -f1)
+count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
+[[ "$count" == "1" ]] || { echo "expected 1 managed heading after run 2, got $count" >&2; exit 1; }
+assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team"
+assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD"
+last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
+[[ "$last_byte" == "0a" ]] || { echo "expected final LF after run 2" >&2; exit 1; }
+# Run 3: same HOME, no file rewrite
+run_installer_case idem_rerun3 rerun "" "$case_home" >/dev/null 2>&1
+h3=$(sha256sum "$case_home/.config/opencode/AGENTS.md" | cut -d' ' -f1)
+count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
+[[ "$count" == "1" ]] || { echo "expected 1 managed heading after run 3, got $count" >&2; exit 1; }
+assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team"
+assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD"
+last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
+[[ "$last_byte" == "0a" ]] || { echo "expected final LF after run 3" >&2; exit 1; }
+# All three hashes must be identical
+[[ "$h1" == "$h2" ]] && [[ "$h2" == "$h3" ]] || { echo "idempotence hash mismatch: $h1 $h2 $h3" >&2; exit 1; }
 
 # CASE 14 — FOLLOWING SECTION WITH EMPTY BODY
-case_home="$(run_installer_case following_empty $'## Agent Bridge Consensus\n\nOLD\n\n## Following')"
+case_home="$(run_installer_case following_empty content $'## Agent Bridge Consensus\n\nOLD\n\n## Following')"
 assert_contains "$case_home/.config/opencode/AGENTS.md" "## Following"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD"
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
