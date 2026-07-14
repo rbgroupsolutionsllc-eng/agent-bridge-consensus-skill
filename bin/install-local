@@ -35,7 +35,7 @@ touch "$opencode_agents"
 python3 - "$opencode_agents" <<'PY'
 import sys, re
 content = open(sys.argv[1]).read()
-content = re.sub(r'\n## Agent Bridge Consensus\n.*?(?=\n## |\Z)', '', content, flags=re.DOTALL)
+content = re.sub(r'(?:\A|\n)## Agent Bridge Consensus\n.*?(?=\n## |\Z)', '', content, flags=re.DOTALL)
 open(sys.argv[1], 'w').write(content.rstrip())
 PY
 cat >> "$opencode_agents" <<'EOF'
