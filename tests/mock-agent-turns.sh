@@ -44,7 +44,7 @@ if [[ "$json" == "1" && "${MOCK_SCENARIO}" == "claude_bad_json" ]]; then
 fi
 
 case "${MOCK_SCENARIO}" in
-  fallback_opencode|fallback_antigravity|skip_failed_primary|distinct_fallback_reviewer|independent_reviewer_unavailable| \
+  fallback_opencode|fallback_antigravity|fallback_identity_verify|skip_failed_primary|distinct_fallback_reviewer|independent_reviewer_unavailable| \
   proto_only_status|proto_only_changed|proto_missing_handoff|proto_missing_next|proto_empty_required_value| \
   proto_invalid_status|proto_duplicate_status|proto_duplicate_handoff|proto_narration_before|proto_narration_after| \
   proto_evidence_omitted|proto_complete|proto_malformed_then_valid|proto_all_malformed| \
@@ -164,6 +164,9 @@ fi
 case "${MOCK_SCENARIO}" in
   mixed_provider_directive)
     printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock opencode implementer via directive\nNEXT: none\nHANDOFF: opencode implemented via directive\n'
+    ;;
+  fallback_identity_verify)
+    printf 'STATUS: COMPLETE\nCHANGED: changed.txt\nEVIDENCE: mock opencode changed output\nNEXT: codex verifies\nHANDOFF: opencode implementation ready\n'
     ;;
   judge_noise)
     printf 'noise line 1\nnoise line 2\nnoise line 3\nSTATUS: VERIFIED\nHANDOFF: judge says revise\nVERDICT: REQUEST_REVISION\n'
@@ -493,8 +496,18 @@ cmp -s "$tmp_root/missing-python-suite.stderr" "$tmp_root/missing-python-suite.e
 assert_not_contains "$tmp_root/missing-python-suite.stdout" "mock-agent-turns: ok ("
 
 state="$(MOCK_SCENARIO=consensus_round2 run_case consensus_round2 "$repo_dir/bin/agent-turns" "$workspace" "mock consensus" 3)"
+primary_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 assert_contains "$state/stdout.log" 'Total Claude cost: $0.0300'
+assert_contains "$primary_run_dir/round-1-claude.prompt.md" "YOU ARE: implementer/planner"
+assert_contains "$primary_run_dir/round-1-codex.prompt.md" "YOU ARE: reviewer/verifier"
+assert_contains "$primary_run_dir/round-1-codex.prompt.md" "LATEST IMPLEMENTER PROVIDER: claude"
+assert_not_contains "$primary_run_dir/round-1-claude.prompt.md" "YOU ARE: Claude"
+assert_not_contains "$primary_run_dir/round-1-claude.prompt.md" "YOU ARE: Codex"
+assert_not_contains "$primary_run_dir/round-1-codex.prompt.md" "YOU ARE: Claude"
+assert_not_contains "$primary_run_dir/round-1-codex.prompt.md" "YOU ARE: Codex"
+assert_contains "$primary_run_dir/round-2-claude.prompt.md" "Round 1 - Implementer (claude)"
+assert_contains "$primary_run_dir/round-2-claude.prompt.md" "Round 1 - Reviewer (codex)"
 [[ "$(cat "$state/codex-count")" == "2" ]]
 
 state="$(MOCK_SCENARIO=judge_noise run_case judge_noise "$repo_dir/bin/agent-turns" "$workspace" "mock judge" 2)"
@@ -526,9 +539,9 @@ assert_contains "$state/stdout.log" "claude returned unparseable/empty JSON"
 state="$(MOCK_SCENARIO=verify_window AGENT_BRIDGE_VERIFY_CMD='exit 1' run_case verify_window "$repo_dir/bin/agent-turns" "$workspace" "mock verify window" 4)"
 window_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_section_count "$window_run_dir/handoff.md" 4
-assert_contains "$window_run_dir/handoff.md" "Round 4 - Claude"
+assert_contains "$window_run_dir/handoff.md" "Round 4 - Implementer (claude)"
 assert_contains "$window_run_dir/handoff.md" "GROUND TRUTH FAILED"
-assert_contains "$window_run_dir/handoff.md" "Round 4 - Codex"
+assert_contains "$window_run_dir/handoff.md" "Round 4 - Reviewer (codex)"
 assert_contains "$window_run_dir/handoff.md" "ORCHESTRATOR REJECTED"
 
 state="$(MOCK_SCENARIO=preflight AGENT_BRIDGE_CODEX_RESUME=1 run_case_fail preflight "$repo_dir/bin/agent-turns" "$workspace" "mock preflight" 1)"
@@ -540,15 +553,32 @@ assert_contains "$state/stdout.log" 'Total Claude cost: $0.0300'
 assert_contains "$state/claude-args.log" "--resume sid-1"
 
 state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 run_case fallback_opencode "$repo_dir/bin/agent-turns" "$workspace" "mock opencode fallback" 1)"
-assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+fallback_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$fallback_run_dir/round-1-claude.prompt.md" "YOU ARE: implementer/planner"
+assert_not_contains "$fallback_run_dir/round-1-claude.prompt.md" "YOU ARE: Claude"
+assert_not_contains "$fallback_run_dir/round-1-claude.prompt.md" "YOU ARE: Codex"
+assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+assert_contains "$fallback_run_dir/handoff.md" "Round 1 - Implementer (opencode)"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 assert_contains "$state/opencode-args.log" "--model opencode-go/minimax-m3"
 
 state="$(MOCK_SCENARIO=fallback_antigravity AGENT_BRIDGE_RESUME=0 run_case fallback_antigravity "$repo_dir/bin/agent-turns" "$workspace" "mock antigravity fallback" 1)"
+fallback_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$fallback_run_dir/round-1-claude.prompt.md" "YOU ARE: implementer/planner"
+assert_not_contains "$fallback_run_dir/round-1-claude.prompt.md" "YOU ARE: Claude"
+assert_not_contains "$fallback_run_dir/round-1-claude.prompt.md" "YOU ARE: Codex"
 assert_contains "$state/stdout.log" "fallback: opencode unavailable"
-assert_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_contains "$state/stdout.log" "fallback: agy answered for implementer"
+assert_contains "$fallback_run_dir/handoff.md" "Round 1 - Implementer (agy)"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 assert_contains "$state/agy-args.log" "--model"
+
+state="$(MOCK_SCENARIO=fallback_identity_verify AGENT_BRIDGE_RESUME=0 AGENT_BRIDGE_VERIFY_CMD=true run_case fallback_identity_verify "$repo_dir/bin/agent-turns" "$workspace" "mock fallback identity verify" 1)"
+identity_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+assert_contains "$identity_run_dir/round-1-codex.prompt.md" "LATEST IMPLEMENTER PROVIDER: opencode"
+assert_contains "$identity_run_dir/handoff.md" "GROUND TRUTH after opencode"
+assert_not_contains "$identity_run_dir/handoff.md" "GROUND TRUTH after claude"
 
 state="$(MOCK_SCENARIO=skip_failed_primary AGENT_BRIDGE_RESUME=0 run_case skip_failed_primary "$repo_dir/bin/agent-turns" "$workspace" "mock failed provider skip" 2)"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
@@ -580,8 +610,18 @@ agy_args="$(cat "$skill_dir_absent/state/agy-args.log")"
 # fallback implementer; OpenCode must be excluded from reviewer fallback
 # selection so a distinct provider (agy) performs the independent review.
 state="$(MOCK_SCENARIO=distinct_fallback_reviewer AGENT_BRIDGE_RESUME=0 run_case distinct_fallback_reviewer "$repo_dir/bin/agent-turns" "$workspace" "mock distinct fallback reviewer" 1)"
-assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
-assert_contains "$state/stdout.log" "fallback: agy answered for Codex reviewer"
+distinct_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
+assert_contains "$distinct_run_dir/round-1-claude.prompt.md" "YOU ARE: implementer/planner"
+assert_contains "$distinct_run_dir/round-1-codex.prompt.md" "YOU ARE: reviewer/verifier"
+assert_contains "$distinct_run_dir/round-1-codex.prompt.md" "LATEST IMPLEMENTER PROVIDER: opencode"
+assert_not_contains "$distinct_run_dir/round-1-claude.prompt.md" "YOU ARE: Claude"
+assert_not_contains "$distinct_run_dir/round-1-claude.prompt.md" "YOU ARE: Codex"
+assert_not_contains "$distinct_run_dir/round-1-codex.prompt.md" "YOU ARE: Claude"
+assert_not_contains "$distinct_run_dir/round-1-codex.prompt.md" "YOU ARE: Codex"
+assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+assert_contains "$state/stdout.log" "fallback: agy answered for reviewer"
+assert_contains "$distinct_run_dir/handoff.md" "Round 1 - Implementer (opencode)"
+assert_contains "$distinct_run_dir/handoff.md" "Round 1 - Reviewer (agy)"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 opencode_calls="$(cat "$state/opencode-count")"
 agy_calls="$(cat "$state/agy-count")"
@@ -593,7 +633,7 @@ agy_calls="$(cat "$state/agy-count")"
 # fail closed instead of accepting the implementer's own provider as the
 # reviewer.
 state="$(MOCK_SCENARIO=independent_reviewer_unavailable AGENT_BRIDGE_RESUME=0 AGENT_BRIDGE_FALLBACKS=opencode run_case independent_reviewer_unavailable "$repo_dir/bin/agent-turns" "$workspace" "mock independent reviewer unavailable" 1)"
-assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
 assert_contains "$state/stdout.log" "independent reviewer unavailable"
 if grep -Fq -- "=== Done: CONSENSUS ===" "$state/stdout.log"; then
   echo "expected no CONSENSUS terminal state, but found one" >&2
@@ -616,8 +656,8 @@ for proto_case in \
   proto_duplicate_handoff proto_narration_before proto_narration_after
 do
   state="$(MOCK_SCENARIO="$proto_case" AGENT_BRIDGE_RESUME=0 run_case "$proto_case" "$repo_dir/bin/agent-turns" "$workspace" "mock $proto_case" 1)"
-  assert_not_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
-  assert_not_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+  assert_not_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+  assert_not_contains "$state/stdout.log" "fallback: agy answered for implementer"
   assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
   assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
   assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
@@ -627,13 +667,13 @@ done
 # EVIDENCE is optional: a complete protocol response missing EVIDENCE must
 # still be accepted.
 state="$(MOCK_SCENARIO=proto_evidence_omitted AGENT_BRIDGE_RESUME=0 run_case proto_evidence_omitted "$repo_dir/bin/agent-turns" "$workspace" "mock proto_evidence_omitted" 1)"
-assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 
 # Fully complete protocol (all five fields, EVIDENCE included once) must be
 # accepted.
 state="$(MOCK_SCENARIO=proto_complete AGENT_BRIDGE_RESUME=0 run_case proto_complete "$repo_dir/bin/agent-turns" "$workspace" "mock proto_complete" 1)"
-assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 
 # First fallback (opencode) returns a malformed/partial protocol and must be
@@ -641,8 +681,8 @@ assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 # whose complete valid protocol is accepted and the run continues normally.
 state="$(MOCK_SCENARIO=proto_malformed_then_valid AGENT_BRIDGE_RESUME=0 run_case proto_malformed_then_valid "$repo_dir/bin/agent-turns" "$workspace" "mock proto_malformed_then_valid" 1)"
 assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
-assert_not_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
-assert_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_not_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+assert_contains "$state/stdout.log" "fallback: agy answered for implementer"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 
 # Every configured fallback returns a malformed/partial protocol: no
@@ -664,7 +704,7 @@ for proto_case in \
   proto_ws_between_mixed
 do
   state="$(MOCK_SCENARIO="$proto_case" AGENT_BRIDGE_RESUME=0 run_case "$proto_case" "$repo_dir/bin/agent-turns" "$workspace" "mock $proto_case" 1)"
-  assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+  assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
   assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 done
 
@@ -672,8 +712,8 @@ done
 # away — an indented "  STATUS: VERIFIED" line is not a recognized field
 # line and must still be rejected, same as any other narration line.
 state="$(MOCK_SCENARIO=proto_ws_indented_key AGENT_BRIDGE_RESUME=0 run_case proto_ws_indented_key "$repo_dir/bin/agent-turns" "$workspace" "mock proto_ws_indented_key" 1)"
-assert_not_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
-assert_not_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_not_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+assert_not_contains "$state/stdout.log" "fallback: agy answered for implementer"
 assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
 assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
 assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
@@ -992,8 +1032,8 @@ judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 # turn's protocol (validate_turn_protocol has no VERDICT case, so a VERDICT:
 # line is an unrecognized line and the whole response is rejected).
 state="$(MOCK_SCENARIO=proto_verdict_line AGENT_BRIDGE_RESUME=0 run_case proto_verdict_line "$repo_dir/bin/agent-turns" "$workspace" "mock proto_verdict_line" 1)"
-assert_not_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
-assert_not_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_not_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+assert_not_contains "$state/stdout.log" "fallback: agy answered for implementer"
 assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
 assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
 assert_contains "$state/stdout.log" "=== Done: CLAUDE_ERROR ==="
@@ -1014,7 +1054,7 @@ run_directive_case() {
   run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
   local prompt_file="$run_dir/round-1-claude.prompt.md"
   assert_contains "$prompt_file" "GOAL: $expected_cleaned"
-  assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+  assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
   assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
   echo "$state"
 }
@@ -1054,7 +1094,7 @@ state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
 run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
 assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Review  change"
 assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
-assert_contains "$state/stdout.log" "fallback: agy answered for Claude implementer"
+assert_contains "$state/stdout.log" "fallback: agy answered for implementer"
 assert_contains "$state/agy-args.log" "--model Gemini 3.5 Flash (Medium)"
 
 # --- Both providers plus metadata ---
@@ -1424,8 +1464,8 @@ state="$(MOCK_SCENARIO=mixed_provider_directive AGENT_BRIDGE_RESUME=0 \
   run_case "dir_mixed_provider_execution" "$repo_dir/bin/agent-turns" "$workspace" \
   "[owner:backend] Deploy [opencode:o1] then review [agy:a1] [ticket:ABC-123]" 1)"
 run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
-assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
-assert_contains "$state/stdout.log" "fallback: agy answered for Codex reviewer"
+assert_contains "$state/stdout.log" "fallback: opencode answered for implementer"
+assert_contains "$state/stdout.log" "fallback: agy answered for reviewer"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
 assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" \
   "[owner:backend] Deploy  then review  [ticket:ABC-123]"

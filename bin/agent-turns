@@ -212,14 +212,15 @@ run_verify() {
 }
 
 build_prompt() {
-  local out="$1" agent="$2"
-  shift 2
+  local out="$1" role="$2" context_line="${3:-}"
+  shift 3
   {
     cat "$protocol"
     echo
     echo "GOAL: $goal"
     echo "WORKSPACE: $workspace"
-    echo "YOU ARE: $agent"
+    echo "YOU ARE: $role"
+    [[ -z "$context_line" ]] || echo "$context_line"
     echo
     echo "# Recent turns"
     if [[ -s "$handoff_file" ]]; then cat "$handoff_file"; else echo "(first turn)"; fi
@@ -575,14 +576,14 @@ for ((round=1; round<=rounds; round++)); do
   printf '\n=== Round %d: Claude ===\n' "$round"
   c_prompt="$run_dir/round-${round}-claude.prompt.md"
   c_out="$run_dir/round-${round}-claude.out.md"
-  build_prompt "$c_prompt" "Claude (implementer/planner)" \
+  build_prompt "$c_prompt" "implementer/planner" "" \
     "Make concrete progress toward the goal, or revise per the latest feedback/verdict." \
     "Modify the workspace only if needed."
   if ! call_claude "$c_prompt" "$c_out"; then
     echo "  claude unavailable; starting automatic fallback"
-    if ! call_fallback "Claude implementer" "$c_prompt" "$c_out" ""; then
+    if ! call_fallback "implementer" "$c_prompt" "$c_out" ""; then
       [[ -s "$c_out" ]] || synth_block "$c_out" "Claude and configured fallback providers failed"
-      push_handoff "Round $round - Claude" "$c_out"
+      push_handoff "Round $round - Implementer (unavailable)" "$c_out"
       final_state="CLAUDE_ERROR"
       break
     fi
@@ -590,22 +591,22 @@ for ((round=1; round<=rounds; round++)); do
   else
     impl_provider="claude"
   fi
-  push_handoff "Round $round - Claude" "$c_out"
+  push_handoff "Round $round - Implementer ($impl_provider)" "$c_out"
   claude_status="$(get_status "$c_out")"
   echo "  claude STATUS: ${claude_status:-?}"
-  [[ -n "$verify_cmd" ]] && changed_something "$c_out" && run_verify "$round" claude
+  [[ -n "$verify_cmd" ]] && changed_something "$c_out" && run_verify "$round" "$impl_provider"
 
   printf '\n=== Round %d: Codex ===\n' "$round"
   x_prompt="$run_dir/round-${round}-codex.prompt.md"
   x_out="$run_dir/round-${round}-codex.out.md"
-  verify_hint="Independently verify Claude's latest claim. Respond VERIFIED only if you checked it yourself."
-  [[ "$claude_status" == "COMPLETE" ]] && verify_hint="Claude claims COMPLETE. Verify independently; respond VERIFIED or DISAGREE with evidence."
-  build_prompt "$x_prompt" "Codex (reviewer/verifier)" "$verify_hint"
+  verify_hint="Independently verify the latest implementer's claim. Respond VERIFIED only if you checked it yourself."
+  [[ "$claude_status" == "COMPLETE" ]] && verify_hint="The latest implementer claims COMPLETE. Verify independently; respond VERIFIED or DISAGREE with evidence."
+  build_prompt "$x_prompt" "reviewer/verifier" "LATEST IMPLEMENTER PROVIDER: $impl_provider" "$verify_hint"
   if ! call_codex "$x_prompt" "$x_out"; then
     echo "  codex unavailable; starting automatic fallback"
-    if ! call_fallback "Codex reviewer" "$x_prompt" "$x_out" "$impl_provider"; then
+    if ! call_fallback "reviewer" "$x_prompt" "$x_out" "$impl_provider"; then
       [[ -s "$x_out" ]] || synth_block "$x_out" "Codex and configured fallback providers failed"
-      push_handoff "Round $round - Codex" "$x_out"
+      push_handoff "Round $round - Reviewer (unavailable)" "$x_out"
       push_note "INDEPENDENT REVIEW UNAVAILABLE (round $round): implementer provider '$impl_provider' has no distinct fallback provider left to serve as reviewer; refusing to emit consensus"
       echo "  independent reviewer unavailable: no distinct provider identity remains to review '$impl_provider' this round"
       final_state="NO_INDEPENDENT_REVIEWER"
@@ -615,10 +616,10 @@ for ((round=1; round<=rounds; round++)); do
   else
     review_provider="codex"
   fi
-  push_handoff "Round $round - Codex" "$x_out"
+  push_handoff "Round $round - Reviewer ($review_provider)" "$x_out"
   codex_status="$(get_status "$x_out")"
   echo "  codex STATUS: ${codex_status:-?}"
-  [[ -n "$verify_cmd" ]] && changed_something "$x_out" && run_verify "$round" codex
+  [[ -n "$verify_cmd" ]] && changed_something "$x_out" && run_verify "$round" "$review_provider"
 
   # Defense in depth: even if selection logic above is ever bypassed, never
   # accept a reviewer identity that matches the implementer identity for
