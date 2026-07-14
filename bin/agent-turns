@@ -29,21 +29,52 @@ rounds="${3:-2}"
 
 # Parse inline model directives from goal: [opencode:model] [agy:model]
 # Only these two lowercase provider names are supported. Provider names are
-# case-sensitive; the value must be non-empty. The first valid occurrence per
-# provider selects the model; all valid occurrences are removed from the goal.
-# Unrelated bracket metadata (e.g. [owner:backend]) is preserved unchanged.
-# Normalize CR/LF first so extraction and sed operate on the same text.
-goal="$(printf '%s' "$goal" | tr -d '\r\n')"
-_re='\[opencode:([^]]+)\]'
-if [[ "$goal" =~ $_re ]]; then export AGENT_BRIDGE_OPENCODE_MODEL="${BASH_REMATCH[1]}"; fi
-_re='\[agy:([^]]+)\]'
-if [[ "$goal" =~ $_re ]]; then export AGENT_BRIDGE_ANTIGRAVITY_MODEL="${BASH_REMATCH[1]}"; fi
-goal="$(printf '%s' "$goal" | sed -E \
-  -e 's/\[opencode:[^]]+\]//g' \
-  -e 's/\[agy:[^]]+\]//g' \
-  -e 's/^[[:space:]]*//' \
-  -e 's/[[:space:]]*$//')"
-unset _re
+# case-sensitive; the value must be non-empty, must not contain ']', and must
+# not contain a carriage return (CR) — directives are single-line constructs.
+# The goal is split into logical lines (LF is the line separator and is
+# never treated as part of a directive value) and each line is parsed
+# independently, so a directive can never span multiple lines. The first
+# valid occurrence per provider, in document order across all lines, selects
+# that provider's model; every valid occurrence (for both providers) is
+# removed from the goal. Unrelated/invalid bracket text (wrong case, empty
+# value, unterminated, or split/embedded CR/LF) is preserved byte-for-byte.
+# Only the outer whitespace of the whole goal is trimmed, once, at the end —
+# internal blank lines and internal line whitespace are never touched.
+_cr=$'\r'
+_oc_re="\\[opencode:([^]${_cr}]+)\\]"
+_agy_re="\\[agy:([^]${_cr}]+)\\]"
+_oc_model=""
+_agy_model=""
+_cleaned_goal=""
+_first_line=1
+while IFS= read -r _dir_line || [[ -n "$_dir_line" ]]; do
+  _work="$_dir_line"
+  while [[ "$_work" =~ $_oc_re ]]; do
+    _match="${BASH_REMATCH[0]}"
+    [[ -z "$_oc_model" ]] && _oc_model="${BASH_REMATCH[1]}"
+    _work="${_work/"$_match"/}"
+  done
+  while [[ "$_work" =~ $_agy_re ]]; do
+    _match="${BASH_REMATCH[0]}"
+    [[ -z "$_agy_model" ]] && _agy_model="${BASH_REMATCH[1]}"
+    _work="${_work/"$_match"/}"
+  done
+  if [[ "$_first_line" -eq 1 ]]; then
+    _cleaned_goal="$_work"
+    _first_line=0
+  else
+    _cleaned_goal="${_cleaned_goal}"$'\n'"${_work}"
+  fi
+done < <(printf '%s' "$goal")
+[[ -n "$_oc_model" ]] && export AGENT_BRIDGE_OPENCODE_MODEL="$_oc_model"
+[[ -n "$_agy_model" ]] && export AGENT_BRIDGE_ANTIGRAVITY_MODEL="$_agy_model"
+_extglob_was_set=0
+shopt -q extglob && _extglob_was_set=1
+shopt -s extglob
+goal="${_cleaned_goal##+([[:space:]])}"
+goal="${goal%%+([[:space:]])}"
+[[ "$_extglob_was_set" -eq 0 ]] && shopt -u extglob
+unset _cr _oc_re _agy_re _oc_model _agy_model _cleaned_goal _first_line _dir_line _work _match _extglob_was_set
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bridge_dir="${AGENT_BRIDGE_HOME:-$HOME/agent-bridge}"

@@ -45,7 +45,7 @@ case "${MOCK_SCENARIO}" in
   proto_evidence_omitted|proto_complete|proto_malformed_then_valid|proto_all_malformed| \
   proto_ws_before_space|proto_ws_between_space|proto_ws_after_space|proto_ws_before_tab|proto_ws_between_tab| \
   proto_ws_after_tab|proto_ws_between_mixed|proto_ws_indented_key|proto_verdict_line| \
-  directive_model_agy)
+  directive_model_agy|mixed_provider_directive)
     exit 1
     ;;
   consensus_round2|json_resume|verify_fail_gate|verify_window)
@@ -108,7 +108,7 @@ done
 [[ -n "$out" ]] || { echo "missing --output-last-message" >&2; exit 2; }
 
 case "${MOCK_SCENARIO}" in
-  distinct_fallback_reviewer|independent_reviewer_unavailable)
+  distinct_fallback_reviewer|independent_reviewer_unavailable|mixed_provider_directive)
     exit 1
     ;;
   directive_*)
@@ -152,10 +152,14 @@ count=0
 count=$((count + 1))
 echo "$count" > "$count_file"
 printf '%s\n' "$*" >> "${MOCK_STATE}/opencode-args.log"
+printf '%s\0' "$@" > "${MOCK_STATE}/opencode-argv-${count}.nul"
 if [[ "${MOCK_SCENARIO}" == "fallback_antigravity" || "${MOCK_SCENARIO}" == "directive_model_agy" ]]; then
   exit 1
 fi
 case "${MOCK_SCENARIO}" in
+  mixed_provider_directive)
+    printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: mock opencode implementer via directive\nNEXT: none\nHANDOFF: opencode implemented via directive\n'
+    ;;
   judge_noise)
     printf 'noise line 1\nnoise line 2\nnoise line 3\nSTATUS: VERIFIED\nHANDOFF: judge says revise\nVERDICT: REQUEST_REVISION\n'
     ;;
@@ -245,7 +249,11 @@ count=0
 count=$((count + 1))
 echo "$count" > "$count_file"
 printf '%s\n' "$*" >> "${MOCK_STATE}/agy-args.log"
+printf '%s\0' "$@" > "${MOCK_STATE}/agy-argv-${count}.nul"
 case "${MOCK_SCENARIO:-}" in
+  mixed_provider_directive)
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock agy independent review via directive\nNEXT: none\nHANDOFF: agy reviewed independently via directive\n'
+    ;;
   distinct_fallback_reviewer)
     printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock agy independent review\nNEXT: none\nHANDOFF: reviewed independently as a distinct provider\n'
     ;;
@@ -395,6 +403,42 @@ assert_not_contains() {
     cat "$file" >&2
     exit 1
   fi
+}
+
+# NUL-delimited argv proof helpers (P2-A). These read a mock provider's
+# captured argv (written by the mock as `printf '%s\0' "$@"`) with
+# mapfile -d '' so argument boundaries are exact array elements, never
+# substrings of a joined "$*" string. This proves e.g. that a model value
+# containing spaces/colons/semicolons was delivered as ONE argv element
+# immediately following a literal "--model" element.
+assert_argv_model_exact() {
+  local file="$1" expected="$2" argv i found=0
+  [[ -f "$file" ]] || { echo "expected argv file not found: $file" >&2; exit 1; }
+  mapfile -d '' -t argv < "$file"
+  for ((i = 0; i < ${#argv[@]}; i++)); do
+    if [[ "${argv[$i]}" == "--model" && "${i}" -lt "$(( ${#argv[@]} - 1 ))" && "${argv[$((i + 1))]}" == "$expected" ]]; then
+      found=1
+      break
+    fi
+  done
+  [[ "$found" == "1" ]] || {
+    echo "expected --model element exactly followed by '$expected' in $file, got argv:" >&2
+    printf '  [%s]\n' "${argv[@]}" >&2
+    exit 1
+  }
+}
+
+assert_argv_model_absent() {
+  local file="$1" unexpected="$2" argv i
+  [[ -f "$file" ]] || { echo "expected argv file not found: $file" >&2; exit 1; }
+  mapfile -d '' -t argv < "$file"
+  for ((i = 0; i < ${#argv[@]}; i++)); do
+    if [[ "${argv[$i]}" == "--model" && "${i}" -lt "$(( ${#argv[@]} - 1 ))" && "${argv[$((i + 1))]}" == "$unexpected" ]]; then
+      echo "unexpected --model element exactly followed by '$unexpected' in $file" >&2
+      printf '  [%s]\n' "${argv[@]}" >&2
+      exit 1
+    fi
+  done
 }
 
 state="$(MOCK_SCENARIO=consensus_round2 run_case consensus_round2 "$repo_dir/bin/agent-turns" "$workspace" "mock consensus" 3)"
@@ -1040,84 +1084,310 @@ assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Review  change"
 assert_contains "$state/agy-args.log" "--model Qwen3 Coder free"
 
 # ===========================================================================
-# RED PHASE: newline/CR in directive value — extraction succeeds but
-# sed operates line-by-line and CANNOT strip across line boundaries.
-# Both extraction and stripping must reject CR/LF in directive values.
+# Corrective fix regression coverage (P1-A/P1-B): the global CR/LF deletion
+# that used to run before directive extraction is gone. Directives are now
+# parsed per logical line (LF is the line separator, never directive
+# content); CR inside a would-be directive invalidates it. Legitimate
+# multiline goals must retain their exact newline structure, and invalid
+# CR/LF-containing bracket text must never be normalized into a valid
+# directive or overridden a configured model.
+#
+# assert_goal_block_equals extracts the exact GOAL block (from the "GOAL: "
+# line up to, but excluding, the "WORKSPACE:" line) and compares it
+# byte-for-byte (including embedded newlines) against the expected text —
+# this is what actually proves newline structure survives, not a substring
+# match against a single truncated line.
 # ===========================================================================
 
-# --- Newline inside opencode directive value ---
-state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+assert_goal_block_equals() {
+  local file="$1" expected="$2" actual
+  actual="$(awk '/^GOAL:/{p=1} /^WORKSPACE:/{p=0} p' "$file" | sed '1s/^GOAL: //')"
+  if [[ "$actual" != "$expected" ]]; then
+    echo "GOAL block mismatch in $file" >&2
+    echo "--- expected (cat -A) ---" >&2
+    printf '%s' "$expected" | cat -A >&2
+    echo "--- actual (cat -A) ---" >&2
+    printf '%s' "$actual" | cat -A >&2
+    exit 1
+  fi
+}
+
+# --- RED regression: an ordinary multiline goal with NO directive at all
+# must retain its real newline exactly (this exact input was PROVEN, against
+# unmodified 9a130fd, to collapse to "Deploy serviceReview change" via the
+# blanket `tr -d '\r\n'` normalization — a correctness regression on ordinary
+# user input, not directive-related at all).
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_plain_multiline_preserved" "$repo_dir/bin/agent-turns" "$workspace" \
+  $'Deploy service\nReview change' 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" $'Deploy service\nReview change'
+
+# --- RED regression: an LF embedded inside what looks like an opencode
+# directive makes it invalid (directives cannot span lines). Against
+# unmodified 9a130fd this was PROVEN to become a valid directive selecting
+# model "model-x" via the same blanket CR/LF deletion. The fix must leave
+# the two original lines completely unchanged and the sentinel default model
+# selected (no override).
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  AGENT_BRIDGE_OPENCODE_MODEL=default-opencode-model \
   run_case "dir_newline_opencode" "$repo_dir/bin/agent-turns" "$workspace" \
   $'Deploy [opencode:model\n-x] service' 1)"
 run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
-# Directive must NOT be in the GOAL (not stripped)
-assert_not_contains "$run_dir/round-1-claude.prompt.md" "[opencode:model"
-# Newline in goal text is stripped (not the directive — the directive is rejected)
-assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" $'Deploy [opencode:model\n-x] service'
+assert_argv_model_exact "$state/opencode-argv-1.nul" "default-opencode-model"
+assert_argv_model_absent "$state/opencode-argv-1.nul" "model-x"
 
-# --- Newline inside agy directive value ---
+# --- RED regression: same defect for agy (LF-split directive). Against
+# unmodified 9a130fd this was PROVEN to become a valid directive selecting
+# model "model-x".
 state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  AGENT_BRIDGE_ANTIGRAVITY_MODEL=default-agy-model \
   run_case "dir_newline_agy" "$repo_dir/bin/agent-turns" "$workspace" \
   $'Deploy [agy:model\n-x] service' 1)"
 run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
-assert_not_contains "$run_dir/round-1-claude.prompt.md" "[agy:model"
-assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" $'Deploy [agy:model\n-x] service'
+assert_argv_model_exact "$state/agy-argv-1.nul" "default-agy-model"
+assert_argv_model_absent "$state/agy-argv-1.nul" "model-x"
 
-# --- CR inside opencode directive value ---
-state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+# --- RED regression: a CR embedded inside an opencode directive value makes
+# it invalid. Against unmodified 9a130fd this was PROVEN to become a valid
+# directive selecting model "modelX" (CR silently deleted, halves joined).
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  AGENT_BRIDGE_OPENCODE_MODEL=default-opencode-model \
   run_case "dir_cr_opencode" "$repo_dir/bin/agent-turns" "$workspace" \
   $'Deploy [opencode:model\rX] service' 1)"
 run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
-assert_not_contains "$run_dir/round-1-claude.prompt.md" "[opencode:model"
-assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" $'Deploy [opencode:model\rX] service'
+assert_argv_model_exact "$state/opencode-argv-1.nul" "default-opencode-model"
+assert_argv_model_absent "$state/opencode-argv-1.nul" "modelX"
 
-# --- CR inside agy directive value ---
+# --- RED regression: same defect for agy (CR-embedded directive). Against
+# unmodified 9a130fd this was PROVEN to become a valid directive selecting
+# model "modelX".
 state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  AGENT_BRIDGE_ANTIGRAVITY_MODEL=default-agy-model \
   run_case "dir_cr_agy" "$repo_dir/bin/agent-turns" "$workspace" \
   $'Deploy [agy:model\rX] service' 1)"
 run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
-assert_not_contains "$run_dir/round-1-claude.prompt.md" "[agy:model"
-assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" $'Deploy [agy:model\rX] service'
+assert_argv_model_exact "$state/agy-argv-1.nul" "default-agy-model"
+assert_argv_model_absent "$state/agy-argv-1.nul" "modelX"
 
-# --- Multiline goal with valid directive on separate lines ---
-# Directive on its own line is a valid single-line directive (LF is line
-# separator, not inside the value). Both extraction and stripping must work.
+# --- Invalid multiline directive (LF splits the bracket expression across
+# two lines) must be preserved verbatim, with no substring removed and no
+# lines concatenated — proves the fix handles the case even when the split
+# directive sits between two otherwise-ordinary words.
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  AGENT_BRIDGE_OPENCODE_MODEL=default-opencode-model \
+  run_case "dir_invalid_multiline_verbatim" "$repo_dir/bin/agent-turns" "$workspace" \
+  $'Deploy [opencode:model\ncontinued] service' 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" $'Deploy [opencode:model\ncontinued] service'
+assert_argv_model_exact "$state/opencode-argv-1.nul" "default-opencode-model"
+
+# --- Multiline goal with VALID directives on their own separate lines ---
+# A directive occupying an entire line is a valid single-line directive (LF
+# is the line separator, never inside the value). Multiline structure around
+# it is preserved exactly; each directive-only line becomes an empty line
+# (simple substring deletion of just the bracket expression on that line).
 state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
   run_case "dir_multiline_opencode" "$repo_dir/bin/agent-turns" "$workspace" \
   $'Deploy service\n[opencode:my-model]\n[agy:my-model]\nReview change' 1)"
 run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
-assert_not_contains "$run_dir/round-1-claude.prompt.md" "[opencode:my-model"
-assert_not_contains "$run_dir/round-1-claude.prompt.md" "[agy:my-model"
-assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy serviceReview change"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" $'Deploy service\n\n\nReview change'
 assert_contains "$state/agy-args.log" "--model my-model"
 
 # ===========================================================================
-# DUPLICATE/MIXED STRENGTHENING: argv assertions and mixed-provider extraction
+# STRICT DIRECTIVE GRAMMAR: extraction and stripping must recognize exactly
+# the same strings — no drift between "what selects a model" and "what gets
+# removed from the goal". Sentinel default models are configured explicitly
+# so an override is unambiguous and distinct from either provider's natural
+# CLI default.
 # ===========================================================================
 
-# --- Duplicate opencode: first-match argv verified ---
+run_sentinel_case() {
+  # run_sentinel_case <name> <provider: opencode|agy> <goal> <expected-goal>
+  local name="$1" provider="$2" goal="$3" expected="$4"
+  local mock_scn sentinel state run_dir argv_file
+  if [[ "$provider" == "opencode" ]]; then
+    mock_scn="fallback_opencode"; sentinel="default-opencode-model"
+  else
+    mock_scn="directive_model_agy"; sentinel="default-agy-model"
+  fi
+  state="$(MOCK_SCENARIO="$mock_scn" AGENT_BRIDGE_RESUME=0 \
+    AGENT_BRIDGE_OPENCODE_MODEL=default-opencode-model \
+    AGENT_BRIDGE_ANTIGRAVITY_MODEL=default-agy-model \
+    run_case "$name" "$repo_dir/bin/agent-turns" "$workspace" "$goal" 1)"
+  run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+  assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" "$expected"
+  if [[ "$provider" == "opencode" ]]; then
+    argv_file="$state/opencode-argv-1.nul"
+  else
+    argv_file="$state/agy-argv-1.nul"
+  fi
+  assert_argv_model_exact "$argv_file" "$sentinel"
+}
+
+# --- Empty value: no override, directive text preserved verbatim ---
+run_sentinel_case "dir_sentinel_empty_opencode" opencode "[opencode:] task" "[opencode:] task"
+run_sentinel_case "dir_sentinel_empty_agy" agy "[agy:] task" "[agy:] task"
+
+# --- Uppercase provider name: no override, preserved verbatim ---
+run_sentinel_case "dir_sentinel_upper_opencode" opencode "[OPENCODE:model] task" "[OPENCODE:model] task"
+run_sentinel_case "dir_sentinel_upper_agy" agy "[Agy:model] task" "[Agy:model] task"
+
+# --- Missing closing bracket: no override, preserved verbatim ---
+run_sentinel_case "dir_sentinel_unterminated_opencode" opencode "[opencode:model task" "[opencode:model task"
+run_sentinel_case "dir_sentinel_unterminated_agy" agy "[agy:model task" "[agy:model task"
+
+# --- LF inside value: no override, both original lines preserved verbatim ---
+run_sentinel_case "dir_sentinel_lf_opencode" opencode $'[opencode:model\ncontinued] task' $'[opencode:model\ncontinued] task'
+run_sentinel_case "dir_sentinel_lf_agy" agy $'[agy:model\ncontinued] task' $'[agy:model\ncontinued] task'
+
+# --- CR inside value: no override, preserved verbatim (single line) ---
+run_sentinel_case "dir_sentinel_cr_opencode" opencode $'[opencode:model\rcontinued] task' $'[opencode:model\rcontinued] task'
+run_sentinel_case "dir_sentinel_cr_agy" agy $'[agy:model\rcontinued] task' $'[agy:model\rcontinued] task'
+
+# --- CRLF inside value: no override, preserved verbatim (two lines, second
+# line starts with a lone CR as its first byte) ---
+run_sentinel_case "dir_sentinel_crlf_opencode" opencode $'[opencode:model\r\ncontinued] task' $'[opencode:model\r\ncontinued] task'
+run_sentinel_case "dir_sentinel_crlf_agy" agy $'[agy:model\r\ncontinued] task' $'[agy:model\r\ncontinued] task'
+
+# ===========================================================================
+# ARGV BOUNDARY PROOF (P2-A fix): replace $*-substring matching with
+# NUL-delimited argv capture, verified by exact array index/element — never
+# by substring containment of a joined string.
+# ===========================================================================
+
+# --- Duplicate opencode: first-match selects, proven by exact argv element
+# immediately after a literal "--model" element; the second value is never
+# selected as the model argument anywhere in the captured argv. ---
 state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
   run_case "dir_dup_opencode_argv" "$repo_dir/bin/agent-turns" "$workspace" \
   "Run [opencode:first/model] then [opencode:second/model]" 1)"
-assert_contains "$state/opencode-args.log" "--model first/model"
-assert_not_contains "$state/opencode-args.log" "--model second/model"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_argv_model_exact "$state/opencode-argv-1.nul" "first/model"
+assert_argv_model_absent "$state/opencode-argv-1.nul" "second/model"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" "Run  then"
 
-# --- Duplicate agy: first-match argv verified ---
+# --- Duplicate agy: first-match selects, proven by exact argv element. ---
 state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
   run_case "dir_dup_agy_argv" "$repo_dir/bin/agent-turns" "$workspace" \
   "Run [agy:first/model] then [agy:second/model]" 1)"
-assert_contains "$state/agy-args.log" "--model first/model"
-assert_not_contains "$state/agy-args.log" "--model second/model"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_argv_model_exact "$state/agy-argv-1.nul" "first/model"
+assert_argv_model_absent "$state/agy-argv-1.nul" "second/model"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" "Run  then"
 
-# --- Mixed providers: both models extracted from same goal ---
-# agy is the only provider called (directive_model_agy), but both env vars
-# must be set from the single goal string. agy-args.log proves its model.
+# --- Model with spaces delivered as exactly one argv element (not split). ---
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_argv_spaces_exact" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Deploy [opencode:Gemini 3.5 Flash (Medium)] service" 1)"
+assert_argv_model_exact "$state/opencode-argv-1.nul" "Gemini 3.5 Flash (Medium)"
+
+# --- Mixed providers: both models extracted from the same goal string, each
+# proven via its own provider's exact NUL-delimited argv. ---
 state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
   run_case "dir_mixed_providers" "$repo_dir/bin/agent-turns" "$workspace" \
   "Deploy [opencode:my-model] service [agy:Qwen3 Coder free] now" 1)"
 run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
-assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service  now"
-assert_contains "$state/agy-args.log" "--model Qwen3 Coder free"
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" "Deploy  service  now"
+assert_argv_model_exact "$state/agy-argv-1.nul" "Qwen3 Coder free"
+
+# ===========================================================================
+# SHELL-SAFETY: directive values are inert data end-to-end. No command
+# substitution, backtick execution, glob expansion, or variable expansion
+# ever occurs, regardless of value content. Proven via NUL-delimited argv
+# (exact single element, byte-for-byte) plus absence of any marker file or
+# unexpected output that execution/expansion would have produced.
+# ===========================================================================
+
+run_shell_safety_case() {
+  # run_shell_safety_case <name> <provider: opencode|agy> <literal-value>
+  local name="$1" provider="$2" value="$3"
+  local mock_scn state run_dir argv_file
+  if [[ "$provider" == "opencode" ]]; then
+    mock_scn="fallback_opencode"
+  else
+    mock_scn="directive_model_agy"
+  fi
+  state="$(MOCK_SCENARIO="$mock_scn" AGENT_BRIDGE_RESUME=0 \
+    run_case "$name" "$repo_dir/bin/agent-turns" "$workspace" \
+    "Deploy [${provider}:${value}] service" 1)"
+  run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+  assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" "Deploy  service"
+  if [[ "$provider" == "opencode" ]]; then
+    argv_file="$state/opencode-argv-1.nul"
+  else
+    argv_file="$state/agy-argv-1.nul"
+  fi
+  assert_argv_model_exact "$argv_file" "$value"
+  [[ ! -e "$state/PWNED" ]] || { echo "FAIL: command injection via $provider directive ($name)" >&2; exit 1; }
+  [[ ! -e "$tmp_root/PWNED" ]] || { echo "FAIL: command injection via $provider directive ($name, tmp_root)" >&2; exit 1; }
+  [[ -z "$(find "$tmp_root" -maxdepth 1 -newer "$state/stdout.log" -name 'PWNED*' 2>/dev/null)" ]] || \
+    { echo "FAIL: unexpected PWNED-named artifact via $provider directive ($name)" >&2; exit 1; }
+}
+
+# --- semicolon: no command chaining ---
+run_shell_safety_case "dir_safety_semicolon_opencode" opencode 'model;printf PWNED'
+run_shell_safety_case "dir_safety_semicolon_agy" agy 'model;printf PWNED'
+
+# --- $(...) command substitution: no execution ---
+run_shell_safety_case "dir_safety_dollarparen_opencode" opencode 'model$(printf PWNED)'
+run_shell_safety_case "dir_safety_dollarparen_agy" agy 'model$(printf PWNED)'
+
+# --- backticks: no execution ---
+run_shell_safety_case "dir_safety_backtick_opencode" opencode 'model`printf PWNED`'
+run_shell_safety_case "dir_safety_backtick_agy" agy 'model`printf PWNED`'
+
+# --- glob characters (* and ?): no expansion against real files ---
+run_shell_safety_case "dir_safety_glob_star_opencode" opencode 'model-*-variant'
+run_shell_safety_case "dir_safety_glob_star_agy" agy 'model-*-variant'
+run_shell_safety_case "dir_safety_glob_question_opencode" opencode 'model-?-variant'
+run_shell_safety_case "dir_safety_glob_question_agy" agy 'model-?-variant'
+
+# --- opening bracket in value: no injection, delivered literally ---
+run_shell_safety_case "dir_safety_open_bracket_opencode" opencode 'model[tag'
+run_shell_safety_case "dir_safety_open_bracket_agy" agy 'model[tag'
+
+# --- colon in value: no injection, delivered literally ---
+run_shell_safety_case "dir_safety_colon_opencode" opencode 'provider/model:variant'
+run_shell_safety_case "dir_safety_colon_agy" agy 'provider/model:variant'
+
+# --- variable expansion attempt: no expansion (literal $HOME-looking text) ---
+run_shell_safety_case "dir_safety_var_expand_opencode" opencode 'model-$HOME-variant'
+run_shell_safety_case "dir_safety_var_expand_agy" agy 'model-$HOME-variant'
+
+# ===========================================================================
+# MIXED-PROVIDER EXECUTION (P2-B fix): a single mocked round where Claude and
+# Codex both fail, OpenCode serves as the fallback implementer and agy serves
+# as the fallback reviewer, and BOTH providers are actually invoked (proven
+# by per-provider invocation counts and per-provider exact argv), in the same
+# run, with the existing P0 distinct-identity enforcement still active. A
+# scenario that only invokes agy (as previously existed) would NOT satisfy
+# this: both providers' models must be proven delivered in the same round.
+# ===========================================================================
+
+state="$(MOCK_SCENARIO=mixed_provider_directive AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_mixed_provider_execution" "$repo_dir/bin/agent-turns" "$workspace" \
+  "[owner:backend] Deploy [opencode:o1] then review [agy:a1] [ticket:ABC-123]" 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_contains "$state/stdout.log" "fallback: opencode answered for Claude implementer"
+assert_contains "$state/stdout.log" "fallback: agy answered for Codex reviewer"
+assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="
+assert_goal_block_equals "$run_dir/round-1-claude.prompt.md" \
+  "[owner:backend] Deploy  then review  [ticket:ABC-123]"
+assert_argv_model_exact "$state/opencode-argv-1.nul" "o1"
+assert_argv_model_exact "$state/agy-argv-1.nul" "a1"
+opencode_calls="$(cat "$state/opencode-count")"
+agy_calls="$(cat "$state/agy-count")"
+[[ "$opencode_calls" == "1" ]] || { echo "expected opencode invoked exactly once, got $opencode_calls" >&2; exit 1; }
+[[ "$agy_calls" == "1" ]] || { echo "expected agy invoked exactly once, got $agy_calls" >&2; exit 1; }
+# P0 still enforced: the reviewer identity (agy) must differ from the
+# implementer identity (opencode) — the run must never accept a same-provider
+# self-review even in this mixed-directive scenario.
+assert_not_contains "$state/stdout.log" "independent reviewer unavailable"
 
 TEST_COUNT=0
 [[ -f "$TEST_COUNT_FILE" ]] && TEST_COUNT="$(cat "$TEST_COUNT_FILE")"
