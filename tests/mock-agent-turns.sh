@@ -463,8 +463,12 @@ installer_missing_python_rc="$?"
 set -e
 [[ "$installer_missing_python_rc" == "2" ]] || { echo "expected install-local missing-python exit 2, got $installer_missing_python_rc" >&2; exit 1; }
 [[ ! -s "$tmp_root/missing-python-installer.stdout" ]] || { echo "expected empty install-local missing-python stdout" >&2; cat "$tmp_root/missing-python-installer.stdout" >&2; exit 1; }
-installer_missing_python_stderr="$(< "$tmp_root/missing-python-installer.stderr")"
-[[ "$installer_missing_python_stderr" == "install-local: required dependency not found: python3" ]] || { echo "unexpected install-local missing-python stderr: $installer_missing_python_stderr" >&2; exit 1; }
+printf '%s\n' "install-local: required dependency not found: python3" > "$tmp_root/missing-python-installer.expected-stderr"
+cmp -s "$tmp_root/missing-python-installer.stderr" "$tmp_root/missing-python-installer.expected-stderr" || {
+  echo "unexpected install-local missing-python stderr" >&2
+  cat "$tmp_root/missing-python-installer.stderr" >&2
+  exit 1
+}
 [[ ! -e "$missing_python_home/.codex" ]] || { echo "install-local created .codex before python3 guard" >&2; exit 1; }
 [[ ! -e "$missing_python_home/.claude" ]] || { echo "install-local created .claude before python3 guard" >&2; exit 1; }
 [[ ! -e "$missing_python_home/.local" ]] || { echo "install-local created .local before python3 guard" >&2; exit 1; }
@@ -480,8 +484,12 @@ suite_missing_python_rc="$?"
 set -e
 [[ "$suite_missing_python_rc" == "2" ]] || { echo "expected mock-agent-turns missing-python exit 2, got $suite_missing_python_rc" >&2; exit 1; }
 [[ ! -s "$tmp_root/missing-python-suite.stdout" ]] || { echo "expected empty mock-agent-turns missing-python stdout" >&2; cat "$tmp_root/missing-python-suite.stdout" >&2; exit 1; }
-suite_missing_python_stderr="$(< "$tmp_root/missing-python-suite.stderr")"
-[[ "$suite_missing_python_stderr" == "mock-agent-turns: required dependency not found: python3" ]] || { echo "unexpected mock-agent-turns missing-python stderr: $suite_missing_python_stderr" >&2; exit 1; }
+printf '%s\n' "mock-agent-turns: required dependency not found: python3" > "$tmp_root/missing-python-suite.expected-stderr"
+cmp -s "$tmp_root/missing-python-suite.stderr" "$tmp_root/missing-python-suite.expected-stderr" || {
+  echo "unexpected mock-agent-turns missing-python stderr" >&2
+  cat "$tmp_root/missing-python-suite.stderr" >&2
+  exit 1
+}
 assert_not_contains "$tmp_root/missing-python-suite.stdout" "mock-agent-turns: ok ("
 
 state="$(MOCK_SCENARIO=consensus_round2 run_case consensus_round2 "$repo_dir/bin/agent-turns" "$workspace" "mock consensus" 3)"
