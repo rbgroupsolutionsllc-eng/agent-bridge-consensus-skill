@@ -32,6 +32,8 @@ rounds="${3:-2}"
 # case-sensitive; the value must be non-empty. The first valid occurrence per
 # provider selects the model; all valid occurrences are removed from the goal.
 # Unrelated bracket metadata (e.g. [owner:backend]) is preserved unchanged.
+# Normalize CR/LF first so extraction and sed operate on the same text.
+goal="$(printf '%s' "$goal" | tr -d '\r\n')"
 _re='\[opencode:([^]]+)\]'
 if [[ "$goal" =~ $_re ]]; then export AGENT_BRIDGE_OPENCODE_MODEL="${BASH_REMATCH[1]}"; fi
 _re='\[agy:([^]]+)\]'

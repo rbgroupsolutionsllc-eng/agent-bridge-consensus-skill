@@ -4,6 +4,8 @@ set -euo pipefail
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_root="$(mktemp -d)"
 trap 'rm -rf "$tmp_root"' EXIT
+TEST_COUNT=0
+TEST_COUNT_FILE="$tmp_root/.test_count"
 
 mockbin="$tmp_root/bin"
 workspace="$tmp_root/workspace"
@@ -338,6 +340,9 @@ run_case() {
   shift
   local state="$tmp_root/state-$name"
   mkdir -p "$state"
+  # File-based counter: persists across subshells
+  local n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
+  echo $((n + 1)) > "$TEST_COUNT_FILE"
   MOCK_STATE="$state" PATH="$mockbin:$PATH" AGENT_BRIDGE_HOME="$bridge_home/$name" "$@" > "$state/stdout.log" 2> "$state/stderr.log"
   echo "$state"
 }
@@ -347,6 +352,9 @@ run_case_fail() {
   shift
   local state="$tmp_root/state-$name"
   mkdir -p "$state"
+  # File-based counter: persists across subshells
+  local n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
+  echo $((n + 1)) > "$TEST_COUNT_FILE"
   set +e
   MOCK_STATE="$state" PATH="$mockbin:$PATH" AGENT_BRIDGE_HOME="$bridge_home/$name" "$@" > "$state/stdout.log" 2> "$state/stderr.log"
   echo "$?" > "$state/exit-code"
@@ -997,6 +1005,23 @@ state="$(run_directive_case "dir_shell_opencode" "[opencode:model;printf PWNED]"
 state="$(run_directive_case "dir_shell_agy" "[agy:model\$(printf PWNED)]" "")"
 [[ ! -e "$state/PWNED" ]] || { echo "FAIL: command injection via agy directive" >&2; exit 1; }
 
+# --- Argv boundary: model with spaces passed as single argument ---
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_argv_spaces" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Deploy [opencode:Gemini 3.5 Flash (Medium)] service" 1)"
+args_line="$(cat "$state/opencode-args.log")"
+# Verify --model is followed by the full value as one token (no splitting)
+[[ "$args_line" == *"--model Gemini 3.5 Flash (Medium)"* ]] || \
+  { echo "FAIL: model with spaces not passed as single argv: $args_line" >&2; exit 1; }
+
+# --- Argv boundary: model with colons passed as single argument ---
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_argv_colon" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Deploy [opencode:provider/model:variant] service" 1)"
+args_line="$(cat "$state/opencode-args.log")"
+[[ "$args_line" == *"--model provider/model:variant"* ]] || \
+  { echo "FAIL: model with colons not passed as single argv: $args_line" >&2; exit 1; }
+
 # --- Model delivery: opencode directive overrides env default ---
 state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
   run_case "dir_model_opencode" "$repo_dir/bin/agent-turns" "$workspace" \
@@ -1014,4 +1039,86 @@ run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
 assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Review  change"
 assert_contains "$state/agy-args.log" "--model Qwen3 Coder free"
 
-echo "mock-agent-turns: ok"
+# ===========================================================================
+# RED PHASE: newline/CR in directive value — extraction succeeds but
+# sed operates line-by-line and CANNOT strip across line boundaries.
+# Both extraction and stripping must reject CR/LF in directive values.
+# ===========================================================================
+
+# --- Newline inside opencode directive value ---
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_newline_opencode" "$repo_dir/bin/agent-turns" "$workspace" \
+  $'Deploy [opencode:model\n-x] service' 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+# Directive must NOT be in the GOAL (not stripped)
+assert_not_contains "$run_dir/round-1-claude.prompt.md" "[opencode:model"
+# Newline in goal text is stripped (not the directive — the directive is rejected)
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+
+# --- Newline inside agy directive value ---
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_newline_agy" "$repo_dir/bin/agent-turns" "$workspace" \
+  $'Deploy [agy:model\n-x] service' 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_not_contains "$run_dir/round-1-claude.prompt.md" "[agy:model"
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+
+# --- CR inside opencode directive value ---
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_cr_opencode" "$repo_dir/bin/agent-turns" "$workspace" \
+  $'Deploy [opencode:model\rX] service' 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_not_contains "$run_dir/round-1-claude.prompt.md" "[opencode:model"
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+
+# --- CR inside agy directive value ---
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_cr_agy" "$repo_dir/bin/agent-turns" "$workspace" \
+  $'Deploy [agy:model\rX] service' 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_not_contains "$run_dir/round-1-claude.prompt.md" "[agy:model"
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service"
+
+# --- Multiline goal with valid directive on separate lines ---
+# Directive on its own line is a valid single-line directive (LF is line
+# separator, not inside the value). Both extraction and stripping must work.
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_multiline_opencode" "$repo_dir/bin/agent-turns" "$workspace" \
+  $'Deploy service\n[opencode:my-model]\n[agy:my-model]\nReview change' 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_not_contains "$run_dir/round-1-claude.prompt.md" "[opencode:my-model"
+assert_not_contains "$run_dir/round-1-claude.prompt.md" "[agy:my-model"
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy serviceReview change"
+assert_contains "$state/agy-args.log" "--model my-model"
+
+# ===========================================================================
+# DUPLICATE/MIXED STRENGTHENING: argv assertions and mixed-provider extraction
+# ===========================================================================
+
+# --- Duplicate opencode: first-match argv verified ---
+state="$(MOCK_SCENARIO=fallback_opencode AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_dup_opencode_argv" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Run [opencode:first/model] then [opencode:second/model]" 1)"
+assert_contains "$state/opencode-args.log" "--model first/model"
+assert_not_contains "$state/opencode-args.log" "--model second/model"
+
+# --- Duplicate agy: first-match argv verified ---
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_dup_agy_argv" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Run [agy:first/model] then [agy:second/model]" 1)"
+assert_contains "$state/agy-args.log" "--model first/model"
+assert_not_contains "$state/agy-args.log" "--model second/model"
+
+# --- Mixed providers: both models extracted from same goal ---
+# agy is the only provider called (directive_model_agy), but both env vars
+# must be set from the single goal string. agy-args.log proves its model.
+state="$(MOCK_SCENARIO=directive_model_agy AGENT_BRIDGE_RESUME=0 \
+  run_case "dir_mixed_providers" "$repo_dir/bin/agent-turns" "$workspace" \
+  "Deploy [opencode:my-model] service [agy:Qwen3 Coder free] now" 1)"
+run_dir="$(awk '/^Run: / { print $2 }' "$state/stdout.log")"
+assert_contains "$run_dir/round-1-claude.prompt.md" "GOAL: Deploy  service  now"
+assert_contains "$state/agy-args.log" "--model Qwen3 Coder free"
+
+TEST_COUNT=0
+[[ -f "$TEST_COUNT_FILE" ]] && TEST_COUNT="$(cat "$TEST_COUNT_FILE")"
+echo "mock-agent-turns: ok ($TEST_COUNT cases)"
