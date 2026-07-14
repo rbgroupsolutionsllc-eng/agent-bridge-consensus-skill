@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '%s\n' "install-local: required dependency not found: python3" >&2
+  exit 2
+fi
+
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)"
 
 mkdir -p "$HOME/.codex/skills/agent-bridge-consensus"

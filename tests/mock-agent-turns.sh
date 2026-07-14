@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '%s\n' "mock-agent-turns: required dependency not found: python3" >&2
+  exit 2
+fi
+
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_root="$(mktemp -d)"
 trap 'rm -rf "$tmp_root"' EXIT
@@ -440,6 +445,44 @@ assert_argv_model_absent() {
     fi
   done
 }
+
+current_bash="${BASH:-}"
+[[ -n "$current_bash" && "$current_bash" = /* && -x "$current_bash" ]] || {
+  echo "unable to resolve absolute bash executable for missing-python guard tests" >&2
+  exit 1
+}
+
+n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
+echo $((n + 1)) > "$TEST_COUNT_FILE"
+missing_python_path="$tmp_root/missing-python-installer-path"
+missing_python_home="$tmp_root/missing-python-installer-home"
+mkdir -p "$missing_python_path"
+set +e
+PATH="$missing_python_path" HOME="$missing_python_home" "$current_bash" "$repo_dir/bin/install-local" > "$tmp_root/missing-python-installer.stdout" 2> "$tmp_root/missing-python-installer.stderr"
+installer_missing_python_rc="$?"
+set -e
+[[ "$installer_missing_python_rc" == "2" ]] || { echo "expected install-local missing-python exit 2, got $installer_missing_python_rc" >&2; exit 1; }
+[[ ! -s "$tmp_root/missing-python-installer.stdout" ]] || { echo "expected empty install-local missing-python stdout" >&2; cat "$tmp_root/missing-python-installer.stdout" >&2; exit 1; }
+installer_missing_python_stderr="$(< "$tmp_root/missing-python-installer.stderr")"
+[[ "$installer_missing_python_stderr" == "install-local: required dependency not found: python3" ]] || { echo "unexpected install-local missing-python stderr: $installer_missing_python_stderr" >&2; exit 1; }
+[[ ! -e "$missing_python_home/.codex" ]] || { echo "install-local created .codex before python3 guard" >&2; exit 1; }
+[[ ! -e "$missing_python_home/.claude" ]] || { echo "install-local created .claude before python3 guard" >&2; exit 1; }
+[[ ! -e "$missing_python_home/.local" ]] || { echo "install-local created .local before python3 guard" >&2; exit 1; }
+[[ ! -e "$missing_python_home/.config" ]] || { echo "install-local created .config before python3 guard" >&2; exit 1; }
+
+n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
+echo $((n + 1)) > "$TEST_COUNT_FILE"
+missing_python_suite_path="$tmp_root/missing-python-suite-path"
+mkdir -p "$missing_python_suite_path"
+set +e
+PATH="$missing_python_suite_path" "$current_bash" "$repo_dir/tests/mock-agent-turns.sh" > "$tmp_root/missing-python-suite.stdout" 2> "$tmp_root/missing-python-suite.stderr"
+suite_missing_python_rc="$?"
+set -e
+[[ "$suite_missing_python_rc" == "2" ]] || { echo "expected mock-agent-turns missing-python exit 2, got $suite_missing_python_rc" >&2; exit 1; }
+[[ ! -s "$tmp_root/missing-python-suite.stdout" ]] || { echo "expected empty mock-agent-turns missing-python stdout" >&2; cat "$tmp_root/missing-python-suite.stdout" >&2; exit 1; }
+suite_missing_python_stderr="$(< "$tmp_root/missing-python-suite.stderr")"
+[[ "$suite_missing_python_stderr" == "mock-agent-turns: required dependency not found: python3" ]] || { echo "unexpected mock-agent-turns missing-python stderr: $suite_missing_python_stderr" >&2; exit 1; }
+assert_not_contains "$tmp_root/missing-python-suite.stdout" "mock-agent-turns: ok ("
 
 state="$(MOCK_SCENARIO=consensus_round2 run_case consensus_round2 "$repo_dir/bin/agent-turns" "$workspace" "mock consensus" 3)"
 assert_contains "$state/stdout.log" "=== Done: CONSENSUS ==="

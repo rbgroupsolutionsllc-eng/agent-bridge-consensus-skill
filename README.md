@@ -13,6 +13,8 @@ Portable skill and local bridge protocol for coordinating Claude Code, Codex, Op
 
 ## Install Locally
 
+Prerequisite: Python 3 is required by `install-local`. The installer checks for `python3` before modifying the installation.
+
 ```bash
 ./bin/install-local
 ```
