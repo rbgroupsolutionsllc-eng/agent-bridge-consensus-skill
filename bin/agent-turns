@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# agent-turns v2.1.1 - token-efficient consensus loop
+# agent-turns v2.3.0 - token-efficient consensus loop with symmetric provider fallback
 #
 # Env vars:
 #   AGENT_BRIDGE_HOME            base dir for runs (default: ~/agent-bridge)
@@ -12,6 +12,9 @@ set -euo pipefail
 #   AGENT_BRIDGE_RESUME          1 = resume Claude session across rounds (default: 1, needs jq)
 #   AGENT_BRIDGE_CODEX_RESUME    1 = codex exec resume --last (default: 0, needs recent codex CLI)
 #   AGENT_BRIDGE_MAX_FALLBACK_CHARS  chars kept when output has no STATUS block (default: 1200)
+#   AGENT_BRIDGE_FALLBACKS        comma-separated fallback providers (default: opencode,agy)
+#   AGENT_BRIDGE_OPENCODE_MODEL   OpenCode model (default: opencode-go/minimax-m3); inline: [opencode:model]
+#   AGENT_BRIDGE_ANTIGRAVITY_MODEL  agy model (default: Gemini 3.5 Flash (Medium)); inline: [agy:model]
 
 usage() { echo "Usage: agent-turns <workspace> <goal> [rounds]" >&2; }
 
@@ -23,6 +26,55 @@ rounds="${3:-2}"
 
 [[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
 [[ "$rounds" =~ ^[0-9]+$ && "$rounds" -ge 1 ]] || { echo "Rounds must be a positive integer" >&2; exit 2; }
+
+# Parse inline model directives from goal: [opencode:model] [agy:model]
+# Only these two lowercase provider names are supported. Provider names are
+# case-sensitive; the value must be non-empty, must not contain ']', and must
+# not contain a carriage return (CR) — directives are single-line constructs.
+# The goal is split into logical lines (LF is the line separator and is
+# never treated as part of a directive value) and each line is parsed
+# independently, so a directive can never span multiple lines. The first
+# valid occurrence per provider, in document order across all lines, selects
+# that provider's model; every valid occurrence (for both providers) is
+# removed from the goal. Unrelated/invalid bracket text (wrong case, empty
+# value, unterminated, or split/embedded CR/LF) is preserved byte-for-byte.
+# Only the outer whitespace of the whole goal is trimmed, once, at the end —
+# internal blank lines and internal line whitespace are never touched.
+_cr=$'\r'
+_oc_re="\\[opencode:([^]${_cr}]+)\\]"
+_agy_re="\\[agy:([^]${_cr}]+)\\]"
+_oc_model=""
+_agy_model=""
+_cleaned_goal=""
+_first_line=1
+while IFS= read -r _dir_line || [[ -n "$_dir_line" ]]; do
+  _work="$_dir_line"
+  while [[ "$_work" =~ $_oc_re ]]; do
+    _match="${BASH_REMATCH[0]}"
+    [[ -z "$_oc_model" ]] && _oc_model="${BASH_REMATCH[1]}"
+    _work="${_work/"$_match"/}"
+  done
+  while [[ "$_work" =~ $_agy_re ]]; do
+    _match="${BASH_REMATCH[0]}"
+    [[ -z "$_agy_model" ]] && _agy_model="${BASH_REMATCH[1]}"
+    _work="${_work/"$_match"/}"
+  done
+  if [[ "$_first_line" -eq 1 ]]; then
+    _cleaned_goal="$_work"
+    _first_line=0
+  else
+    _cleaned_goal="${_cleaned_goal}"$'\n'"${_work}"
+  fi
+done < <(printf '%s' "$goal")
+[[ -n "$_oc_model" ]] && export AGENT_BRIDGE_OPENCODE_MODEL="$_oc_model"
+[[ -n "$_agy_model" ]] && export AGENT_BRIDGE_ANTIGRAVITY_MODEL="$_agy_model"
+_extglob_was_set=0
+shopt -q extglob && _extglob_was_set=1
+shopt -s extglob
+goal="${_cleaned_goal##+([[:space:]])}"
+goal="${goal%%+([[:space:]])}"
+[[ "$_extglob_was_set" -eq 0 ]] && shopt -u extglob
+unset _cr _oc_re _agy_re _oc_model _agy_model _cleaned_goal _first_line _dir_line _work _match _extglob_was_set
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bridge_dir="${AGENT_BRIDGE_HOME:-$HOME/agent-bridge}"
@@ -41,7 +93,13 @@ fi
 fallback_chars="${AGENT_BRIDGE_MAX_FALLBACK_CHARS:-1200}"
 resume_claude="${AGENT_BRIDGE_RESUME:-1}"
 resume_codex="${AGENT_BRIDGE_CODEX_RESUME:-0}"
+fallbacks="${AGENT_BRIDGE_FALLBACKS:-opencode,agy}"
 mkdir -p "$run_dir"
+
+# Session-wide provider failure tracking — any provider that fails is skipped for the rest of the session
+_failed_providers=" "
+mark_failed() { _failed_providers+="${1} "; echo "  provider unavailable for this session: $1" >&2; }
+is_failed()   { [[ "$_failed_providers" == *" ${1} "* ]]; }
 
 have_jq=0
 command -v jq >/dev/null 2>&1 && have_jq=1
@@ -71,6 +129,7 @@ NEXT: one concrete next action or "none"
 HANDOFF: one sentence to the next agent
 
 Rules:
+- Token rule: output the protocol block only. No preamble, no narration. Omit EVIDENCE if "not run".
 - Prefer evidence over explanation. Small, verifiable changes.
 - Do not undo the other agent's work unless it is clearly wrong.
 - Never mark COMPLETE for your own unverified implementation.
@@ -98,18 +157,6 @@ EVIDENCE: $2
 NEXT: operator intervention required
 HANDOFF: orchestrator-generated block; the agent call failed or returned unparseable output
 EOF
-}
-
-judge_summary() {
-  local f="$1" verdict lines
-  verdict="$(grep -m1 -oE 'ACCEPT_CLAUDE|ACCEPT_CODEX|REQUEST_REVISION|BLOCKED' "$f" || true)"
-  lines="$(grep -E '^(VERDICT|STATUS|HANDOFF):' "$f" | head -3 | tr '\n' ' ' || true)"
-  if [[ -n "$verdict" || -n "$lines" ]]; then
-    [[ "$lines" == *VERDICT:* ]] && verdict=""
-    printf '%s%s' "${verdict:+VERDICT: $verdict :: }" "$lines"
-  else
-    head -c 400 "$f" | tr '\n' ' '
-  fi
 }
 
 get_field() {
@@ -165,14 +212,15 @@ run_verify() {
 }
 
 build_prompt() {
-  local out="$1" agent="$2"
-  shift 2
+  local out="$1" role="$2" context_line="${3:-}"
+  shift 3
   {
     cat "$protocol"
     echo
     echo "GOAL: $goal"
     echo "WORKSPACE: $workspace"
-    echo "YOU ARE: $agent"
+    echo "YOU ARE: $role"
+    [[ -z "$context_line" ]] || echo "$context_line"
     echo
     echo "# Recent turns"
     if [[ -s "$handoff_file" ]]; then cat "$handoff_file"; else echo "(first turn)"; fi
@@ -185,8 +233,173 @@ build_prompt() {
 claude_session_id=""
 total_cost="0"
 
+# Round-scoped provider-identity tracking (independent-review enforcement).
+# Canonical identities: claude, codex, opencode, agy. Aliases (e.g.
+# "antigravity") are normalized to their canonical form before any
+# comparison. This is keyed strictly on which actual provider produced the
+# accepted output for a role — never on role text, filename, PID, response
+# content, model self-claims, or call order.
+_last_fallback_provider=""
+_last_fallback_outcome=""
+
+normalize_provider() {
+  local p="${1//[[:space:]]/}"
+  [[ "$p" == "antigravity" ]] && p="agy"
+  printf '%s' "$p"
+}
+
+is_supported_fallback_provider() {
+  case "$1" in
+    opencode|agy) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Strict, local, deterministic validation of a normal turn protocol response
+# (STATUS/CHANGED/EVIDENCE/NEXT/HANDOFF). This is the single authoritative
+# acceptance check for fallback candidates in call_fallback below; wrapper
+# scripts (e.g. ask-antigravity) may run their own coarse pre-check to fail
+# fast, but only this function decides whether a candidate response is
+# accepted into the run. Does NOT parse or touch judge VERDICT: output.
+#
+# Contract:
+#   - STATUS, CHANGED, NEXT, HANDOFF must each appear exactly once, anchored
+#     at line start, with a non-empty value after trimming whitespace.
+#   - EVIDENCE may appear at most once (optional).
+#   - STATUS value must be one of: PROPOSED VERIFIED DISAGREE REVISE BLOCKED COMPLETE.
+#   - Every non-blank line in the file must be a recognized protocol field
+#     line (single-line values only) — any other line (narration before,
+#     between, or after the block) causes rejection. Empty and
+#     whitespace-only lines are tolerated since they introduce no
+#     ambiguity; leading whitespace/indentation before a protocol key is
+#     NOT stripped from the line itself, so an indented key (e.g. "  STATUS:
+#     VERIFIED") is still rejected as an unrecognized line.
+_valid_status_re='^(PROPOSED|VERIFIED|DISAGREE|REVISE|BLOCKED|COMPLETE)$'
+
+validate_turn_protocol() {
+  local file="$1"
+  [[ -s "$file" ]] || return 1
+
+  local line status_n=0 changed_n=0 evidence_n=0 next_n=0 handoff_n=0
+  local status_v="" changed_v="" next_v="" handoff_v=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    case "$line" in
+      STATUS:*)   status_n=$((status_n + 1));   status_v="${line#STATUS:}" ;;
+      CHANGED:*)  changed_n=$((changed_n + 1)); changed_v="${line#CHANGED:}" ;;
+      EVIDENCE:*) evidence_n=$((evidence_n + 1)) ;;
+      NEXT:*)     next_n=$((next_n + 1));       next_v="${line#NEXT:}" ;;
+      HANDOFF:*)  handoff_n=$((handoff_n + 1)); handoff_v="${line#HANDOFF:}" ;;
+      *)
+        return 1
+        ;;
+    esac
+  done < "$file"
+
+  [[ "$status_n" -eq 1 && "$changed_n" -eq 1 && "$next_n" -eq 1 && "$handoff_n" -eq 1 ]] || return 1
+  [[ "$evidence_n" -le 1 ]] || return 1
+
+  status_v="$(printf '%s' "$status_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  changed_v="$(printf '%s' "$changed_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  next_v="$(printf '%s' "$next_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  handoff_v="$(printf '%s' "$handoff_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+  [[ -n "$status_v" && -n "$changed_v" && -n "$next_v" && -n "$handoff_v" ]] || return 1
+  [[ "$status_v" =~ $_valid_status_re ]] || return 1
+
+  return 0
+}
+
+# Strict, local, deterministic validation of a judge response
+# (STATUS/CHANGED/EVIDENCE/NEXT/HANDOFF/VERDICT). This is the single
+# authoritative acceptance check for judge candidates (both the primary
+# OpenCode judge and the agy fallback judge) in call_judge below. A judge
+# response is accepted only when it satisfies the COMPLETE protocol below —
+# never merely because a STATUS: or VERDICT: line exists somewhere in the
+# text.
+#
+# Contract (same structural rules as validate_turn_protocol, plus VERDICT):
+#   - STATUS, CHANGED, NEXT, HANDOFF, VERDICT must each appear exactly once,
+#     anchored at line start, with a non-empty value after trimming
+#     whitespace.
+#   - EVIDENCE may appear at most once (optional).
+#   - STATUS value must be one of: PROPOSED VERIFIED DISAGREE REVISE BLOCKED
+#     COMPLETE (same enum as validate_turn_protocol).
+#   - VERDICT value must be exactly one of: ACCEPT_CLAUDE ACCEPT_CODEX
+#     REQUEST_REVISION BLOCKED (case-sensitive, no extra text on the line).
+#   - Every non-blank line in the file must be a recognized protocol field
+#     line; any other line (narration, Markdown fences, unknown fields,
+#     decoy verdict tokens embedded in another field's value) causes
+#     rejection. Empty and whitespace-only lines are tolerated using the
+#     exact same blank-line logic as validate_turn_protocol; leading
+#     whitespace/indentation before a protocol key is NOT stripped, so an
+#     indented key is rejected as an unrecognized line.
+#   - A verdict token appearing inside STATUS/CHANGED/EVIDENCE/NEXT/HANDOFF
+#     values, or in any unrecognized narration line, never counts as the
+#     verdict and never causes acceptance on its own.
+_valid_verdict_re='^(ACCEPT_CLAUDE|ACCEPT_CODEX|REQUEST_REVISION|BLOCKED)$'
+
+validate_judge_protocol() {
+  local file="$1"
+  [[ -s "$file" ]] || return 1
+
+  local line status_n=0 changed_n=0 evidence_n=0 next_n=0 handoff_n=0 verdict_n=0
+  local status_v="" changed_v="" next_v="" handoff_v="" verdict_v=""
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    case "$line" in
+      STATUS:*)   status_n=$((status_n + 1));   status_v="${line#STATUS:}" ;;
+      CHANGED:*)  changed_n=$((changed_n + 1)); changed_v="${line#CHANGED:}" ;;
+      EVIDENCE:*) evidence_n=$((evidence_n + 1)) ;;
+      NEXT:*)     next_n=$((next_n + 1));       next_v="${line#NEXT:}" ;;
+      HANDOFF:*)  handoff_n=$((handoff_n + 1)); handoff_v="${line#HANDOFF:}" ;;
+      VERDICT:*)  verdict_n=$((verdict_n + 1)); verdict_v="${line#VERDICT:}" ;;
+      *)
+        return 1
+        ;;
+    esac
+  done < "$file"
+
+  [[ "$status_n" -eq 1 && "$changed_n" -eq 1 && "$next_n" -eq 1 && "$handoff_n" -eq 1 && "$verdict_n" -eq 1 ]] || return 1
+  [[ "$evidence_n" -le 1 ]] || return 1
+
+  status_v="$(printf '%s' "$status_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  changed_v="$(printf '%s' "$changed_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  next_v="$(printf '%s' "$next_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  handoff_v="$(printf '%s' "$handoff_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+  verdict_v="$(printf '%s' "$verdict_v" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+
+  [[ -n "$status_v" && -n "$changed_v" && -n "$next_v" && -n "$handoff_v" && -n "$verdict_v" ]] || return 1
+  [[ "$status_v" =~ $_valid_status_re ]] || return 1
+  [[ "$verdict_v" =~ $_valid_verdict_re ]] || return 1
+
+  return 0
+}
+
+# Anchored, defense-in-depth verdict extraction. Assumes the input already
+# passed validate_judge_protocol, but still reads ONLY the anchored
+# `VERDICT: ` field line rather than trusting prior validation blindly or
+# searching arbitrary file text for a bare token.
+judge_verdict() {
+  local f="$1" line
+  line="$(grep -m1 -E '^VERDICT:' "$f" || true)"
+  [[ -n "$line" ]] || { printf ''; return 0; }
+  printf '%s' "${line#VERDICT:}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+# Human-readable summary of an already-validated judge response, built ONLY
+# from anchored field lines (never a whole-file token search).
+judge_summary() {
+  local f="$1"
+  printf 'VERDICT: %s :: STATUS: %s :: HANDOFF: %s' \
+    "$(judge_verdict "$f")" "$(get_field "$f" STATUS)" "$(get_field "$f" HANDOFF)"
+}
+
 call_claude() {
   local prompt="$1" out="$2" raw="$2.json" rc result cost
+  is_failed claude && return 1
   local -a cmd=(claude -p --permission-mode acceptEdits --add-dir "$workspace")
   if [[ "$resume_claude" == "1" ]]; then
     cmd+=(--output-format json)
@@ -196,11 +409,13 @@ call_claude() {
     rc=$?
     set -e
     if [[ $rc -ne 0 ]]; then
+      mark_failed claude
       synth_block "$out" "claude CLI failed (exit=$rc, timeout=${turn_timeout}s); raw output: $raw"
       return 1
     fi
     result="$(jq -r '.result // empty' "$raw" 2>/dev/null || true)"
     if [[ -z "$result" ]]; then
+      mark_failed claude
       synth_block "$out" "claude returned unparseable/empty JSON; raw output: $raw"
       return 1
     fi
@@ -216,6 +431,7 @@ call_claude() {
     rc=$?
     set -e
     if [[ $rc -ne 0 ]]; then
+      mark_failed claude
       synth_block "$out" "claude CLI failed (exit=$rc, timeout=${turn_timeout}s)"
       return 1
     fi
@@ -224,6 +440,7 @@ call_claude() {
 
 call_codex() {
   local prompt="$1" out="$2" rc
+  is_failed codex && return 1
   local -a cmd=(codex --ask-for-approval never exec --cd "$workspace" --sandbox workspace-write)
   if [[ "$resume_codex" == "1" ]]; then
     cmd=(codex --ask-for-approval never exec resume --last --cd "$workspace" --sandbox workspace-write)
@@ -233,9 +450,86 @@ call_codex() {
   rc=$?
   set -e
   if [[ $rc -ne 0 || ! -s "$out" ]]; then
+    mark_failed codex
     synth_block "$out" "codex CLI failed (exit=$rc, timeout=${turn_timeout}s) or wrote empty output"
     return 1
   fi
+}
+
+call_fallback() {
+  # $4 (exclude) is the provider identity that already fulfilled a role this
+  # round (e.g. the implementer). It must never be selected again as the
+  # reviewer for the same round. Exclusion is round-scoped and MUST NOT be
+  # recorded via mark_failed: an excluded provider did not fail, and must
+  # remain eligible for other rounds/roles where independence is not at risk.
+  local role="$1" prompt="$2" out="$3" exclude provider rc candidate
+  exclude="$(normalize_provider "${4:-}")"
+  local -a providers
+  IFS=',' read -r -a providers <<< "$fallbacks"
+
+  _last_fallback_provider=""
+  _last_fallback_outcome=""
+
+  local distinct_supported=" " distinct_supported_count=0
+  for provider in "${providers[@]}"; do
+    provider="$(normalize_provider "$provider")"
+    [[ -n "$provider" ]] || continue
+    is_supported_fallback_provider "$provider" || continue
+    [[ -n "$exclude" && "$provider" == "$exclude" ]] && continue
+    if [[ "$distinct_supported" != *" ${provider} "* ]]; then
+      distinct_supported+="${provider} "
+      distinct_supported_count=$((distinct_supported_count + 1))
+    fi
+  done
+
+  for provider in "${providers[@]}"; do
+    provider="$(normalize_provider "$provider")"
+    [[ -n "$provider" ]] || continue
+    if is_failed "$provider"; then
+      echo "  fallback: skipping $provider (unavailable this session)"
+      continue
+    fi
+    if [[ -n "$exclude" && "$provider" == "$exclude" ]]; then
+      echo "  fallback: skipping $provider (already participated this round as a different role; independent review requires a distinct provider identity)"
+      continue
+    fi
+    echo "  fallback: trying $provider for $role..."
+    candidate="${out}.fallback.$$"
+    rm -f "$candidate"
+    set +e
+    case "$provider" in
+      opencode)
+        timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$candidate"
+        rc=$?
+        ;;
+      agy|antigravity)
+        timeout "$turn_timeout" "$script_dir/ask-antigravity" "$workspace" "$prompt" "$candidate"
+        rc=$?
+        ;;
+      *)
+        echo "  fallback: unsupported provider '$provider'" >&2
+        rc=2
+        ;;
+    esac
+    set -e
+
+    if [[ $rc -eq 0 && -s "$candidate" ]] && validate_turn_protocol "$candidate"; then
+      mv "$candidate" "$out"
+      echo "  fallback: $provider answered for $role"
+      _last_fallback_provider="$provider"
+      _last_fallback_outcome="success"
+      return 0
+    fi
+    rm -f "$candidate"
+    mark_failed "$provider"
+    echo "  fallback: $provider unavailable (exit=$rc)"
+  done
+  if [[ "$distinct_supported_count" -eq 0 ]]; then
+    _last_fallback_outcome="no_distinct_candidate"
+  else
+    _last_fallback_outcome="candidates_failed"
+  fi
+  return 1
 }
 
 call_judge() {
@@ -244,22 +538,46 @@ call_judge() {
     cat "$protocol"
     echo
     echo "GOAL: $goal"
-    echo "YOU ARE: OpenCode, third-party judge. Do NOT edit files."
+    echo "YOU ARE: third-party judge. Do NOT edit files."
     echo
     echo "# Dispute"
     cat "$handoff_file"
     echo
     echo "# Your turn"
-    echo "Arbitrate. Return one verdict: ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED, with one reason."
+    echo "Arbitrate. Respond with the COMPLETE protocol block above (STATUS/CHANGED/NEXT/HANDOFF; EVIDENCE optional) PLUS exactly one additional line:"
+    echo "VERDICT: ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED"
+    echo "Rules: exactly one VERDICT line, containing one allowed value only (no extra words, no trailing punctuation). No narration, no Markdown fences, no lines other than the protocol fields."
   } > "$prompt"
-  echo "  escalating to OpenCode judge..."
+
   local jrc
-  set +e
-  timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
-  jrc=$?
-  set -e
-  if [[ $jrc -ne 0 || ! -s "$out" ]]; then
-    push_note "JUDGE UNAVAILABLE (round $round, exit=$jrc): continue without arbitration; operator review advised"
+  rm -f "$out"
+  # Primary judge: OpenCode
+  if ! is_failed opencode; then
+    echo "  escalating to OpenCode judge..."
+    set +e
+    timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
+    jrc=$?
+    set -e
+    if [[ $jrc -ne 0 || ! -s "$out" ]] || ! validate_judge_protocol "$out"; then
+      mark_failed opencode
+      rm -f "$out"
+    fi
+  fi
+  # Fallback judge: agy
+  if [[ ! -s "$out" ]] && is_failed opencode && ! is_failed agy; then
+    echo "  judge: OpenCode unavailable, trying agy..."
+    rm -f "$out"
+    set +e
+    timeout "$turn_timeout" "$script_dir/ask-antigravity" "$workspace" "$prompt" "$out"
+    jrc=$?
+    set -e
+    if [[ $jrc -ne 0 || ! -s "$out" ]] || ! validate_judge_protocol "$out"; then
+      mark_failed agy
+      rm -f "$out"
+    fi
+  fi
+  if [[ ! -s "$out" ]]; then
+    push_note "JUDGE UNAVAILABLE (round $round): all judge providers unavailable; operator review advised"
     return 0
   fi
   push_note "JUDGE VERDICT (round $round): $(judge_summary "$out")"
@@ -279,38 +597,86 @@ codex_status=""
 
 for ((round=1; round<=rounds; round++)); do
   round_verify_failed=0
+  impl_provider=""
+  review_provider=""
 
   printf '\n=== Round %d: Claude ===\n' "$round"
   c_prompt="$run_dir/round-${round}-claude.prompt.md"
   c_out="$run_dir/round-${round}-claude.out.md"
-  build_prompt "$c_prompt" "Claude (implementer/planner)" \
+  build_prompt "$c_prompt" "implementer/planner" "" \
     "Make concrete progress toward the goal, or revise per the latest feedback/verdict." \
     "Modify the workspace only if needed."
   if ! call_claude "$c_prompt" "$c_out"; then
-    push_handoff "Round $round - Claude" "$c_out"
-    final_state="CLAUDE_ERROR"
-    break
+    echo "  claude unavailable; starting automatic fallback"
+    if ! call_fallback "implementer" "$c_prompt" "$c_out" ""; then
+      [[ -s "$c_out" ]] || synth_block "$c_out" "Claude and configured fallback providers failed"
+      push_handoff "Round $round - Implementer (unavailable)" "$c_out"
+      final_state="CLAUDE_ERROR"
+      break
+    fi
+    impl_provider="$_last_fallback_provider"
+  else
+    impl_provider="claude"
   fi
-  push_handoff "Round $round - Claude" "$c_out"
+  push_handoff "Round $round - Implementer ($impl_provider)" "$c_out"
   claude_status="$(get_status "$c_out")"
   echo "  claude STATUS: ${claude_status:-?}"
-  [[ -n "$verify_cmd" ]] && changed_something "$c_out" && run_verify "$round" claude
+  [[ -n "$verify_cmd" ]] && changed_something "$c_out" && run_verify "$round" "$impl_provider"
 
   printf '\n=== Round %d: Codex ===\n' "$round"
   x_prompt="$run_dir/round-${round}-codex.prompt.md"
   x_out="$run_dir/round-${round}-codex.out.md"
-  verify_hint="Independently verify Claude's latest claim. Respond VERIFIED only if you checked it yourself."
-  [[ "$claude_status" == "COMPLETE" ]] && verify_hint="Claude claims COMPLETE. Verify independently; respond VERIFIED or DISAGREE with evidence."
-  build_prompt "$x_prompt" "Codex (reviewer/verifier)" "$verify_hint"
+  verify_hint="Independently verify the latest implementer's claim. Respond VERIFIED only if you checked it yourself."
+  [[ "$claude_status" == "COMPLETE" ]] && verify_hint="The latest implementer claims COMPLETE. Verify independently; respond VERIFIED or DISAGREE with evidence."
+  build_prompt "$x_prompt" "reviewer/verifier" "LATEST IMPLEMENTER PROVIDER: $impl_provider" "$verify_hint"
   if ! call_codex "$x_prompt" "$x_out"; then
-    push_handoff "Round $round - Codex" "$x_out"
-    final_state="CODEX_ERROR"
-    break
+    echo "  codex unavailable; starting automatic fallback"
+    if ! call_fallback "reviewer" "$x_prompt" "$x_out" "$impl_provider"; then
+      case "${_last_fallback_outcome:-}" in
+        no_distinct_candidate)
+          synth_block "$x_out" "independent reviewer unavailable: no distinct supported fallback reviewer is configured"
+          push_handoff "Round $round - Reviewer (unavailable)" "$x_out"
+          push_note "INDEPENDENT REVIEW UNAVAILABLE (round $round): no distinct supported fallback reviewer is configured after excluding implementer provider '$impl_provider'; refusing to emit consensus"
+          echo "  independent reviewer unavailable: no distinct supported fallback reviewer is configured"
+          final_state="NO_INDEPENDENT_REVIEWER"
+          break
+          ;;
+        candidates_failed)
+          synth_block "$x_out" "independent reviewer failed: distinct supported fallback reviewer candidates existed but all were unavailable or failed"
+          push_handoff "Round $round - Reviewer (failed)" "$x_out"
+          push_note "INDEPENDENT REVIEW FAILED (round $round): distinct supported fallback reviewer candidates existed but all were unavailable or failed; refusing to emit consensus"
+          echo "  independent reviewer failed: distinct supported fallback reviewer candidates existed but all were unavailable or failed"
+          final_state="CODEX_ERROR"
+          break
+          ;;
+        *)
+          synth_block "$x_out" "internal fallback classification failure while selecting independent reviewer"
+          push_handoff "Round $round - Reviewer (classification failure)" "$x_out"
+          push_note "INTERNAL FALLBACK CLASSIFICATION FAILURE (round $round): reviewer fallback outcome '${_last_fallback_outcome:-unset}' was not recognized; refusing to emit consensus"
+          echo "  independent reviewer failed: internal fallback classification failure"
+          final_state="CODEX_ERROR"
+          break
+          ;;
+      esac
+    fi
+    review_provider="$_last_fallback_provider"
+  else
+    review_provider="codex"
   fi
-  push_handoff "Round $round - Codex" "$x_out"
+  push_handoff "Round $round - Reviewer ($review_provider)" "$x_out"
   codex_status="$(get_status "$x_out")"
   echo "  codex STATUS: ${codex_status:-?}"
-  [[ -n "$verify_cmd" ]] && changed_something "$x_out" && run_verify "$round" codex
+  [[ -n "$verify_cmd" ]] && changed_something "$x_out" && run_verify "$round" "$review_provider"
+
+  # Defense in depth: even if selection logic above is ever bypassed, never
+  # accept a reviewer identity that matches the implementer identity for
+  # this round. Independence is decided by provider identity alone.
+  if [[ -n "$review_provider" && -n "$impl_provider" && "$review_provider" == "$impl_provider" ]]; then
+    push_note "ORCHESTRATOR REJECTED (round $round): reviewer provider '$review_provider' is the same identity that implemented this round; independent review unavailable"
+    echo "  independent reviewer unavailable: provider '$review_provider' cannot review its own implementation"
+    final_state="NO_INDEPENDENT_REVIEWER"
+    break
+  fi
 
   case "$codex_status" in
     VERIFIED|COMPLETE)

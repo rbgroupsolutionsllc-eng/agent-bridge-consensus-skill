@@ -9,12 +9,21 @@ fi
 workspace="$1"
 prompt_file="$2"
 output_file="${3:-}"
+model="${AGENT_BRIDGE_OPENCODE_MODEL:-opencode-go/minimax-m3}"
+variant="${AGENT_BRIDGE_OPENCODE_VARIANT:-}"
 
 [[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
 [[ -f "$prompt_file" ]] || { echo "Prompt file not found: $prompt_file" >&2; exit 2; }
 
+cmd=(opencode run --pure --dir "$workspace" --model "$model")
+[[ -n "$variant" ]] && cmd+=(--variant "$variant")
+
 if [[ -n "$output_file" ]]; then
-  opencode run --pure --dir "$workspace" "$(cat "$prompt_file")" > "$output_file"
+  tmp_output="${output_file}.tmp.$$"
+  trap 'rm -f "$tmp_output"' EXIT
+  "${cmd[@]}" "$(cat "$prompt_file")" > "$tmp_output"
+  [[ -s "$tmp_output" ]] || { echo "OpenCode returned empty output with model: $model" >&2; exit 1; }
+  mv "$tmp_output" "$output_file"
 else
-  opencode run --pure --dir "$workspace" "$(cat "$prompt_file")"
+  "${cmd[@]}" "$(cat "$prompt_file")"
 fi

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 3 ]]; then
+  echo "Usage: ask-antigravity <workspace> <prompt-file> <output-file>" >&2
+  exit 2
+fi
+
+workspace="$1"
+prompt_file="$2"
+output_file="$3"
+model="${AGENT_BRIDGE_ANTIGRAVITY_MODEL:-Gemini 3.5 Flash (Medium)}"
+
+[[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
+[[ -f "$prompt_file" ]] || { echo "Prompt file not found: $prompt_file" >&2; exit 2; }
+
+mkdir -p "$(dirname "$output_file")"
+
+tmp_output="${output_file}.tmp.$$"
+trap 'rm -f "$tmp_output"' EXIT
+
+skill_dir="$HOME/.local/share/agent-bridge"
+cmd=(agy --print --model "$model" --add-dir "$workspace")
+[[ -d "$skill_dir" ]] && cmd+=(--add-dir "$skill_dir")
+
+"${cmd[@]}" < "$prompt_file" > "$tmp_output"
+
+[[ -s "$tmp_output" ]] || { echo "agy returned empty output (model: $model)" >&2; exit 1; }
+# Coarse pre-check only: fail fast when no protocol field is present at all.
+# This is NOT the authoritative protocol validator — bin/agent-turns'
+# validate_turn_protocol() (used in call_fallback) is authoritative and
+# re-validates this output (full structure, required fields exactly once,
+# allowed STATUS values, no narration) before it is ever accepted.
+grep -qE '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$tmp_output" || {
+  echo "agy output missing bridge protocol; head: $(head -3 "$tmp_output")" >&2
+  exit 1
+}
+
+mv "$tmp_output" "$output_file"
