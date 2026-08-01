@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-bridge.dev/schemas/v3/run-state.schema.json",
+  "title": "V3 Run State",
+  "description": "Canonical state representation for an Agent Bridge V3 run",
+  "type": "object",
+  "schema_version": "1.0",
+  "required": [
+    "schema_version",
+    "run_id",
+    "state",
+    "round",
+    "goal",
+    "workspace",
+    "baseline",
+    "provider_assignments",
+    "failed_providers",
+    "excluded_providers",
+    "evidence_refs",
+    "pending_approval",
+    "last_event_id",
+    "created_at",
+    "updated_at",
+    "terminal_result"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Schema version for forward compatibility"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for this run"
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "INIT",
+        "PRECHECK",
+        "PLANNING",
+        "PLAN_REVIEW",
+        "AWAITING_EXECUTION_APPROVAL",
+        "IMPLEMENTER_SELECTION",
+        "IMPLEMENTING",
+        "EVIDENCE_CAPTURE",
+        "VERIFYING",
+        "REVIEWER_SELECTION",
+        "REVIEWING",
+        "JUDGING",
+        "AWAITING_FINAL_APPROVAL",
+        "CONSENSUS",
+        "BLOCKED",
+        "FAILED",
+        "CANCELLED"
+      ],
+      "description": "Current state in the state machine"
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Current round number (1-indexed)"
+    },
+    "goal": {
+      "type": "string",
+      "description": "User-provided goal statement"
+    },
+    "workspace": {
+      "type": "string",
+      "description": "Absolute path to workspace directory"
+    },
+    "baseline": {
+      "type": "object",
+      "required": ["head_sha", "branch"],
+      "properties": {
+        "head_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Git HEAD SHA at run start"
+        },
+        "branch": {
+          "type": "string",
+          "description": "Branch name at run start"
+        }
+      },
+      "description": "Baseline state before implementation"
+    },
+    "provider_assignments": {
+      "type": "object",
+      "patternProperties": {
+        "^[0-9]+$": {
+          "type": "object",
+          "required": ["implementer", "reviewer"],
+          "properties": {
+            "implementer": {
+              "$ref": "#/$defs/canonical_provider"
+            },
+            "reviewer": {
+              "$ref": "#/$defs/canonical_provider"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false,
+      "description": "Provider assignments by round number"
+    },
+    "failed_providers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/canonical_provider"
+      },
+      "uniqueItems": true,
+      "description": "Providers that have failed in this run"
+    },
+    "excluded_providers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/canonical_provider"
+      },
+      "uniqueItems": true,
+      "description": "Providers excluded from selection (role conflict)"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "uniqueItems": true,
+      "description": "References to evidence artifacts"
+    },
+    "pending_approval": {
+      "type": "object",
+      "required": ["action", "requested_at"],
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "workspace_mutation",
+            "commit",
+            "push",
+            "open_pr",
+            "mark_ready",
+            "merge",
+            "delete_branch",
+            "release_tag",
+            "access_secrets"
+          ],
+          "description": "Action requiring approval"
+        },
+        "requested_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When approval was requested"
+        },
+        "context": {
+          "type": "object",
+          "description": "Additional context for approval decision"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Pending human approval request (null if none)"
+    },
+    "last_event_id": {
+      "type": ["string", "null"],
+      "format": "uuid",
+      "description": "ID of the most recent event (null if no events yet)"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the run was created"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the state was last updated"
+    },
+    "terminal_result": {
+      "type": ["object", "null"],
+      "required": ["outcome", "reason"],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": ["CONSENSUS", "BLOCKED", "FAILED", "CANCELLED"],
+          "description": "Terminal outcome"
+        },
+        "reason": {
+          "type": "string",
+          "description": "Human-readable explanation"
+        },
+        "final_head": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{40}$",
+          "description": "Final Git HEAD (null if no changes)"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Terminal result (null if not in terminal state)"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "canonical_provider": {
+      "type": "string",
+      "enum": ["claude", "codex", "opencode", "agy"],
+      "description": "Canonical provider identity (aliases normalized)"
+    }
+  }
+}

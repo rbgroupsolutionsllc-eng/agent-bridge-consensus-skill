@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-bridge.dev/schemas/v3/evidence.schema.json",
+  "title": "V3 Evidence",
+  "description": "Git-based evidence artifact capturing observed vs. declared changes",
+  "type": "object",
+  "schema_version": "1.0",
+  "required": [
+    "evidence_id",
+    "run_id",
+    "evidence_type",
+    "captured_at",
+    "provider",
+    "role",
+    "round",
+    "baseline_head",
+    "observed_head",
+    "model_declared_changes",
+    "observed_changes",
+    "staged_files",
+    "unstaged_files",
+    "untracked_files",
+    "scope",
+    "scope_violations",
+    "commands",
+    "verification_jobs",
+    "diff_check",
+    "repository_clean",
+    "artifact_hashes"
+  ],
+  "properties": {
+    "evidence_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for this evidence artifact"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "ID of the run this evidence belongs to"
+    },
+    "evidence_type": {
+      "type": "string",
+      "enum": [
+        "baseline_snapshot",
+        "implementation_snapshot",
+        "verification_result",
+        "review_artifact",
+        "final_snapshot"
+      ],
+      "description": "Type of evidence artifact"
+    },
+    "captured_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this evidence was captured (ISO 8601)"
+    },
+    "provider": {
+      "$ref": "#/$defs/canonical_provider",
+      "description": "Provider that generated this evidence"
+    },
+    "role": {
+      "$ref": "#/$defs/canonical_role",
+      "description": "Role the provider was performing"
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Round number when evidence was captured"
+    },
+    "baseline_head": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Git HEAD before this evidence (null for initial baseline)"
+    },
+    "observed_head": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Git HEAD when evidence was captured"
+    },
+    "model_declared_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "description": "Files the provider claims to have changed"
+    },
+    "observed_changes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "description": "Files actually changed (per Git)"
+    },
+    "staged_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "description": "Files staged for commit"
+    },
+    "unstaged_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "description": "Modified but unstaged files"
+    },
+    "untracked_files": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "description": "New files not yet tracked by Git"
+    },
+    "scope": {
+      "type": "object",
+      "required": ["allowed_paths", "violations"],
+      "properties": {
+        "allowed_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "description": "Paths within authorized scope"
+        },
+        "violations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "uniqueItems": true,
+          "description": "Paths outside authorized scope"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Scope validation results"
+    },
+    "scope_violations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true,
+      "description": "Files changed outside authorized scope (deprecated, use scope.violations)"
+    },
+    "commands": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["command", "exit_code", "stdout_hash", "stderr_hash"],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Command that was executed"
+          },
+          "exit_code": {
+            "type": "integer",
+            "description": "Exit code returned by the command"
+          },
+          "stdout_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 hash of stdout output"
+          },
+          "stderr_hash": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 hash of stderr output"
+          },
+          "executed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the command was executed"
+          }
+        },
+        "additionalProperties": false
+      },
+      "description": "Commands executed during this evidence capture"
+    },
+    "verification_jobs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["job_id", "command", "exit_code", "passed"],
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Unique identifier for this verification job"
+          },
+          "command": {
+            "type": "string",
+            "description": "Verification command that was executed"
+          },
+          "exit_code": {
+            "type": "integer",
+            "description": "Exit code returned by the command"
+          },
+          "passed": {
+            "type": "boolean",
+            "description": "Whether the verification passed"
+          },
+          "executed_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the verification was executed"
+          }
+        },
+        "additionalProperties": false
+      },
+      "description": "Verification jobs executed during this evidence capture"
+    },
+    "diff_check": {
+      "type": "object",
+      "required": ["passed", "output_hash"],
+      "properties": {
+        "passed": {
+          "type": "boolean",
+          "description": "Whether git diff --check passed"
+        },
+        "output_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 hash of git diff --check output"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Results of git diff --check validation"
+    },
+    "repository_clean": {
+      "type": "boolean",
+      "description": "Whether the working tree was clean when evidence was captured"
+    },
+    "artifact_hashes": {
+      "type": "object",
+      "required": ["diff_hash", "before_snapshot", "after_snapshot"],
+      "properties": {
+        "diff_hash": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 hash of unified diff"
+        },
+        "before_snapshot": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 hash of pre-implementation state"
+        },
+        "after_snapshot": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 hash of post-implementation state"
+        }
+      },
+      "additionalProperties": false,
+      "description": "Cryptographic hashes of key artifacts"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "canonical_provider": {
+      "type": "string",
+      "enum": ["claude", "codex", "opencode", "agy"],
+      "description": "Canonical provider identity (aliases normalized)"
+    },
+    "canonical_role": {
+      "type": "string",
+      "enum": [
+        "planner",
+        "researcher",
+        "implementer",
+        "reviewer",
+        "verifier",
+        "judge",
+        "release_manager"
+      ],
+      "description": "Canonical role name"
+    }
+  }
+}

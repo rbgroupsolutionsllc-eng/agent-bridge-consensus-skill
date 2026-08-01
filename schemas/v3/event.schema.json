@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-bridge.dev/schemas/v3/event.schema.json",
+  "title": "V3 Event",
+  "description": "Append-only event representing a state transition in Agent Bridge V3",
+  "type": "object",
+  "schema_version": "1.0",
+  "required": [
+    "event_id",
+    "run_id",
+    "schema_version",
+    "timestamp",
+    "round",
+    "state_before",
+    "event_type",
+    "state_after",
+    "reason"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique identifier for this event"
+    },
+    "run_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "ID of the run this event belongs to"
+    },
+    "schema_version": {
+      "type": "string",
+      "const": "1.0",
+      "description": "Schema version for forward compatibility"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When the event occurred (ISO 8601)"
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Round number when event occurred"
+    },
+    "state_before": {
+      "type": "string",
+      "enum": [
+        "INIT",
+        "PRECHECK",
+        "PLANNING",
+        "PLAN_REVIEW",
+        "AWAITING_EXECUTION_APPROVAL",
+        "IMPLEMENTER_SELECTION",
+        "IMPLEMENTING",
+        "EVIDENCE_CAPTURE",
+        "VERIFYING",
+        "REVIEWER_SELECTION",
+        "REVIEWING",
+        "JUDGING",
+        "AWAITING_FINAL_APPROVAL",
+        "CONSENSUS",
+        "BLOCKED",
+        "FAILED",
+        "CANCELLED"
+      ],
+      "description": "State before the transition"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "RUN_CREATED",
+        "PRECHECK_PASSED",
+        "PRECHECK_FAILED",
+        "PLAN_CREATED",
+        "PLAN_REVIEWED",
+        "HUMAN_APPROVAL_GRANTED",
+        "HUMAN_APPROVAL_DENIED",
+        "PROVIDER_SELECTED",
+        "PROVIDER_SKIPPED",
+        "PROVIDER_FAILED",
+        "TURN_STARTED",
+        "TURN_COMPLETED",
+        "TURN_REJECTED",
+        "EVIDENCE_CAPTURED",
+        "VERIFICATION_STARTED",
+        "VERIFICATION_PASSED",
+        "VERIFICATION_FAILED",
+        "REVIEW_COMPLETED",
+        "REVIEW_DISAGREED",
+        "JUDGE_SELECTED",
+        "JUDGMENT_COMPLETED",
+        "CONSENSUS_REACHED",
+        "RUN_BLOCKED",
+        "RUN_FAILED",
+        "RUN_CANCELLED"
+      ],
+      "description": "Type of event"
+    },
+    "state_after": {
+      "type": "string",
+      "enum": [
+        "INIT",
+        "PRECHECK",
+        "PLANNING",
+        "PLAN_REVIEW",
+        "AWAITING_EXECUTION_APPROVAL",
+        "IMPLEMENTER_SELECTION",
+        "IMPLEMENTING",
+        "EVIDENCE_CAPTURE",
+        "VERIFYING",
+        "REVIEWER_SELECTION",
+        "REVIEWING",
+        "JUDGING",
+        "AWAITING_FINAL_APPROVAL",
+        "CONSENSUS",
+        "BLOCKED",
+        "FAILED",
+        "CANCELLED"
+      ],
+      "description": "State after the transition"
+    },
+    "provider": {
+      "oneOf": [
+        {"$ref": "#/$defs/canonical_provider"},
+        {"type": "null"}
+      ],
+      "description": "Provider involved in this event (null for system events)"
+    },
+    "role": {
+      "oneOf": [
+        {"$ref": "#/$defs/canonical_role"},
+        {"type": "null"}
+      ],
+      "description": "Role the provider was performing (null for system events)"
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "uniqueItems": true,
+      "description": "References to evidence artifacts associated with this event"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable explanation of why this event occurred"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Event-type-specific metadata"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "canonical_provider": {
+      "type": "string",
+      "enum": ["claude", "codex", "opencode", "agy"],
+      "description": "Canonical provider identity (aliases normalized)"
+    },
+    "canonical_role": {
+      "type": "string",
+      "enum": [
+        "planner",
+        "researcher",
+        "implementer",
+        "reviewer",
+        "verifier",
+        "judge",
+        "release_manager"
+      ],
+      "description": "Canonical role name"
+    }
+  }
+}
