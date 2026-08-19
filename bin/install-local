@@ -27,12 +27,14 @@ cp "$repo_dir/bin/ask-claude"      "$HOME/.local/bin/ask-claude"
 cp "$repo_dir/bin/ask-codex"       "$HOME/.local/bin/ask-codex"
 cp "$repo_dir/bin/ask-opencode"    "$HOME/.local/bin/ask-opencode"
 cp "$repo_dir/bin/ask-antigravity" "$HOME/.local/bin/ask-antigravity"
+cp "$repo_dir/bin/ask-ks"          "$HOME/.local/bin/ask-ks"
 chmod +x \
   "$HOME/.local/bin/agent-turns" \
   "$HOME/.local/bin/ask-claude" \
   "$HOME/.local/bin/ask-codex" \
   "$HOME/.local/bin/ask-opencode" \
-  "$HOME/.local/bin/ask-antigravity"
+  "$HOME/.local/bin/ask-antigravity" \
+  "$HOME/.local/bin/ask-ks"
 
 # OpenCode — update AGENTS.md (idempotent: removes old section then re-adds)
 opencode_agents="$HOME/.config/opencode/AGENTS.md"

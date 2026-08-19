@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ask-ks: Local KS Server Provider Adapter for Agent Bridge
+# Communicates with http://localhost:4000/v1 (KS Server OpenAI-compatible endpoint)
+
+if [[ $# -lt 2 ]]; then
+  echo "Usage: ask-ks <workspace> <prompt-file> [output-file]" >&2
+  exit 2
+fi
+
+workspace="$1"
+prompt_file="$2"
+output_file="${3:-}"
+model="${AGENT_BRIDGE_KS_MODEL:-deepseek-chat}"
+ks_url="${KS_SERVER_URL:-http://localhost:4000/v1/chat/completions}"
+api_key="${KS_API_KEY:-ks-internal-agent-bridge}"
+
+[[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
+[[ -f "$prompt_file" ]] || { echo "Prompt file not found: $prompt_file" >&2; exit 2; }
+
+# Prepare payload using Python for safe JSON encoding
+json_payload="$(python3 -c "
+import json, sys
+
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    prompt_text = f.read()
+
+payload = {
+    'model': sys.argv[2],
+    'messages': [
+        {'role': 'user', 'content': prompt_text}
+    ],
+    'temperature': 0.2
+}
+print(json.dumps(payload))
+" "$prompt_file" "$model")"
+
+tmp_output="${output_file:-/tmp/ask_ks_out_$$}.tmp.$$"
+trap 'rm -f "$tmp_output"' EXIT
+
+# Send request to KS Server
+http_response="$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$ks_url" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $api_key" \
+  -d "$json_payload")"
+
+http_status="$(echo "$http_response" | grep "HTTP_STATUS:" | cut -d':' -f2)"
+response_body="$(echo "$http_response" | sed '/HTTP_STATUS:/d')"
+
+if [[ "$http_status" -ne 200 ]]; then
+  echo "KS Server returned error HTTP $http_status: $response_body" >&2
+  exit 1
+fi
+
+# Extract assistant content
+python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+content = data.get('choices', [{}])[0].get('message', {}).get('content', '')
+if not content:
+    sys.exit(1)
+print(content.strip())
+" "$response_body" > "$tmp_output" || {
+  echo "Failed to extract content from KS Server response" >&2
+  exit 1
+}
+
+# Coarse protocol verification
+if ! grep -qE '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$tmp_output"; then
+  echo "KS Server output missing bridge protocol block" >&2
+  exit 1
+fi
+
+if [[ -n "$output_file" ]]; then
+  mkdir -p "$(dirname "$output_file")"
+  mv "$tmp_output" "$output_file"
+else
+  cat "$tmp_output"
+fi

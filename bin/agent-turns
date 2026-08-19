@@ -221,6 +221,32 @@ build_prompt() {
     echo "WORKSPACE: $workspace"
     echo "YOU ARE: $role"
     [[ -z "$context_line" ]] || echo "$context_line"
+    
+    # Cognitive Mode Knobs Injection
+    if [[ "${_ooda_mode:-0}" -eq 1 ]]; then
+      echo "COGNITIVE DIRECTIVE (OODA): Follow Observe -> Orient -> Decide -> Act loop. Inspect workspace before editing."
+    fi
+    if [[ "${_truth_mode:-0}" -eq 1 ]]; then
+      echo "COGNITIVE DIRECTIVE (TRUTHMODE): Zero speculation. Every claim must be supported by file diffs or verify command outputs."
+    fi
+    if [[ "${_redteam_mode:-0}" -eq 1 && "$role" =~ reviewer|verifier ]]; then
+      echo "COGNITIVE DIRECTIVE (REDTEAM): Adversarial mode active. Search for race conditions, memory leaks, security flaws, and regressions."
+    fi
+    if [[ "${_alt3_mode:-0}" -eq 1 && "$role" =~ implementer|planner ]]; then
+      echo "COGNITIVE DIRECTIVE (ALT3): Evaluate 3 distinct approaches internally and execute the minimal optimal solution."
+    fi
+    if [[ "${_meta_mode:-0}" -eq 1 ]]; then
+      echo "COGNITIVE DIRECTIVE (META): Verify plan feasibility and token budget before performing modifications."
+    fi
+    if [[ "${_x10think_mode:-0}" -eq 1 ]]; then
+      echo "REASONING DIRECTIVE (x10think): Extended reasoning active. Predict edge-case interactions and failure modes."
+    fi
+    
+    # Language Substrate
+    if [[ "$goal" =~ [áéíóúÁÉÍÓÚñÑ¿¡]|(corrige|implementa|analiza|revisa|soluciona|agrega|elimina|optimiza|actualiza|prueba|busca) ]]; then
+      echo "LANGUAGE SUBSTRATE: Input language is Spanish. Perform ALL internal technical reasoning, file changes, and protocol blocks in dense English for maximum cross-model precision. Maintain Spanish for the final operator handoff message."
+    fi
+
     echo
     echo "# Recent turns"
     if [[ -s "$handoff_file" ]]; then cat "$handoff_file"; else echo "(first turn)"; fi
@@ -250,7 +276,7 @@ normalize_provider() {
 
 is_supported_fallback_provider() {
   case "$1" in
-    opencode|agy) return 0 ;;
+    opencode|agy|ks) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -504,6 +530,10 @@ call_fallback() {
         ;;
       agy|antigravity)
         timeout "$turn_timeout" "$script_dir/ask-antigravity" "$workspace" "$prompt" "$candidate"
+        rc=$?
+        ;;
+      ks|ksserver)
+        timeout "$turn_timeout" "$script_dir/ask-ks" "$workspace" "$prompt" "$candidate"
         rc=$?
         ;;
       *)
