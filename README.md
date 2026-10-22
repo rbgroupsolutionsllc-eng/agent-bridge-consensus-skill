@@ -88,6 +88,8 @@ One agent should not close its own unverified implementation. The other agent ve
 | `AGENT_BRIDGE_ALLOWED_WORKSPACES` | empty | Gate 14B: authorized workspaces, entries separated by `:` or newlines (canonical paths compared after symlink resolution) |
 | `AGENT_BRIDGE_ALLOWLIST_FILE` | `~/.agent-bridge/authorized-workspaces` | Gate 14B: allowlist file (one path per line, `#` comments); used when the env var is unset |
 
+**Workspace authorization (Gate 14B.2):** If `AGENT_BRIDGE_ALLOWED_WORKSPACES` is explicitly set, even to an empty string, it is authoritative and an empty or invalid list is rejected (exit 7). Otherwise, an explicitly selected allowlist file or an existing default file is mandatory to read and must contain at least one authorized path; missing, unreadable, empty, or comment-only policies are rejected (exit 7). Set `AGENT_BRIDGE_REQUIRE_ALLOWLIST=1` for Hermes or other autonomous use: without a valid policy, the bridge rejects execution. Only legacy CLI with no policy configured and strict mode off retains permissive behavior with a warning. Workspace allowlisting is **not** an OS sandbox.
+
 Both OpenCode and `agy` enforce model selection via `--model`. Run `opencode models` or `agy models` to list available options. The GUI app (`antigravity`) is not used.
 
 Any provider that fails (any exit code, timeout, or empty response) is automatically marked unavailable for the rest of the session. The fallback chain retries remaining providers without operator intervention.
