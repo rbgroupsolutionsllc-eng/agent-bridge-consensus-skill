@@ -147,22 +147,40 @@ mark_failed() { _failed_providers+="${1} "; echo "  provider unavailable for thi
 is_failed()   { [[ "$_failed_providers" == *" ${1} "* ]]; }
 
 # ── Gate 14B / P0-3: detección objetiva de cambios en el workspace ───────────
-# Hash del estado del workspace: cada archivo/symlink/directorio endTime con
-# tipo, ruta, tamaño, mtime, destino del enlace y nlink. Alcance real: archivos
-# nuevos, modificados (contenido/vía mtime) y eliminados; symlinks retargeted;
-# archivos ignorados por Git incluidos (el toque del agente cuenta). Mtime sin
-# cambio de contenido cuenta como cambio: es deliberadamente conservador.
-# Límite documentado: -xdev restringe la detección al propio filesystem; montajos
-# externos, red y /proc no son observados — en ese caso el detector reporta
-# no-confiable (ws_detection_reliable=0) y la política falla cerrada.
+# Hash del estado del workspace: cada archivo/symlink/directorio entra con
+# tipo, ruta, tamaño, mtime, destino del enlace y nlink, MÁS los hashes de
+# contenido de cada archivo regular (Gate 14B.1: los metadatos solos
+# permitían un falso negativo modificando contenido conservando tamaño y
+# mtime). Alcance real: archivos nuevos, modificados (contenido o solo
+# mtime) y eliminados; symlinks retargeted; archivos ignorados por Git
+# incluidos (el toque del agente cuenta). Mtime sin cambio de contenido
+# cuenta como cambio: es deliberadamente conservador.
+# Fail-closed Gate 14B.1: los hashes se calculan por archivo y se coteja el
+# conteo contra el inventario; si algún archivo no se puede leer/hashear
+# (o sha256sum no existe), el snapshot se declara UNRELIABLE y la política
+# falla cerrada en vez de validar un snapshot aparentemente correcto.
+# Límite documentado: -xdev restringe la detección al propio filesystem;
+# montajes externos, red y /proc no son observados — en ese caso el
+# detector reporta no-confiable (ws_detection_reliable=0) y la política
+# falla cerrada.
 ws_snapshot() {
-  local list
+  local list hashes n_files n_hashed
   list="$( ( cd "$workspace" 2>/dev/null && \
     find . -xdev \( -type d -o -type f -o -type l \) -printf '%y|%p|%s|%T@|%l|%n\n' 2>/dev/null | sort ) 2>/dev/null )"
   # El punto de partida '.' siempre aparece si el workspace es legible; una
   # lista vacía = snapshot no garantizable → centinela, y la política falla cerrada.
-  [[ -z "$list" ]] && { printf 'UNRELIABLE'; return 0; }
-    printf '%s\n' "$list" | ( if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi ) | awk '{print $1}'
+  [[ -n "$list" ]] || { printf 'UNRELIABLE'; return 0; }
+  # Hashes de contenido reales por archivo regular; si alguno falla (ilegible,
+  # desaparecido, sha256sum ausente), el conteo difiere y todo el snapshot
+  # se declara no confiable.
+  hashes="$( ( cd "$workspace" 2>/dev/null && \
+    find . -xdev -type f -exec sha256sum {} + 2>/dev/null | sort ) 2>/dev/null )"
+  n_files="$(printf '%s\n' "$list" | grep -c '^f|')"
+  n_hashed="$(printf '%s\n' "$hashes" | grep -c '.')"
+  if [[ "$n_hashed" -lt "$n_files" ]]; then
+    printf 'UNRELIABLE'; return 0
+  fi
+  printf '%s\n' "$list" "$hashes" | ( if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi ) | awk '{print $1}'
 }
 ws_snapshot_ok() { local h="$1"; [[ -n "$h" && "$h" != "UNRELIABLE" ]]; }
 

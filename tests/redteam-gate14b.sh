@@ -16,7 +16,23 @@ ok_count=0
 cat > "$mockbin/claude" <<'EOF'
 #!/usr/bin/env bash
 [[ -n "${MOCK_CLAUDE_FAIL:-}" ]] && exit 1
-[[ "${MOCK_CLAUDE_EFFECT:-}" == "write" && -n "${MOCK_WS:-}" ]] && echo "un-declared-change" > "$MOCK_WS/sneaky.txt"
+if [[ "${MOCK_CLAUDE_EFFECT:-}" == "write" && -n "${MOCK_WS:-}" ]]; then
+  echo "un-declared-change" > "$MOCK_WS/sneaky.txt"
+elif [[ "${MOCK_CLAUDE_EFFECT:-}" == "rewrite_same_meta" && -n "${MOCK_WS:-}" ]]; then
+  # Gate 14B.1: modifica contenido conservando EXACTAMENTE tamaño y mtime
+  # (16 bytes, mismo atime/mtime) para forzar el falso negativo de un
+  # detector basado solo en metadatos.
+  python3 - "$MOCK_WS/gen.txt" <<'PY'
+import os, sys
+p = sys.argv[1]
+st = os.stat(p)
+with open(p, "w") as f:
+    f.write("GROUND-1-TRUTH-2")
+os.utime(p, (st.st_atime, st.st_mtime))
+assert os.stat(p).st_size == st.st_size
+assert os.stat(p).st_mtime_ns == st.st_mtime_ns
+PY
+fi
 json=0; _p=""
 for a in "$@"; do [[ "$_p" == "--output-format" && "$a" == "json" ]] && json=1; _p="$a"; done
 if [[ "$json" == "1" ]]; then
@@ -120,6 +136,26 @@ rm -rf "$tmp_root/workspace/tamper5" "$tmp_root/verify-marker.log"; mkdir -p "$t
   bash "$engine" "$tmp_root/workspace/tamper5" "tamper" 2 > "$tmp_root/tamper5.full" 2>&1; echo $? > "$tmp_root/tamper5.rc" )
 if [[ "$(cat "$tmp_root/tamper5.rc")" -eq 2 ]] && grep -q "VERIFY-RAN" $tmp_root/verify-marker.log \
    && grep -q "Done: VERIFY_FAILING" "$tmp_root/tamper5.full"; then case_pass changed_none_lie_caught; else case_fail changed_none_lie_caught "rc2+verify-corrió" "$(cat "$tmp_root/tamper5.rc")" "" "$tmp_root/tamper5.full"; fi
+
+# ── caso 11 (Gate 14B.1): modificación conservando tamaño y mtime → detector de contenido la captura ─
+rm -rf "$tmp_root/workspace/tamper11"; mkdir -p "$tmp_root/workspace/tamper11"
+printf 'PRISTINE-CONTENT' > "$tmp_root/workspace/tamper11/gen.txt"
+( cd "$tmp_root/workspace/tamper11" && MOCK_WS="$tmp_root/workspace/tamper11" MOCK_CLAUDE_EFFECT=rewrite_same_meta \
+  MOCK_CLAUDE_FILE="$tmp_root/c4c.txt" MOCK_CODEX_FILE="$tmp_root/c4r.txt" AGENT_BRIDGE_HOME="$tmp_root/bridge-tamper11" \
+  bash "$engine" "$tmp_root/workspace/tamper11" "tamper same-size mtime" 2 > "$tmp_root/tamper11.full" 2>&1; echo $? > "$tmp_root/tamper11.rc" )
+if [[ "$(cat "$tmp_root/tamper11.rc")" -eq 2 ]] && grep -q "objective verification" "$tmp_root/tamper11.full" \
+   && grep -q "Done: VERIFY_FAILING" "$tmp_root/tamper11.full" \
+   && [[ "$(cat "$tmp_root/workspace/tamper11/gen.txt" 2>/dev/null)" == "GROUND-1-TRUTH-2" ]]; then case_pass same_meta_rewrite_caught; else case_fail same_meta_rewrite_caught "rc2+interchange de contenido detectado" "$(cat "$tmp_root/tamper11.rc")" "" "$tmp_root/tamper11.full"; fi
+
+# ── caso 12 (Gate 14B.1): árbol parcialmente inaccesible → fail-closed (UNRELIABLE), nunca consenso falso ─
+rm -rf "$tmp_root/workspace/unread"; mkdir -p "$tmp_root/workspace/unread"
+printf 'secret' > "$tmp_root/workspace/unread/locked.txt"; chmod 000 "$tmp_root/workspace/unread/locked.txt"
+( cd "$tmp_root/workspace/unread" && MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c1r.txt" AGENT_BRIDGE_HOME="$tmp_root/bridge-unread" \
+  bash "$engine" "$tmp_root/workspace/unread" "consenso con ilegible" 2 > "$tmp_root/unread.full" 2>&1; echo $? > "$tmp_root/unread.rc" )
+# El snapshot no puede garantizarse: falla cerrada, jamás CONSENSUS rc=0.
+unread_rc="$(cat "$tmp_root/unread.rc")"
+if [[ "$unread_rc" -ne 0 ]] && ! grep -q "Done: CONSENSUS" "$tmp_root/unread.full"; then case_pass unreadable_tree_fail_closed; else case_fail unreadable_tree_fail_closed "rc!=0 y sin CONSENSUS" "$unread_rc" "" "$tmp_root/unread.full"; fi
+chmod 644 "$tmp_root/workspace/unread/locked.txt" 2>/dev/null || true
 
 # ── caso 6: revisor primario codex protocolo inválido → nunca CONSENSUS (rc=5 CODEX_ERROR) ─
 cat > "$tmp_root/c6r.txt" <<'EOF'
