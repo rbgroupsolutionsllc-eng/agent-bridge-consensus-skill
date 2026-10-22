@@ -367,7 +367,13 @@ run_case() {
   # File-based counter: persists across subshells
   local n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
   echo $((n + 1)) > "$TEST_COUNT_FILE"
+  set +e
   MOCK_STATE="$state" PATH="$mockbin:$PATH" AGENT_BRIDGE_HOME="$bridge_home/$name" "$@" > "$state/stdout.log" 2> "$state/stderr.log"
+  # Gate 14B / P0-1: run_case ya no presupone exit 0; el estado del motor
+  # determina el código (CONSENSUS=0, errores != 0). Se guarda sin abortar y
+  # los asserts posteriores validan comportamiento.
+  echo "$?" > "$state/exit-code"
+  set -e
   echo "$state"
 }
 
@@ -658,6 +664,7 @@ opencode_calls="$(cat "$state/opencode-count")"
 # implementer is excluded.
 adv_state="$tmp_root/state-independent_reviewer_unavailable_adversarial"
 mkdir -p "$adv_state"
+set +e
 MOCK_SCENARIO=independent_reviewer_unavailable \
 MOCK_STATE="$adv_state" \
 PATH="$mockbin:$PATH" \
@@ -665,7 +672,12 @@ AGENT_BRIDGE_HOME="$bridge_home/independent_reviewer_unavailable_adversarial" \
 AGENT_BRIDGE_RESUME=0 \
 AGENT_BRIDGE_FALLBACKS=",unsupported,opencode,opencode," \
   "$repo_dir/bin/agent-turns" "$workspace" "mock independent reviewer unavailable adversarial" 1 > "$adv_state/stdout.log" 2> "$adv_state/stderr.log"
+echo "$?" > "$adv_state/exit-code"
+set -e
 adv_run_dir="$(awk '/^Artifacts: / { print $2 }' "$adv_state/stdout.log")"
+# Gate 14B / P0-1: NO_INDEPENDENT_REVIEWER ahora sale con código 6.
+adv_rc="$(cat "$adv_state/exit-code")"
+[[ "$adv_rc" != "0" ]] || { echo "P0-1: NO_INDEPENDENT_REVIEWER must exit non-zero, got 0" >&2; exit 1; }
 assert_contains "$adv_state/stdout.log" "fallback: opencode answered for implementer"
 assert_contains "$adv_state/stdout.log" "independent reviewer unavailable: no distinct supported fallback reviewer is configured"
 assert_contains "$adv_run_dir/handoff.md" "INDEPENDENT REVIEW UNAVAILABLE"

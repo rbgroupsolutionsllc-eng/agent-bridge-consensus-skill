@@ -27,6 +27,51 @@ rounds="${3:-2}"
 [[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
 [[ "$rounds" =~ ^[0-9]+$ && "$rounds" -ge 1 ]] || { echo "Rounds must be a positive integer" >&2; exit 2; }
 
+# ── Gate 14B / P1-4: política de workspaces autorizados ──────────────────────
+# Comparación por ruta canónica (resuelve symlinks y rutas equivalentes).
+# Allowlist: AGENT_BRIDGE_ALLOWED_WORKSPACES (var, entradas separadas por ':' o
+# salto de línea) o archivo AGENT_BRIDGE_ALLOWLIST_FILE (default
+# ~/.agent-bridge/authorized-workspaces, una ruta por línea, '#' = comentario).
+# Compatibilidad CLI: sin allowlist el comportamiento es el histórico, con una
+# advertencia en stderr. El modo estricto (futuro modo Hermes) debe fijar la
+# allowlist: entonces cualquier directorio no listado se rechaza con exit 7.
+canon_path() {
+  local p="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null && return 0
+  fi
+  if command -v realpath >/dev/null 2>&1; then realpath "$p" 2>/dev/null && return 0; fi
+  readlink -f "$p" 2>/dev/null
+}
+_g14b_allow_spec="${AGENT_BRIDGE_ALLOWED_WORKSPACES:-}"
+_g14b_allow_file="${AGENT_BRIDGE_ALLOWLIST_FILE:-$HOME/.agent-bridge/authorized-workspaces}"
+if [[ -z "$_g14b_allow_spec" && -r "$_g14b_allow_file" ]]; then
+  _g14b_allow_spec="$(grep -vE '^[[:space:]]*(#|$)' "$_g14b_allow_file" | tr '\n' ':')"
+fi
+_g14b_reject_workspace() {
+  echo "Workspace not authorized (AGENT_BRIDGE_ALLOWED_WORKSPACES policy): $workspace" >&2
+  exit 7
+}
+if [[ -n "$_g14b_allow_spec" ]]; then
+  _g14b_ws_canon="$(canon_path "$workspace")"
+  [[ -n "$_g14b_ws_canon" ]] || _g14b_reject_workspace
+  _g14b_ws_authed=0
+  # Nota Gate 14B: se usa herestring <<< en lugar de process substitution <_( ... )
+  # porque algunos entornos sandbox bloquean /dev/fd y el bucle no iteraría.
+  IFS=$':' read -r -a _g14b_entries <<< "$_g14b_allow_spec"
+  for _g14b_entry in "${_g14b_entries[@]}"; do
+    [[ -n "$_g14b_entry" ]] || continue
+    _g14b_entry_canon="$(canon_path "${_g14b_entry%/}")"
+    [[ -n "$_g14b_entry_canon" && "$_g14b_entry_canon" == "$_g14b_ws_canon" ]] && { _g14b_ws_authed=1; break; }
+  done
+  if [[ "$_g14b_ws_authed" -ne 1 ]]; then _g14b_reject_workspace; fi
+  unset _g14b_ws_authed _g14b_entry _g14b_entry_canon
+  echo "  workspace authorized (canonical): $_g14b_ws_canon" >&2
+else
+  echo "WARNING: no AGENT_BRIDGE_ALLOWED_WORKSPACES configured; any existing directory is accepted. Future Hermes mode will require an allowlist." >&2
+fi
+unset _g14b_allow_spec _g14b_allow_file
+
 # Parse inline model directives from goal: [opencode:model] [agy:model]
 # Only these two lowercase provider names are supported. Provider names are
 # case-sensitive; the value must be non-empty, must not contain ']', and must
@@ -100,6 +145,26 @@ mkdir -p "$run_dir"
 _failed_providers=" "
 mark_failed() { _failed_providers+="${1} "; echo "  provider unavailable for this session: $1" >&2; }
 is_failed()   { [[ "$_failed_providers" == *" ${1} "* ]]; }
+
+# ── Gate 14B / P0-3: detección objetiva de cambios en el workspace ───────────
+# Hash del estado del workspace: cada archivo/symlink/directorio endTime con
+# tipo, ruta, tamaño, mtime, destino del enlace y nlink. Alcance real: archivos
+# nuevos, modificados (contenido/vía mtime) y eliminados; symlinks retargeted;
+# archivos ignorados por Git incluidos (el toque del agente cuenta). Mtime sin
+# cambio de contenido cuenta como cambio: es deliberadamente conservador.
+# Límite documentado: -xdev restringe la detección al propio filesystem; montajos
+# externos, red y /proc no son observados — en ese caso el detector reporta
+# no-confiable (ws_detection_reliable=0) y la política falla cerrada.
+ws_snapshot() {
+  local list
+  list="$( ( cd "$workspace" 2>/dev/null && \
+    find . -xdev \( -type d -o -type f -o -type l \) -printf '%y|%p|%s|%T@|%l|%n\n' 2>/dev/null | sort ) 2>/dev/null )"
+  # El punto de partida '.' siempre aparece si el workspace es legible; una
+  # lista vacía = snapshot no garantizable → centinela, y la política falla cerrada.
+  [[ -z "$list" ]] && { printf 'UNRELIABLE'; return 0; }
+    printf '%s\n' "$list" | ( if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi ) | awk '{print $1}'
+}
+ws_snapshot_ok() { local h="$1"; [[ -n "$h" && "$h" != "UNRELIABLE" ]]; }
 
 have_jq=0
 command -v jq >/dev/null 2>&1 && have_jq=1
@@ -594,6 +659,8 @@ echo "Run: $run_dir"
 final_state="MAX_ROUNDS"
 claude_status=""
 codex_status=""
+ws_delta_unverified_run=0   # Gate 14B: hubo cambios reales sin ground truth ejecutable
+ws_detection_reliable=1     # Gate 14B: detección de delta garantizable; 0 = límite detectado → fail closed
 
 for ((round=1; round<=rounds; round++)); do
   round_verify_failed=0
@@ -606,11 +673,22 @@ for ((round=1; round<=rounds; round++)); do
   build_prompt "$c_prompt" "implementer/planner" "" \
     "Make concrete progress toward the goal, or revise per the latest feedback/verdict." \
     "Modify the workspace only if needed."
+  _g14b_pre_impl="$(ws_snapshot)"
   if ! call_claude "$c_prompt" "$c_out"; then
-    echo "  claude unavailable; starting automatic fallback"
+    _g14b_impl_rejected="unavailable"
+  elif ! validate_turn_protocol "$c_out"; then                       # Gate 14B / P0-2
+    push_handoff "Round $round - Implementer (claude, protocol-invalid)" "$c_out"
+    push_note "ORCHESTRATOR REJECTED (round $round): primary implementer 'claude' returned a protocol-invalid response; independent fallback required"
+    echo "  claude returned a protocol-invalid response; starting automatic fallback"
+    _g14b_impl_rejected="invalid"
+  else
+    _g14b_impl_rejected=""
+  fi
+  if [[ -n "$_g14b_impl_rejected" ]]; then
+    echo "  claude ${_g14b_impl_rejected}; starting automatic fallback"
     if ! call_fallback "implementer" "$c_prompt" "$c_out" ""; then
       [[ -s "$c_out" ]] || synth_block "$c_out" "Claude and configured fallback providers failed"
-      push_handoff "Round $round - Implementer (unavailable)" "$c_out"
+      push_handoff "Round $round - Implementer (${_g14b_impl_rejected})" "$c_out"
       final_state="CLAUDE_ERROR"
       break
     fi
@@ -621,7 +699,25 @@ for ((round=1; round<=rounds; round++)); do
   push_handoff "Round $round - Implementer ($impl_provider)" "$c_out"
   claude_status="$(get_status "$c_out")"
   echo "  claude STATUS: ${claude_status:-?}"
-  [[ -n "$verify_cmd" ]] && changed_something "$c_out" && run_verify "$round" "$impl_provider"
+  _g14b_post_impl="$(ws_snapshot)"
+  _g14b_impl_delta=0
+  if ws_snapshot_ok "$_g14b_pre_impl" && ws_snapshot_ok "$_g14b_post_impl"; then
+    [[ "$_g14b_post_impl" != "$_g14b_pre_impl" ]] && _g14b_impl_delta=1
+  else
+    ws_detection_reliable=0                                          # límite de detección → fail closed
+    _g14b_impl_delta=1
+  fi
+  if [[ "$_g14b_impl_delta" -eq 1 ]]; then
+    if [[ -n "$verify_cmd" ]]; then
+      run_verify "$round" "$impl_provider"
+    else
+      ws_delta_unverified_run=1
+      push_note "VERIFY REQUIRED (round $round): workspace changed during implementer turn but AGENT_BRIDGE_VERIFY_CMD is unset; consensus will be refused without objective verification"
+      echo "  workspace changed; AGENT_BRIDGE_VERIFY_CMD unset (consensus will require objective verification)"
+    fi
+  elif [[ -n "$verify_cmd" ]] && changed_something "$c_out"; then
+    run_verify "$round" "$impl_provider"
+  fi
 
   printf '\n=== Round %d: Codex ===\n' "$round"
   x_prompt="$run_dir/round-${round}-codex.prompt.md"
@@ -629,8 +725,18 @@ for ((round=1; round<=rounds; round++)); do
   verify_hint="Independently verify the latest implementer's claim. Respond VERIFIED only if you checked it yourself."
   [[ "$claude_status" == "COMPLETE" ]] && verify_hint="The latest implementer claims COMPLETE. Verify independently; respond VERIFIED or DISAGREE with evidence."
   build_prompt "$x_prompt" "reviewer/verifier" "LATEST IMPLEMENTER PROVIDER: $impl_provider" "$verify_hint"
+  _g14b_pre_rev="$(ws_snapshot)"
+  _g14b_rev_fallback=0
   if ! call_codex "$x_prompt" "$x_out"; then
     echo "  codex unavailable; starting automatic fallback"
+    _g14b_rev_fallback=1
+  elif ! validate_turn_protocol "$x_out"; then                        # Gate 14B / P0-2
+    push_handoff "Round $round - Reviewer (codex, protocol-invalid)" "$x_out"
+    push_note "ORCHESTRATOR REJECTED (round $round): primary reviewer 'codex' returned a protocol-invalid response; an independent fallback reviewer is required"
+    echo "  codex returned a protocol-invalid response; starting automatic fallback"
+    _g14b_rev_fallback=1
+  fi
+  if [[ "$_g14b_rev_fallback" -eq 1 ]]; then
     if ! call_fallback "reviewer" "$x_prompt" "$x_out" "$impl_provider"; then
       case "${_last_fallback_outcome:-}" in
         no_distinct_candidate)
@@ -666,7 +772,25 @@ for ((round=1; round<=rounds; round++)); do
   push_handoff "Round $round - Reviewer ($review_provider)" "$x_out"
   codex_status="$(get_status "$x_out")"
   echo "  codex STATUS: ${codex_status:-?}"
-  [[ -n "$verify_cmd" ]] && changed_something "$x_out" && run_verify "$round" "$review_provider"
+  _g14b_post_rev="$(ws_snapshot)"
+  _g14b_rev_delta=0
+  if ws_snapshot_ok "$_g14b_pre_rev" && ws_snapshot_ok "$_g14b_post_rev"; then
+    [[ "$_g14b_post_rev" != "$_g14b_pre_rev" ]] && _g14b_rev_delta=1
+  else
+    ws_detection_reliable=0                                           # límite de detección → fail closed
+    _g14b_rev_delta=1
+  fi
+  if [[ "$_g14b_rev_delta" -eq 1 ]]; then
+    if [[ -n "$verify_cmd" ]]; then
+      run_verify "$round" "$review_provider"
+    else
+      ws_delta_unverified_run=1
+      push_note "VERIFY REQUIRED (round $round): workspace changed during reviewer turn but AGENT_BRIDGE_VERIFY_CMD is unset; consensus will be refused without objective verification"
+      echo "  workspace changed; AGENT_BRIDGE_VERIFY_CMD unset (consensus will require objective verification)"
+    fi
+  elif [[ -n "$verify_cmd" ]] && changed_something "$x_out"; then
+    run_verify "$round" "$review_provider"
+  fi
 
   # Defense in depth: even if selection logic above is ever bypassed, never
   # accept a reviewer identity that matches the implementer identity for
@@ -683,6 +807,10 @@ for ((round=1; round<=rounds; round++)); do
       if [[ "$round_verify_failed" -eq 1 ]]; then
         push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth command is failing; fix it before closing"
         echo "  consensus REJECTED: verify failing"
+        final_state="VERIFY_FAILING"
+      elif [[ "$ws_delta_unverified_run" -eq 1 ]]; then               # Gate 14B / P0-3: fail closed
+        push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace changed without objective ground-truth verification (AGENT_BRIDGE_VERIFY_CMD unset${ws_detection_reliable:+; detection limit invoked})"
+        echo "  consensus REJECTED: workspace changed without objective verification"
         final_state="VERIFY_FAILING"
       else
         final_state="CONSENSUS"
@@ -707,3 +835,18 @@ echo "=== Done: $final_state ==="
 echo "Artifacts: $run_dir"
 echo "Final handoff state:"
 cat "$handoff_file"
+
+# ── Gate 14B / P0-1: códigos de salida documentados (README) ─────────────────
+# 0 CONSENSUS · 1 MAX_ROUNDS/esperado no mapeado · 2 VERIFY_FAILING
+# 3 BLOCKED · 4 CLAUDE_ERROR · 5 CODEX_ERROR · 6 NO_INDEPENDENT_REVIEWER
+# 2 de invocación: args inválidos · 7 workspace no autorizado por allowlist
+case "$final_state" in
+  CONSENSUS) exit 0 ;;
+  MAX_ROUNDS) exit 1 ;;
+  VERIFY_FAILING) exit 2 ;;
+  BLOCKED) exit 3 ;;
+  CLAUDE_ERROR) exit 4 ;;
+  CODEX_ERROR) exit 5 ;;
+  NO_INDEPENDENT_REVIEWER) exit 6 ;;
+  *) exit 1 ;;
+esac
