@@ -27,14 +27,10 @@ rounds="${3:-2}"
 [[ -d "$workspace" ]] || { echo "Workspace not found: $workspace" >&2; exit 2; }
 [[ "$rounds" =~ ^[0-9]+$ && "$rounds" -ge 1 ]] || { echo "Rounds must be a positive integer" >&2; exit 2; }
 
-# ── Gate 14B / P1-4: política de workspaces autorizados ──────────────────────
-# Comparación por ruta canónica (resuelve symlinks y rutas equivalentes).
-# Allowlist: AGENT_BRIDGE_ALLOWED_WORKSPACES (var, entradas separadas por ':' o
-# salto de línea) o archivo AGENT_BRIDGE_ALLOWLIST_FILE (default
-# ~/.agent-bridge/authorized-workspaces, una ruta por línea, '#' = comentario).
-# Compatibilidad CLI: sin allowlist el comportamiento es el histórico, con una
-# advertencia en stderr. El modo estricto (futuro modo Hermes) debe fijar la
-# allowlist: entonces cualquier directorio no listado se rechaza con exit 7.
+# ── Gate 14B.2: política fail-closed de workspaces autorizados ────────────────
+# Compatibilidad CLI: únicamente sin política configurada permite cualquier
+# directorio (con advertencia). Una política declarada pero vacía, inaccesible
+# o inexistente NUNCA desactiva el control. Hermes debe fijar REQUIRE_ALLOWLIST=1.
 canon_path() {
   local p="$1"
   if command -v python3 >/dev/null 2>&1; then
@@ -43,36 +39,51 @@ canon_path() {
   if command -v realpath >/dev/null 2>&1; then realpath "$p" 2>/dev/null && return 0; fi
   readlink -f "$p" 2>/dev/null
 }
-_g14b_allow_spec="${AGENT_BRIDGE_ALLOWED_WORKSPACES:-}"
-_g14b_allow_file="${AGENT_BRIDGE_ALLOWLIST_FILE:-$HOME/.agent-bridge/authorized-workspaces}"
-if [[ -z "$_g14b_allow_spec" && -r "$_g14b_allow_file" ]]; then
-  _g14b_allow_spec="$(grep -vE '^[[:space:]]*(#|$)' "$_g14b_allow_file" | tr '\n' ':')"
-fi
 _g14b_reject_workspace() {
-  echo "Workspace not authorized (AGENT_BRIDGE_ALLOWED_WORKSPACES policy): $workspace" >&2
+  echo "Workspace not authorized (${1:-allowlist policy}): $workspace" >&2
   exit 7
 }
-if [[ -n "$_g14b_allow_spec" ]]; then
+_g14b_allow_file="${AGENT_BRIDGE_ALLOWLIST_FILE-$HOME/.agent-bridge/authorized-workspaces}"
+_g14b_allow_spec=""
+_g14b_policy_active=0
+case "${AGENT_BRIDGE_REQUIRE_ALLOWLIST:-0}" in
+  0|1) ;;
+  *) _g14b_reject_workspace "invalid AGENT_BRIDGE_REQUIRE_ALLOWLIST value" ;;
+esac
+if [[ ${AGENT_BRIDGE_ALLOWED_WORKSPACES+x} ]]; then
+  # La variable tiene precedencia sobre el archivo, incluso si está vacía.
+  _g14b_policy_active=1
+  _g14b_allow_spec="$AGENT_BRIDGE_ALLOWED_WORKSPACES"
+elif [[ ${AGENT_BRIDGE_ALLOWLIST_FILE+x} || -e "$_g14b_allow_file" || -L "$_g14b_allow_file" ]]; then
+  _g14b_policy_active=1
+  [[ -n "$_g14b_allow_file" && -f "$_g14b_allow_file" && -r "$_g14b_allow_file" ]] ||
+    _g14b_reject_workspace "allowlist file missing or unreadable"
+  _g14b_allow_spec="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "$_g14b_allow_file" | tr '\n' ':')" ||
+    _g14b_reject_workspace "cannot read allowlist file"
+fi
+if [[ "$_g14b_policy_active" -eq 1 ]]; then
+  _g14b_allow_spec="${_g14b_allow_spec//$'\n'/:}"
+  [[ -n "$_g14b_allow_spec" ]] || _g14b_reject_workspace "allowlist contains no workspaces"
   _g14b_ws_canon="$(canon_path "$workspace")"
   [[ -n "$_g14b_ws_canon" ]] || _g14b_reject_workspace
   _g14b_ws_authed=0
-  # Nota Gate 14B: se usa herestring <<< en lugar de process substitution <_( ... )
-  # porque algunos entornos sandbox bloquean /dev/fd y el bucle no iteraría.
   IFS=$':' read -r -a _g14b_entries <<< "$_g14b_allow_spec"
   for _g14b_entry in "${_g14b_entries[@]}"; do
     [[ -n "$_g14b_entry" ]] || continue
     _g14b_entry_canon="$(canon_path "${_g14b_entry%/}")"
-    [[ -n "$_g14b_entry_canon" && "$_g14b_entry_canon" == "$_g14b_ws_canon" ]] && { _g14b_ws_authed=1; break; }
+    [[ -n "$_g14b_entry_canon" && "$_g14b_entry_canon" == "$_g14b_ws_canon" ]] &&
+      { _g14b_ws_authed=1; break; }
   done
-  if [[ "$_g14b_ws_authed" -ne 1 ]]; then _g14b_reject_workspace; fi
-  unset _g14b_ws_authed _g14b_entry _g14b_entry_canon
+  [[ "$_g14b_ws_authed" -eq 1 ]] || _g14b_reject_workspace
   echo "  workspace authorized (canonical): $_g14b_ws_canon" >&2
+elif [[ "${AGENT_BRIDGE_REQUIRE_ALLOWLIST:-0}" == 1 ]]; then
+  _g14b_reject_workspace "allowlist required but not configured"
 else
-  echo "WARNING: no AGENT_BRIDGE_ALLOWED_WORKSPACES configured; any existing directory is accepted. Future Hermes mode will require an allowlist." >&2
+  echo "WARNING: no allowlist configured; any existing directory is accepted. Hermes must set AGENT_BRIDGE_REQUIRE_ALLOWLIST=1." >&2
 fi
-unset _g14b_allow_spec _g14b_allow_file
+unset _g14b_allow_spec _g14b_allow_file _g14b_policy_active _g14b_ws_authed _g14b_entry _g14b_entry_canon
 
-# Parse inline model directives from goal: [opencode:model] [agy:model]
+# # Parse inline model directives from goal: [opencode:model] [agy:model]
 # Only these two lowercase provider names are supported. Provider names are
 # case-sensitive; the value must be non-empty, must not contain ']', and must
 # not contain a carriage return (CR) — directives are single-line constructs.
