@@ -215,6 +215,49 @@ else
 fi
 unset MOCK_CLAUDE_FAIL MOCK_CODEX_FAIL MOCK_OPENCODE_FILE MOCK_AGY_FILE
 
+# ── Gate 14B.2: política declarada vacía/ilegible nunca abre permisos ────────
+# No se ejecutan agentes si la autorización no se valida: sin línea "Run:".
+run_allowlist_case() {
+  local label="$1" expected_rc="$2"; shift 2
+  local log="$tmp_root/allowlist-$label.log" actual
+  (
+    cd "$tmp_root"
+    env HOME="$HOME_NS" AGENT_BRIDGE_HOME="$tmp_root/bridge-policy-$label" \
+      MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+      "$@" bash "$engine" "$tmp_root/workspace/clean1" "allowlist $label" 1
+  ) >"$log" 2>&1
+  actual=$?
+  if [[ "$actual" -eq "$expected_rc" ]] && ! grep -q '^Run:' "$log" &&
+    grep -q 'Workspace not authorized' "$log"; then
+    case_pass "allowlist_$label"
+  else
+    case_fail "allowlist_$label" "rc=$expected_rc, reject, sin Run" "$actual" "" "$log"
+  fi
+}
+: > "$tmp_root/empty-allowlist"
+printf '# solo comentarios\n\n' > "$tmp_root/comments-allowlist"
+run_allowlist_case empty_file 7 AGENT_BRIDGE_ALLOWLIST_FILE="$tmp_root/empty-allowlist"
+run_allowlist_case comments_only 7 AGENT_BRIDGE_ALLOWLIST_FILE="$tmp_root/comments-allowlist"
+run_allowlist_case missing_explicit_file 7 AGENT_BRIDGE_ALLOWLIST_FILE="$tmp_root/not-created"
+run_allowlist_case empty_env 7 AGENT_BRIDGE_ALLOWED_WORKSPACES=''
+run_allowlist_case separators_only 7 AGENT_BRIDGE_ALLOWED_WORKSPACES=':::'
+run_allowlist_case hermes_no_policy 7 AGENT_BRIDGE_REQUIRE_ALLOWLIST=1 \
+  AGENT_BRIDGE_ALLOWLIST_FILE="$tmp_root/not-created"
+# Modo estricto también debe rechazar si no hay declaración de ningún tipo.
+(
+  cd "$tmp_root"
+  env -u AGENT_BRIDGE_ALLOWED_WORKSPACES -u AGENT_BRIDGE_ALLOWLIST_FILE \
+    HOME="$HOME_NS" AGENT_BRIDGE_REQUIRE_ALLOWLIST=1 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-policy-strict-unconfigured" \
+    bash "$engine" "$tmp_root/workspace/clean1" "strict no policy" 1
+) > "$tmp_root/strict-unconfigured.log" 2>&1
+_rc=$?
+if [[ "$_rc" -eq 7 ]] && ! grep -q '^Run:' "$tmp_root/strict-unconfigured.log"; then
+  case_pass allowlist_strict_unconfigured
+else
+  case_fail allowlist_strict_unconfigured "rc7, sin Run" "$_rc" "" "$tmp_root/strict-unconfigured.log"
+fi
+
 if [[ $ok_count -eq $total ]]; then
   echo "redteam-gate14b: ok ($ok_count casos)"
   exit 0
