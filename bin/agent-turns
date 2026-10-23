@@ -174,10 +174,18 @@ is_failed()   { [[ "$_failed_providers" == *" ${1} "* ]]; }
 # montajes externos, red y /proc no son observados — en ese caso el
 # detector reporta no-confiable (ws_detection_reliable=0) y la política
 # falla cerrada.
+# ── Gate 14B.3: fail-closed sobre fallos de enumeración ─────────────────────
+# find que no puede leer un directorio (p.ej. chmod 000) omite su contenido
+# pero termina con rc!=0: una lista aparentemente "completa" no garantiza
+# nada. Si la enumeración (lista o hashes) no termina en 0, el snapshot se
+# declara UNRELIABLE y la política falla cerrada, nunca valida un snapshot
+# simplemente plausible.
 ws_snapshot() {
-  local list hashes n_files n_hashed
+  local list hashes n_files n_hashed rc_list rc_hash
+  rc_list=0; rc_hash=0
   list="$( ( cd "$workspace" 2>/dev/null && \
-    find . -xdev \( -type d -o -type f -o -type l \) -printf '%y|%p|%s|%T@|%l|%n\n' 2>/dev/null | sort ) 2>/dev/null )"
+    find . -xdev \( -type d -o -type f -o -type l \) -printf '%y|%p|%s|%T@|%l|%n\n' 2>/dev/null | sort ) 2>/dev/null )" || rc_list=$?
+  [[ "$rc_list" -eq 0 ]] || { printf 'UNRELIABLE'; return 0; }
   # El punto de partida '.' siempre aparece si el workspace es legible; una
   # lista vacía = snapshot no garantizable → centinela, y la política falla cerrada.
   [[ -n "$list" ]] || { printf 'UNRELIABLE'; return 0; }
@@ -185,7 +193,8 @@ ws_snapshot() {
   # desaparecido, sha256sum ausente), el conteo difiere y todo el snapshot
   # se declara no confiable.
   hashes="$( ( cd "$workspace" 2>/dev/null && \
-    find . -xdev -type f -exec sha256sum {} + 2>/dev/null | sort ) 2>/dev/null )"
+    find . -xdev -type f -exec sha256sum {} + 2>/dev/null | sort ) 2>/dev/null )" || rc_hash=$?
+  [[ "$rc_hash" -eq 0 ]] || { printf 'UNRELIABLE'; return 0; }
   n_files="$(printf '%s\n' "$list" | grep -c '^f|')"
   n_hashed="$(printf '%s\n' "$hashes" | grep -c '.')"
   if [[ "$n_hashed" -lt "$n_files" ]]; then
@@ -836,6 +845,10 @@ for ((round=1; round<=rounds; round++)); do
       if [[ "$round_verify_failed" -eq 1 ]]; then
         push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth command is failing; fix it before closing"
         echo "  consensus REJECTED: verify failing"
+        final_state="VERIFY_FAILING"
+      elif [[ "$ws_detection_reliable" -eq 0 ]]; then                # Gate 14B.3: UNRELIABLE bloquea CONSENSUS incluso con verify exitoso
+        push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace snapshot unreliable (detection limit); an exit=0 of verify does not restore the lost confidence"
+        echo "  consensus REJECTED: workspace snapshot unreliable (detection limit)"
         final_state="VERIFY_FAILING"
       elif [[ "$ws_delta_unverified_run" -eq 1 ]]; then               # Gate 14B / P0-3: fail closed
         push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace changed without objective ground-truth verification (AGENT_BRIDGE_VERIFY_CMD unset${ws_detection_reliable:+; detection limit invoked})"

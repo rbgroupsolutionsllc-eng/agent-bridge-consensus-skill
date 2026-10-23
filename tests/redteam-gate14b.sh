@@ -11,6 +11,9 @@ mockbin="$tmp_root/bin"
 mkdir -p "$mockbin"
 total=0
 ok_count=0
+skip_count=0
+
+case_skip() { skip_count=$((skip_count+1)); printf 'SKIP %s (requiere id -u != 0: %s)\n' "$1" "$2" >&2; }
 
 # ── mocks ────────────────────────────────────────────────────────────────────
 cat > "$mockbin/claude" <<'EOF'
@@ -258,9 +261,59 @@ else
   case_fail allowlist_strict_unconfigured "rc7, sin Run" "$_rc" "" "$tmp_root/strict-unconfigured.log"
 fi
 
+# ── Gate 14B.3: falla de enumeración de find sobre directorio ilegible ──────
+# Caso 13 (findfail_dir_fail_closed): con chmod 000 en un DIRECTORIO find no
+# puede descender: la lista del snapshot parece "completa" pero omite todo lo
+# que hay dentro (falso negativo silencioso). find termina con rc!=0 → el
+# snapshot se declara UNRELIABLE (detección no garantizable). requires no-root.
+if [[ "$(id -u)" -eq 0 ]]; then
+  case_skip findfail_dir_fail_closed "chmod 000 es readable para root"
+else
+  rm -rf "$tmp_root/workspace/findfail"; mkdir -p "$tmp_root/workspace/findfail"
+  printf 'visible-content' > "$tmp_root/workspace/findfail/ok.txt"
+  mkdir "$tmp_root/workspace/findfail/locked"
+  printf 'hidden-content' > "$tmp_root/workspace/findfail/locked/child.txt"
+  chmod 000 "$tmp_root/workspace/findfail/locked"
+  ( cd /tmp && MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-findfail" \
+    bash "$engine" "$tmp_root/workspace/findfail" "findfail dir" 2 > "$tmp_root/findfail.full" 2>&1; echo $? > "$tmp_root/findfail.rc" )
+  chmod 700 "$tmp_root/workspace/findfail/locked" 2>/dev/null || true
+  rc13="$(cat "$tmp_root/findfail.rc")"
+  if [[ "$rc13" -ne 0 ]] && ! grep -q "Done: CONSENSUS" "$tmp_root/findfail.full"; then
+    case_pass findfail_dir_fail_closed
+  else
+    case_fail findfail_dir_fail_closed "rc!=0 y sin CONSENSUS (fail-closed sobre detect limit)" "$rc13" "" "$tmp_root/findfail.full"
+  fi
+fi
+
+# ── Caso 14 (Gate 14B.3): UNRELIABLE bloquea CONSENSUS incluso con verify exitoso ──
+# Un archivo ilegible (chmod 000) rompe el conteo de hashes → snapshot
+# UNRELIABLE (detección no garantizable) + verify exit=0. La verificación del
+# ground truth NO restaura la confianza perdida: el consenso se rechaza
+# igualmente, fail-closed. requires no-root.
+if [[ "$(id -u)" -eq 0 ]]; then
+  case_skip unreliable_blocks_consensus_with_verify "chmod 000 es readable para root"
+else
+  rm -rf "$tmp_root/workspace/unrel"; mkdir -p "$tmp_root/workspace/unrel"
+  printf 'readable-content' > "$tmp_root/workspace/unrel/ok.txt"
+  printf 'locked-content' > "$tmp_root/workspace/unrel/locked.txt"
+  chmod 000 "$tmp_root/workspace/unrel/locked.txt"
+  ( cd /tmp && MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-unrel" AGENT_BRIDGE_VERIFY_CMD="echo verify-ok" \
+    bash "$engine" "$tmp_root/workspace/unrel" "unreliable" 2 > "$tmp_root/unrel.full" 2>&1; echo $? > "$tmp_root/unrel.rc" )
+  chmod 644 "$tmp_root/workspace/unrel/locked.txt" 2>/dev/null || true
+  rc14="$(cat "$tmp_root/unrel.rc")"
+  if [[ "$rc14" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/unrel.full" \
+     && grep -q '^  verify: exit=0' "$tmp_root/unrel.full"; then
+    case_pass unreliable_blocks_consensus_with_verify
+  else
+    case_fail unreliable_blocks_consensus_with_verify "rc=2+VERIFY_FAILING+verify exit=0" "$rc14" "" "$tmp_root/unrel.full"
+  fi
+fi
+
 if [[ $ok_count -eq $total ]]; then
-  echo "redteam-gate14b: ok ($ok_count casos)"
+  echo "redteam-gate14b: ok ($ok_count casos; id -u = $(id -u)${skip_count:+, $skip_count omitidos por privilegio})"
   exit 0
 fi
-echo "redteam-gate14b: $ok_count/$total casos pasaron"
+echo "redteam-gate14b: $ok_count/$total casos pasaron (omitidos: $skip_count)"
 exit 1
