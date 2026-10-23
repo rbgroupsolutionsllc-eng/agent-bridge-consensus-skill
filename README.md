@@ -96,6 +96,8 @@ Any provider that fails (any exit code, timeout, or empty response) is automatic
 
 **Independent review enforcement:** the orchestrator tracks the actual provider identity (not role labels, filenames, PIDs, response content, or call order) that fulfilled the implementer role each round. That identity is excluded from reviewer fallback selection for the same round — a provider can never review its own implementation. If no distinct supported fallback reviewer is configured after excluding the implementer, the run fails closed as `NO_INDEPENDENT_REVIEWER` rather than emitting `CONSENSUS`. If primary Codex fails and distinct supported fallback reviewer candidates existed but were unavailable or all failed validation or execution, the run fails closed as `CODEX_ERROR` rather than emitting `CONSENSUS`. This exclusion is round-scoped only: an excluded provider is not marked failed and remains eligible in later rounds or other roles.
 
+**Independent judge enforcement (Gate 14B.4.2):** when a dispute requires arbitration, the orchestrator excludes both `impl_provider` and `review_provider` of the current round (actual provider identities, normalized) from arbiter selection. OpenCode remains the preferred arbiter; AGY is used when OpenCode is excluded or unavailable. An excluded provider is never invoked as arbiter (not even as last resort) and is never marked failed by the exclusion. If no independent arbiter candidate exists, the run stops immediately with `NO_INDEPENDENT_JUDGE` (exit `8`) instead of continuing toward a possible later consensus. A unit is never both the implementer or reviewer and the arbiter of the same round.
+
 Final states:
 
 ```text
@@ -113,6 +115,7 @@ CONSENSUS | BLOCKED | VERIFY_FAILING | CLAUDE_ERROR | CODEX_ERROR | NO_INDEPENDE
 | `4` | `CLAUDE_ERROR`: implementer (and fallbacks) failed or were protocol-invalid |
 | `5` | `CODEX_ERROR`: reviewer (and fallbacks) failed or were protocol-invalid |
 | `6` | `NO_INDEPENDENT_REVIEWER`: no distinct reviewer provider exists for this round |
+| `8` | `NO_INDEPENDENT_JUDGE`: no arbiter candidate is independent of this round's implementer and reviewer (Gate 14B.4.2) |
 | `2` (usage) | invalid invocation (bad arguments) |
 | `7` | workspace not authorized by `AGENT_BRIDGE_ALLOWED_WORKSPACES` / `AGENT_BRIDGE_ALLOWLIST_FILE` |
 

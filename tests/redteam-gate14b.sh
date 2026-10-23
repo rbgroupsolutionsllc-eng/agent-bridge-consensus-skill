@@ -111,6 +111,10 @@ cat > "$mockbin/agy" <<'EOF'
 body="$(cat)"
 if [[ "$body" == *"third-party judge"* ]]; then
   [[ -n "${MOCK_AGY_JUDGE_HIT:-}" ]] && printf 'judge\n' > "$MOCK_AGY_JUDGE_HIT"
+  # Gate 14B.4.2: tras la exclusión por independencia de OpenCode el árbitro
+  # efectivo es agy; los hooks de tamper de workspace (RT-02) deben vivir aquí.
+  [[ -n "${MOCK_JUDGE_WS_WRITE:-}" ]] && printf 'judge-touched\n' > "${MOCK_JUDGE_WS_WRITE}/SNEAKY-BY-JUDGE.txt"
+  [[ -n "${MOCK_JUDGE_WS_UNREAD:-}" ]] && { printf 'locked-by-judge\n' > "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; chmod 000 "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; }
   if [[ -n "${MOCK_AGY_JUDGE_FILE:-}" && -f "$MOCK_AGY_JUDGE_FILE" ]]; then
     cat "$MOCK_AGY_JUDGE_FILE"; exit 0
   fi
@@ -373,13 +377,19 @@ else
 fi
 
 # ── Gate 14B.4.1 (RT-02): el árbitro MODIFICA el workspace durante call_judge ─
+# Gate 14B.4.2: aqui el árbitro efectivo es AGY (OpenCode implementó en r1 y
+# queda excluido por independencia), por lo que el tamper se dispara vía el
+# mock de agy con MOCK_AGY_JUDGE_FILE.
 # Caso 15 (judge_ws_write_no_verify_cmd): OpenCode implementa en r1, disputa
-# con codex, el ÁRBITRO (2ª invocación de opencode) crea un archivo en el
-# workspace y r2 termina en VERIFIED. RED actual: todo queda fuera de las
-# ventanas delta → CONSENSUS rc=0 no verificado. GREEN esperado: fail-closed,
-# rc=2 + VERIFY_FAILING + rechazo objetivo.
+# con codex, el ÁRBITRO (agy) crea un archivo en el workspace y r2 termina en
+# VERIFIED. El delta del árbitro queda cubierto por los snapshots pre/post de
+# judge_ws_gate → fail-closed: rc=2 + VERIFY_FAILING + rechazo objetivo.
 printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: impl r2\nNEXT: none\nHANDOFF: ok\n' > "$tmp_root/c15impl-r2.txt"
 printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: rev r2\nNEXT: none\nHANDOFF: ok\n' > "$tmp_root/c15rev.txt"
+# Gate 14B.4.2: respuesta del árbitro AGY (el efectivo tras la exclusión de
+# OpenCode). Veredicto REQUEST_REVISION, idéntico al default del mock de
+# opencode antes de la corrección → el flujo de rondas queda sin cambios.
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: arbiter\nNEXT: none\nHANDOFF: arbiter-agy-marker\nVERDICT: REQUEST_REVISION\n' > "$tmp_root/rt01a-agy-judge.txt"
 rm -rf "$tmp_root/workspace/judge-ws" "$tmp_root/judge15-oc-count" "$tmp_root/judge15-xd-count"
 mkdir -p "$tmp_root/workspace/judge-ws"
 ( cd /tmp
@@ -387,7 +397,8 @@ mkdir -p "$tmp_root/workspace/judge-ws"
     MOCK_OPENCODE_FILE="$tmp_root/c15impl-r2.txt" \
     MOCK_OPENCODE_COUNT_FILE="$tmp_root/judge15-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/judge15-xd-count" \
     MOCK_JUDGE_WS_WRITE="$tmp_root/workspace/judge-ws" AGENT_BRIDGE_HOME="$tmp_root/bridge-judge-ws" \
-    MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL=""
+    MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt"
   bash "$engine" "$tmp_root/workspace/judge-ws" "juez modifica workspace" 2 > "$tmp_root/judge-ws.full" 2>&1
   echo $? > "$tmp_root/judge-ws.rc"
 )
@@ -415,6 +426,7 @@ mkdir -p "$tmp_root/workspace/judge-ws2"
     MOCK_OPENCODE_FILE="$tmp_root/c15impl-r2.txt" \
     MOCK_OPENCODE_COUNT_FILE="$tmp_root/judge16-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/judge16-xd-count" \
     MOCK_JUDGE_WS_WRITE="$tmp_root/workspace/judge-ws2" AGENT_BRIDGE_HOME="$tmp_root/bridge-judge-ws2" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt" \
     MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
     AGENT_BRIDGE_VERIFY_CMD="echo VERIFY-RAN >> $tmp_root/verify-judge16.log; false"
   bash "$engine" "$tmp_root/workspace/judge-ws2" "delta del juez con verify fallido" 2 > "$tmp_root/judge-ws2.full" 2>&1
@@ -444,6 +456,7 @@ mkdir -p "$tmp_root/workspace/judge-ws3"
     MOCK_OPENCODE_FILE="$tmp_root/c15impl-r2.txt" \
     MOCK_OPENCODE_COUNT_FILE="$tmp_root/judge17-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/judge17-xd-count" \
     MOCK_JUDGE_WS_WRITE="$tmp_root/workspace/judge-ws3" AGENT_BRIDGE_HOME="$tmp_root/bridge-judge-ws3" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt" \
     MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
     AGENT_BRIDGE_VERIFY_CMD="echo VERIFY-RAN >> $tmp_root/verify-judge17.log; true"
   bash "$engine" "$tmp_root/workspace/judge-ws3" "delta del juez con verify exitoso" 2 > "$tmp_root/judge-ws3.full" 2>&1
@@ -472,6 +485,7 @@ mkdir -p "$tmp_root/workspace/judge-ws4"
     MOCK_OPENCODE_FILE="$tmp_root/c15impl-r2.txt" \
     MOCK_OPENCODE_COUNT_FILE="$tmp_root/judge18-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/judge18-xd-count" \
     MOCK_JUDGE_WS_WRITE="$tmp_root/workspace/judge-ws4" MOCK_JUDGE_WS_UNREAD=1 \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt" \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-judge-ws4" \
     MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
     AGENT_BRIDGE_VERIFY_CMD="echo VERIFY-RAN >> $tmp_root/verify-judge18.log; true"
@@ -499,7 +513,8 @@ printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl dispute\nNEXT: none\nHAN
 printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: impl r2\nNEXT: none\nHANDOFF: ok\n' > "$tmp_root/rt01a-impl-agy-r2.txt"
 printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rev oc\nNEXT: none\nHANDOFF: disputa rev oc\n' > "$tmp_root/rt01a-rev-oc.txt"
 printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rev agy\nNEXT: none\nHANDOFF: disputa rev agy\n' > "$tmp_root/rt01a-rev-agy.txt"
-printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: arbiter\nNEXT: none\nHANDOFF: arbiter-agy-marker\nVERDICT: REQUEST_REVISION\n' > "$tmp_root/rt01a-agy-judge.txt"
+# NOTA: rt01a-agy-judge.txt ya fue creado antes del caso 15 y se comparte con
+# RT-02; no se recrea aquí para evitar una segunda fuente de verdad.
 
 # ── Caso 19 (rt01a_agy_arbitrates_when_oc_implemented): OpenCode implementa,
 # Codex revisa. OpenCode NO puede arbitrar; debe seleccionarse AGY.
@@ -513,6 +528,7 @@ mkdir -p "$tmp_root/workspace/rt01a-ws1"
     MOCK_OPENCODE_COUNT_FILE="$tmp_root/rt01a-1-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/rt01a-1-xd-count" \
     MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt" \
     MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-1" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-1" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01a-1"
   bash "$engine" "$tmp_root/workspace/rt01a-ws1" "RT-01a: impl opencode, rev codex" 2 > "$tmp_root/rt01a-1.full" 2>&1
   echo $? > "$tmp_root/rt01a-1.rc"
@@ -569,6 +585,7 @@ mkdir -p "$tmp_root/workspace/rt01a-ws3"
     MOCK_OPENCODE_COUNT_FILE="$tmp_root/rt01a-3-oc-count" \
     MOCK_AGY_FILE="$tmp_root/rt01a-rev-agy.txt" \
     MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-3" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-3" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01a-3"
   bash "$engine" "$tmp_root/workspace/rt01a-ws3" "RT-01a: sin candidato independiente" 2 > "$tmp_root/rt01a-3.full" 2>&1
   echo $? > "$tmp_root/rt01a-3.rc"

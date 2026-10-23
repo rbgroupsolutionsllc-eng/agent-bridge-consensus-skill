@@ -691,10 +691,37 @@ call_judge() {
   } > "$prompt"
 
   local jrc _g14b_pre_judge
+  # ── Gate 14B.4.2 (RT-01a): el árbitro debe ser independiente ───────────
+  # Identidades REALES registradas por el orquestador (impl_provider /
+  # review_provider), normalizadas con normalize_provider(); la exclusión es
+  # round-scoped y jamás vía mark_failed (un proveedor excluido por
+  # independencia no falló y sigue elegible en otras rondas/roles).
+  local _g14b_impl_id _g14b_rev_id _g14b_oc_eligible=1 _g14b_agy_eligible=1 _g14b_candidate=0
+  _g14b_impl_id="$(normalize_provider "${impl_provider:-}")"
+  _g14b_rev_id="$(normalize_provider "${review_provider:-}")"
+  if [[ "$_g14b_impl_id" == "opencode" || "$_g14b_rev_id" == "opencode" ]]; then
+    _g14b_oc_eligible=0
+  fi
+  if [[ "$_g14b_impl_id" == "agy" || "$_g14b_rev_id" == "agy" ]]; then
+    _g14b_agy_eligible=0
+  fi
+  # Gate 14B.4.2 fail-closed: sin candidato independiente no se intenta
+  # arbitraje ni se continúa en rondas posteriores; estado explícito
+  # NO_INDEPENDENT_JUDGE (rc=8), distinto de NO_INDEPENDENT_REVIEWER. Los
+  # candidatos elegibles que fallan al ejecutarse mantienen el camino
+  # JUDGE UNAVAILABLE existente (nunca se recurre a un participante).
+  if [[ "$_g14b_oc_eligible" -eq 1 ]] && ! is_failed opencode; then _g14b_candidate=1; fi
+  if [[ "$_g14b_agy_eligible" -eq 1 ]] && ! is_failed agy; then _g14b_candidate=1; fi
+  if [[ "$_g14b_candidate" -eq 0 ]]; then
+    push_note "NO INDEPENDENT JUDGE (round $round): every arbiter candidate already implemented or reviewed this round; refusing to continue toward possible consensus"
+    echo "  independent judge unavailable: no candidate is independent of implementer '$impl_provider' and reviewer '$review_provider'"
+    _g14b_judge_independence_failed=1
+    return 0
+  fi
   _g14b_pre_judge="$(ws_snapshot)"                                   # Gate 14B.4: estado justo antes de que el árbitro se ejecute
   rm -f "$out"
-  # Primary judge: OpenCode
-  if ! is_failed opencode; then
+  # Primary judge: OpenCode (Gate 14B.4.2: solo si no implementó ni revisó esta ronda)
+  if [[ "$_g14b_oc_eligible" -eq 1 ]] && ! is_failed opencode; then
     echo "  escalating to OpenCode judge..."
     set +e
     timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
@@ -704,9 +731,11 @@ call_judge() {
       mark_failed opencode
       rm -f "$out"
     fi
+  elif [[ "$_g14b_oc_eligible" -eq 0 ]] && ! is_failed opencode; then
+    echo "  judge: OpenCode excluded (independence: implemented/reviewed this round)"
   fi
-  # Fallback judge: agy
-  if [[ ! -s "$out" ]] && is_failed opencode && ! is_failed agy; then
+  # Fallback judge: agy (Gate 14B.4.2: solo si no implementó ni revisó esta ronda)
+  if [[ ! -s "$out" ]] && [[ "$_g14b_agy_eligible" -eq 1 ]] && ! is_failed agy; then
     echo "  judge: OpenCode unavailable, trying agy..."
     rm -f "$out"
     set +e
@@ -717,6 +746,8 @@ call_judge() {
       mark_failed agy
       rm -f "$out"
     fi
+  elif [[ ! -s "$out" ]] && [[ "$_g14b_agy_eligible" -eq 0 ]] && ! is_failed agy; then
+    echo "  judge: agy excluded (independence: implemented/reviewed this round)"
   fi
   if [[ ! -s "$out" ]]; then
     push_note "JUDGE UNAVAILABLE (round $round): all judge providers unavailable; operator review advised"
@@ -741,6 +772,7 @@ codex_status=""
 ws_delta_unverified_run=0   # Gate 14B: hubo cambios reales sin ground truth ejecutable
 ws_detection_reliable=1     # Gate 14B: detección de delta garantizable; 0 = límite detectado → fail closed
 ws_judge_verify_failed_run=0 # Gate 14B.4: ground truth falló tras delta del juez; run-scoped porque round_verify_failed es por ronda
+_g14b_judge_independence_failed=0 # Gate 14B.4.2: sin árbitro independiente esta ronda → NO_INDEPENDENT_JUDGE, se reinicia en cada invocación del juez
 
 for ((round=1; round<=rounds; round++)); do
   round_verify_failed=0
@@ -911,7 +943,14 @@ for ((round=1; round<=rounds; round++)); do
       ;;
     DISAGREE)
       if [[ "$claude_status" == "DISAGREE" || "$claude_status" == "REVISE" ]]; then
+        _g14b_judge_independence_failed=0
         call_judge "$round"
+        # Gate 14B.4.2: sin árbitro independiente no se continúa silenciosamente
+        # hacia un posible consenso posterior; corte explícito de la ronda.
+        if [[ "$_g14b_judge_independence_failed" -eq 1 ]]; then
+          final_state="NO_INDEPENDENT_JUDGE"
+          break
+        fi
       fi
       ;;
   esac
@@ -927,6 +966,7 @@ cat "$handoff_file"
 # ── Gate 14B / P0-1: códigos de salida documentados (README) ─────────────────
 # 0 CONSENSUS · 1 MAX_ROUNDS/esperado no mapeado · 2 VERIFY_FAILING
 # 3 BLOCKED · 4 CLAUDE_ERROR · 5 CODEX_ERROR · 6 NO_INDEPENDENT_REVIEWER
+# 8 NO_INDEPENDENT_JUDGE (Gate 14B.4.2: sin árbitro independiente de impl+rev)
 # 2 de invocación: args inválidos · 7 workspace no autorizado por allowlist
 case "$final_state" in
   CONSENSUS) exit 0 ;;
@@ -936,5 +976,6 @@ case "$final_state" in
   CLAUDE_ERROR) exit 4 ;;
   CODEX_ERROR) exit 5 ;;
   NO_INDEPENDENT_REVIEWER) exit 6 ;;
+  NO_INDEPENDENT_JUDGE) exit 8 ;;
   *) exit 1 ;;
 esac
