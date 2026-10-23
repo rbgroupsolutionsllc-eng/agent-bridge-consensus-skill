@@ -630,6 +630,45 @@ else
   case_fail rt01a_agy_arbitrates_when_oc_reviewed "opencode revisó y no puede arbitrar (RED: opencode se auto-arbitró como revisor)" "$rcN4" "agy_hit=$agy_hit_4 oc_hit=$oc_hit_4" "$tmp_root/rt01a-4.full"
 fi
 
+# ── Caso 23 (rt01a_eligible_failed_judge_unavailable, RT-01a-F1):
+# reclasificación. Claude implementa (DISAGREE), Codex falla y AGY revisa
+# (excluido como árbitro por independencia). OpenCode ÉS independiente pero
+# su intento de arbitraje es protocolo-invalido (garbage) → mark_failed.
+# Clasificación esperada (GREEN): existen candidatos independientes, solo
+# fallaron/disponibles → camino JUDGE UNAVAILABLE existente en ambas rondas,
+# final MAX_ROUNDS rc=1. NO_INDEPENDENT_JUDGE rc=8 está RESERVADO a ambos
+# excluidos por participación (caso 21). RED del motor actual: en la 2ª
+# invocación del juez el candidato se calcula con is_failed → rc=8.
+printf 'not a protocol block\n' > "$tmp_root/rt01a-judge-garbage.txt"
+rm -rf "$tmp_root/workspace/rt01a-ws5" "$tmp_root/rt01a-5-gy-count" "$tmp_root/hit-oc-judge-5" "$tmp_root/hit-agy-judge-5"
+mkdir -p "$tmp_root/workspace/rt01a-ws5"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CODEX_FAIL=1 \
+    AGENT_BRIDGE_FALLBACKS="agy" \
+    MOCK_AGY_FILE="$tmp_root/rt01a-rev-agy.txt" \
+    MOCK_AGY_COUNT_FILE="$tmp_root/rt01a-5-gy-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt01a-judge-garbage.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-5" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-5" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01a-5"
+  bash "$engine" "$tmp_root/workspace/rt01a-ws5" "RT-01a-F1: árbitro independiente fallido" 2 > "$tmp_root/rt01a-5.full" 2>&1
+  echo $? > "$tmp_root/rt01a-5.rc"
+)
+rcN5="$(cat "$tmp_root/rt01a-5.rc")"
+agy_hit_5=0; [[ -f "$tmp_root/hit-agy-judge-5" ]] && agy_hit_5=1
+oc_hit_5=0; [[ -f "$tmp_root/hit-oc-judge-5" ]] && oc_hit_5=1
+if [[ "$rcN5" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt01a-5.full" \
+   && grep -q "JUDGE UNAVAILABLE (round 2): all judge providers unavailable; operator review advised" "$tmp_root/rt01a-5.full" \
+   && grep -q "escalating to OpenCode judge" "$tmp_root/rt01a-5.full" \
+   && grep -q "judge: agy excluded (independence: implemented/reviewed this round)" "$tmp_root/rt01a-5.full" \
+   && grep -q "Reviewer (agy)" "$tmp_root/rt01a-5.full" \
+   && ! grep -q "Done: NO_INDEPENDENT_JUDGE" "$tmp_root/rt01a-5.full" \
+   && [[ "$agy_hit_5" -eq 0 ]]; then
+  case_pass rt01a_eligible_failed_judge_unavailable
+else
+  case_fail rt01a_eligible_failed_judge_unavailable "independiente elegible pero fallido → JUDGE_UNAVAILABLE (MAX_ROUNDS rc=1), NUNCA rc=8 (RED: rc=8 por is_failed del candidato)" "$rcN5" "agy_hit=$agy_hit_5 oc_hit=$oc_hit_5" "$tmp_root/rt01a-5.full"
+fi
+
 if [[ $ok_count -eq $total ]]; then
   echo "redteam-gate14b: ok ($ok_count casos; id -u = $(id -u)${skip_count:+, $skip_count omitidos por privilegio})"
   exit 0
