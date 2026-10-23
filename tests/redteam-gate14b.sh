@@ -279,10 +279,11 @@ else
     bash "$engine" "$tmp_root/workspace/findfail" "findfail dir" 2 > "$tmp_root/findfail.full" 2>&1; echo $? > "$tmp_root/findfail.rc" )
   chmod 700 "$tmp_root/workspace/findfail/locked" 2>/dev/null || true
   rc13="$(cat "$tmp_root/findfail.rc")"
-  if [[ "$rc13" -ne 0 ]] && ! grep -q "Done: CONSENSUS" "$tmp_root/findfail.full"; then
+  if [[ "$rc13" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/findfail.full" \
+     && grep -q "consensus REJECTED: workspace snapshot unreliable (detection limit)" "$tmp_root/findfail.full"; then
     case_pass findfail_dir_fail_closed
   else
-    case_fail findfail_dir_fail_closed "rc!=0 y sin CONSENSUS (fail-closed sobre detect limit)" "$rc13" "" "$tmp_root/findfail.full"
+    case_fail findfail_dir_fail_closed "rc=2+VERIFY_FAILING+rechazo explicito por snapshot no confiable" "$rc13" "" "$tmp_root/findfail.full"
   fi
 fi
 
@@ -304,10 +305,11 @@ else
   chmod 644 "$tmp_root/workspace/unrel/locked.txt" 2>/dev/null || true
   rc14="$(cat "$tmp_root/unrel.rc")"
   if [[ "$rc14" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/unrel.full" \
-     && grep -q '^  verify: exit=0' "$tmp_root/unrel.full"; then
+     && grep -q '^  verify: exit=0' "$tmp_root/unrel.full" \
+     && grep -q "consensus REJECTED: workspace snapshot unreliable (detection limit)" "$tmp_root/unrel.full"; then
     case_pass unreliable_blocks_consensus_with_verify
   else
-    case_fail unreliable_blocks_consensus_with_verify "rc=2+VERIFY_FAILING+verify exit=0" "$rc14" "" "$tmp_root/unrel.full"
+    case_fail unreliable_blocks_consensus_with_verify "rc=2+VERIFY_FAILING+verify exit=0+rechazo UNRELIABLE" "$rc14" "" "$tmp_root/unrel.full"
   fi
 fi
 
