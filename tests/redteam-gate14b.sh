@@ -80,6 +80,7 @@ if [[ -n "${MOCK_OPENCODE_COUNT_FILE:-}" ]]; then
   case "$c" in
     1) printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl r1\nNEXT: none\nHANDOFF: disputa r1\n'; exit 0 ;;
     2) [[ -n "${MOCK_JUDGE_WS_WRITE:-}" ]] && printf 'judge-touched\n' > "${MOCK_JUDGE_WS_WRITE}/SNEAKY-BY-JUDGE.txt"
+       [[ -n "${MOCK_JUDGE_WS_UNREAD:-}" ]] && { printf 'locked-by-judge\n' > "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; chmod 000 "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; }
        printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: judge r1\nNEXT: none\nHANDOFF: veredicto viz\nVERDICT: REQUEST_REVISION\n'; exit 0 ;;
   esac
 fi
@@ -392,6 +393,65 @@ if [[ "$rc16" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/judge-ws2.fu
   case_pass judge_ws_delta_runs_verify
 else
   case_fail judge_ws_delta_runs_verify "rc=2+VERIFY_FAILING+verify exit=1 corrió por delta del juez" "$rc16" "" "$tmp_root/judge-ws2.full"
+fi
+
+# Caso 17 (judge_ws_verify_success_continues) [C-REGRESIÓN set -e]: mismo
+# escenario de tamper + AGENT_BRIDGE_VERIFY_CMD EXITOSO. Tras run_verify
+# exitoso, round_verify_failed=0 y la comparación `[[ 0 -eq 1 ]] && asg`
+# del commit a3e1af2 devolvería 1 como ÚLTIMA sentencia de judge_ws_gate()
+# → sale 1 → call_judge sale 1 → el aborto prematuro del motor por set -e.
+# GREEN esperado: el motor completa sus controles normalmente y continúa
+# hasta el estado final objetivo (CONSENSUS rc=0), sin aborto.
+rm -rf "$tmp_root/workspace/judge-ws3" "$tmp_root/judge17-oc-count" "$tmp_root/judge17-xd-count" "$tmp_root/verify-judge17.log"
+mkdir -p "$tmp_root/workspace/judge-ws3"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c15rev.txt" \
+    MOCK_OPENCODE_FILE="$tmp_root/c15impl-r2.txt" \
+    MOCK_OPENCODE_COUNT_FILE="$tmp_root/judge17-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/judge17-xd-count" \
+    MOCK_JUDGE_WS_WRITE="$tmp_root/workspace/judge-ws3" AGENT_BRIDGE_HOME="$tmp_root/bridge-judge-ws3" \
+    MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
+    AGENT_BRIDGE_VERIFY_CMD="echo VERIFY-RAN >> $tmp_root/verify-judge17.log; true"
+  bash "$engine" "$tmp_root/workspace/judge-ws3" "delta del juez con verify exitoso" 2 > "$tmp_root/judge-ws3.full" 2>&1
+  echo $? > "$tmp_root/judge-ws3.rc"
+)
+rc17="$(cat "$tmp_root/judge-ws3.rc")"
+verify17=0; [[ -s "$tmp_root/verify-judge17.log" ]] && verify17=1
+tamper17=0; [[ -f "$tmp_root/workspace/judge-ws3/SNEAKY-BY-JUDGE.txt" ]] && tamper17=1
+if [[ "$tamper17" -eq 1 && "$rc17" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/judge-ws3.full" \
+   && grep -q '^  verify: exit=0' "$tmp_root/judge-ws3.full" && [[ "$verify17" -eq 1 ]] \
+   && grep -q "GROUND TRUTH after judge (round" "$tmp_root/judge-ws3.full"; then
+  case_pass judge_ws_verify_success_continues
+else
+  case_fail judge_ws_verify_success_continues "rc=0+CONSENSUS+verify exit=0 sin aborto prematuro (RED: aborto de set -e tras verify del juez exitoso)" "$rc17" "" "$tmp_root/judge-ws3.full"
+fi
+
+# Caso 18 (judge_ws_unreliable_with_verify_success) [C-REGRESIÓN]: snapshot
+# no confiable DURANTE el arbitraje (el juez deja un archivo chmod 000 que
+# rompe el hash del snapshot post) con verify exitoso. La pérdida de
+# confianza no se restaura por un exit=0 de ground truth: rechazo
+# obligatorio de CONSENSUS por VERIFY_FAILING rc=2.
+rm -rf "$tmp_root/workspace/judge-ws4" "$tmp_root/judge18-oc-count" "$tmp_root/judge18-xd-count" "$tmp_root/verify-judge18.log"
+mkdir -p "$tmp_root/workspace/judge-ws4"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c15rev.txt" \
+    MOCK_OPENCODE_FILE="$tmp_root/c15impl-r2.txt" \
+    MOCK_OPENCODE_COUNT_FILE="$tmp_root/judge18-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/judge18-xd-count" \
+    MOCK_JUDGE_WS_WRITE="$tmp_root/workspace/judge-ws4" MOCK_JUDGE_WS_UNREAD=1 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-judge-ws4" \
+    MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
+    AGENT_BRIDGE_VERIFY_CMD="echo VERIFY-RAN >> $tmp_root/verify-judge18.log; true"
+  bash "$engine" "$tmp_root/workspace/judge-ws4" "juez deja snapshot no confiable" 2 > "$tmp_root/judge-ws4.full" 2>&1
+  echo $? > "$tmp_root/judge-ws4.rc"
+)
+chmod 644 "$tmp_root/workspace/judge-ws4/LOCKED-BY-JUDGE.txt" 2>/dev/null || true
+rc18="$(cat "$tmp_root/judge-ws4.rc")"
+locked=0; [[ -f "$tmp_root/workspace/judge-ws4/LOCKED-BY-JUDGE.txt" ]] && locked=1
+if [[ "$locked" -eq 1 && "$rc18" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/judge-ws4.full" \
+   && grep -q "consensus REJECTED: workspace snapshot unreliable (detection limit)" "$tmp_root/judge-ws4.full" \
+   && grep -q '^  verify: exit=0' "$tmp_root/judge-ws4.full"; then
+  case_pass judge_ws_unreliable_with_verify_success
+else
+  case_fail judge_ws_unreliable_with_verify_success "rc=2+VERIFY_FAILING+UNRELIABLE tras snapshot del juez, verify exit=0 no lo restaura (RED: aborto de set -e)" "$rc18" "" "$tmp_root/judge-ws4.full"
 fi
 
 if [[ $ok_count -eq $total ]]; then
