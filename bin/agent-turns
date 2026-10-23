@@ -658,13 +658,19 @@ judge_ws_gate() {
   if [[ "$delta" -eq 1 ]]; then
     if [[ -n "$verify_cmd" ]]; then
       run_verify "$round" "judge"
-      [[ "$round_verify_failed" -eq 1 ]] && ws_judge_verify_failed_run=1 # Gate 14B.4: persiste (round_verify_failed se resetea por ronda y el tamper puede cerrarse en ronda posterior)
+      # C-REGRESIÓN set -e: el `[[ ... ]] && asg` devolvía 1 cuando verify había
+      # salido exitoso, como última sentencia de la función → aborto prematuro
+      # del motor vía call_judge. `if` explícito y `return 0` garantizado.
+      if [[ "$round_verify_failed" -eq 1 ]]; then
+        ws_judge_verify_failed_run=1 # Gate 14B.4: persiste (round_verify_failed se resetea por ronda y el tamper puede cerrarse en ronda posterior)
+      fi
     else
       ws_delta_unverified_run=1
       push_note "VERIFY REQUIRED (round $round): workspace changed during judge arbitration but AGENT_BRIDGE_VERIFY_CMD is unset; consensus will be refused without objective verification"
       echo "  workspace changed during judge arbitration; AGENT_BRIDGE_VERIFY_CMD unset (consensus will require objective verification)"
     fi
   fi
+  return 0   # Gate 14B.4: el gate completo sin aborto; el control real vive en ws_* y en el gate de CONSENSUS
 }
 
 call_judge() {
