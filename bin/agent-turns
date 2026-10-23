@@ -635,6 +635,38 @@ call_fallback() {
   return 1
 }
 
+# ── Gate 14B.4: el juez dentro del mismo control de integridad (RT-02) ──────
+# Reuso estricto del mecanismo ya usado por los turnos de implementador y de
+# revisor: ws_snapshot pre/post, ws_snapshot_ok, run_verify, y las variables
+# run-scoped ws_detection_reliable / ws_delta_unverified_run que el gate de
+# CONSENSUS ya evalúa. No hay un segundo sistema: solo se conecta el árbitro
+# al mismo gate. El snapshot post se toma tras el intento del juez haya
+# devuelto una respuesta válida, inválida o nada (siempre que haya llegado a
+# ejecutarse), de modo que cualquier huella que deje en el workspace queda
+# sujeta al mismo control objetivo. Como la acumulación es run-scoped, un
+# tamper del juez en la ronda N impide CONSENSUS en esa y en cualquier ronda
+# posterior.
+judge_ws_gate() {
+  local round="$1" pre="$2" post delta=0
+  post="$(ws_snapshot)"
+  if ws_snapshot_ok "$pre" && ws_snapshot_ok "$post"; then
+    [[ "$post" != "$pre" ]] && delta=1
+  else
+    ws_detection_reliable=0                                          # límite de detección → fail closed
+    delta=1
+  fi
+  if [[ "$delta" -eq 1 ]]; then
+    if [[ -n "$verify_cmd" ]]; then
+      run_verify "$round" "judge"
+      [[ "$round_verify_failed" -eq 1 ]] && ws_judge_verify_failed_run=1 # Gate 14B.4: persiste (round_verify_failed se resetea por ronda y el tamper puede cerrarse en ronda posterior)
+    else
+      ws_delta_unverified_run=1
+      push_note "VERIFY REQUIRED (round $round): workspace changed during judge arbitration but AGENT_BRIDGE_VERIFY_CMD is unset; consensus will be refused without objective verification"
+      echo "  workspace changed during judge arbitration; AGENT_BRIDGE_VERIFY_CMD unset (consensus will require objective verification)"
+    fi
+  fi
+}
+
 call_judge() {
   local round="$1" prompt="$run_dir/round-${round}-judge.prompt.md" out="$run_dir/round-${round}-judge.out.md"
   {
@@ -652,7 +684,8 @@ call_judge() {
     echo "Rules: exactly one VERDICT line, containing one allowed value only (no extra words, no trailing punctuation). No narration, no Markdown fences, no lines other than the protocol fields."
   } > "$prompt"
 
-  local jrc
+  local jrc _g14b_pre_judge
+  _g14b_pre_judge="$(ws_snapshot)"                                   # Gate 14B.4: estado justo antes de que el árbitro se ejecute
   rm -f "$out"
   # Primary judge: OpenCode
   if ! is_failed opencode; then
@@ -681,9 +714,11 @@ call_judge() {
   fi
   if [[ ! -s "$out" ]]; then
     push_note "JUDGE UNAVAILABLE (round $round): all judge providers unavailable; operator review advised"
+    judge_ws_gate "$round" "$_g14b_pre_judge"                        # Gate 14B.4: detecta tamper aunque la respuesta fuese inválida o vacía
     return 0
   fi
   push_note "JUDGE VERDICT (round $round): $(judge_summary "$out")"
+  judge_ws_gate "$round" "$_g14b_pre_judge"                          # Gate 14B.4: delta del juez → mismo control que implementador/revisor
 }
 
 changed_something() {
@@ -699,6 +734,7 @@ claude_status=""
 codex_status=""
 ws_delta_unverified_run=0   # Gate 14B: hubo cambios reales sin ground truth ejecutable
 ws_detection_reliable=1     # Gate 14B: detección de delta garantizable; 0 = límite detectado → fail closed
+ws_judge_verify_failed_run=0 # Gate 14B.4: ground truth falló tras delta del juez; run-scoped porque round_verify_failed es por ronda
 
 for ((round=1; round<=rounds; round++)); do
   round_verify_failed=0
@@ -845,6 +881,10 @@ for ((round=1; round<=rounds; round++)); do
       if [[ "$round_verify_failed" -eq 1 ]]; then
         push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth command is failing; fix it before closing"
         echo "  consensus REJECTED: verify failing"
+        final_state="VERIFY_FAILING"
+      elif [[ "$ws_judge_verify_failed_run" -eq 1 ]]; then         # Gate 14B.4: verify falló tras delta del juez en una ronda previa
+        push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth failed after workspace change during judge arbitration; fix it before closing"
+        echo "  consensus REJECTED: ground truth failing after judge arbitration"
         final_state="VERIFY_FAILING"
       elif [[ "$ws_detection_reliable" -eq 0 ]]; then                # Gate 14B.3: UNRELIABLE bloquea CONSENSUS incluso con verify exitoso
         push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace snapshot unreliable (detection limit); an exit=0 of verify does not restore the lost confidence"
