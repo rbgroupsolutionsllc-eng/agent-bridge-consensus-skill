@@ -696,7 +696,7 @@ call_judge() {
   # review_provider), normalizadas con normalize_provider(); la exclusión es
   # round-scoped y jamás vía mark_failed (un proveedor excluido por
   # independencia no falló y sigue elegible en otras rondas/roles).
-  local _g14b_impl_id _g14b_rev_id _g14b_oc_eligible=1 _g14b_agy_eligible=1 _g14b_candidate=0
+  local _g14b_impl_id _g14b_rev_id _g14b_oc_eligible=1 _g14b_agy_eligible=1
   _g14b_impl_id="$(normalize_provider "${impl_provider:-}")"
   _g14b_rev_id="$(normalize_provider "${review_provider:-}")"
   if [[ "$_g14b_impl_id" == "opencode" || "$_g14b_rev_id" == "opencode" ]]; then
@@ -705,14 +705,14 @@ call_judge() {
   if [[ "$_g14b_impl_id" == "agy" || "$_g14b_rev_id" == "agy" ]]; then
     _g14b_agy_eligible=0
   fi
-  # Gate 14B.4.2 fail-closed: sin candidato independiente no se intenta
-  # arbitraje ni se continúa en rondas posteriores; estado explícito
-  # NO_INDEPENDENT_JUDGE (rc=8), distinto de NO_INDEPENDENT_REVIEWER. Los
-  # candidatos elegibles que fallan al ejecutarse mantienen el camino
-  # JUDGE UNAVAILABLE existente (nunca se recurre a un participante).
-  if [[ "$_g14b_oc_eligible" -eq 1 ]] && ! is_failed opencode; then _g14b_candidate=1; fi
-  if [[ "$_g14b_agy_eligible" -eq 1 ]] && ! is_failed agy; then _g14b_candidate=1; fi
-  if [[ "$_g14b_candidate" -eq 0 ]]; then
+  # Gate 14B.4.2 fail-closed (RT-01a-F1): NO_INDEPENDENT_JUDGE (rc=8) se usa
+  # ÚNICAMENTE cuando OpenCode y AGY están excluidos POR PARTICIPACIÓN como
+  # implementador o revisor de esta ronda. Si existe un candidato
+  # independiente pero está marcado como fallido o no disponible, la
+  # clasificación correcta es el camino JUDGE UNAVAILABLE existente: en esta
+  # ronda no hay árbitro ejecutable, pero la exclusión es por fallo, no por
+  # independencia. Nunca se recurre a un participante.
+  if [[ "$_g14b_oc_eligible" -ne 1 && "$_g14b_agy_eligible" -ne 1 ]]; then
     push_note "NO INDEPENDENT JUDGE (round $round): every arbiter candidate already implemented or reviewed this round; refusing to continue toward possible consensus"
     echo "  independent judge unavailable: no candidate is independent of implementer '$impl_provider' and reviewer '$review_provider'"
     _g14b_judge_independence_failed=1

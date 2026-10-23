@@ -96,12 +96,12 @@ Any provider that fails (any exit code, timeout, or empty response) is automatic
 
 **Independent review enforcement:** the orchestrator tracks the actual provider identity (not role labels, filenames, PIDs, response content, or call order) that fulfilled the implementer role each round. That identity is excluded from reviewer fallback selection for the same round — a provider can never review its own implementation. If no distinct supported fallback reviewer is configured after excluding the implementer, the run fails closed as `NO_INDEPENDENT_REVIEWER` rather than emitting `CONSENSUS`. If primary Codex fails and distinct supported fallback reviewer candidates existed but were unavailable or all failed validation or execution, the run fails closed as `CODEX_ERROR` rather than emitting `CONSENSUS`. This exclusion is round-scoped only: an excluded provider is not marked failed and remains eligible in later rounds or other roles.
 
-**Independent judge enforcement (Gate 14B.4.2):** when a dispute requires arbitration, the orchestrator excludes both `impl_provider` and `review_provider` of the current round (actual provider identities, normalized) from arbiter selection. OpenCode remains the preferred arbiter; AGY is used when OpenCode is excluded or unavailable. An excluded provider is never invoked as arbiter (not even as last resort) and is never marked failed by the exclusion. If no independent arbiter candidate exists, the run stops immediately with `NO_INDEPENDENT_JUDGE` (exit `8`) instead of continuing toward a possible later consensus. A unit is never both the implementer or reviewer and the arbiter of the same round.
+**Independent judge enforcement (Gate 14B.4.2):** when a dispute requires arbitration, the orchestrator excludes both `impl_provider` and `review_provider` of the current round (actual provider identities, normalized) from arbiter selection. OpenCode remains the preferred arbiter; AGY is used when OpenCode is excluded or unavailable. An excluded provider is never invoked as arbiter (not even as last resort) and is never marked failed by the exclusion. If both arbiter candidates are excluded this way, the run stops immediately with `NO_INDEPENDENT_JUDGE` (exit `8`) instead of continuing toward a possible later consensus; `NO_INDEPENDENT_JUDGE` is used exclusively for participation-based exclusion. If an independent candidate exists but is marked failed or unavailable for the round, the run keeps the existing `JUDGE UNAVAILABLE` path instead of reporting `NO_INDEPENDENT_JUDGE`. A provider is never both the implementer or reviewer and the arbiter of the same round.
 
 Final states:
 
 ```text
-CONSENSUS | BLOCKED | VERIFY_FAILING | CLAUDE_ERROR | CODEX_ERROR | NO_INDEPENDENT_REVIEWER | MAX_ROUNDS
+CONSENSUS | BLOCKED | VERIFY_FAILING | CLAUDE_ERROR | CODEX_ERROR | NO_INDEPENDENT_REVIEWER | NO_INDEPENDENT_JUDGE | MAX_ROUNDS
 ```
 
 ## Exit codes (Gate 14B)
