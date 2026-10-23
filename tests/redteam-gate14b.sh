@@ -70,19 +70,34 @@ EOF
 
 cat > "$mockbin/opencode" <<'EOF'
 #!/usr/bin/env bash
-# Gate 14B.4.1: con MOCK_OPENCODE_COUNT_FILE activado, la 1ª invocación es el
-# intento de fallback del implementador (r1), la 2ª es el ÁRBITRO (call_judge)
-# y las siguientes vuelven al implementador (r2+). Sin la variable, el mock
-# clásico por archivo queda intacto para los casos 1-14.
+# Gate 14B.4.2: el ROL se registra por el contenido del prompt (ask-opencode
+# pasa `$(cat "prompt")` como un solo argumento; el prompt del árbitro contiene
+# "third-party judge"). El hit-file deja registro inequívoco de proveedor+rol.
+isjudge=0
+for a in "$@"; do
+  [[ "$a" == *"third-party judge"* ]] && isjudge=1
+done
+if [[ "$isjudge" -eq 1 ]]; then
+  [[ -n "${MOCK_OPENCODE_JUDGE_HIT:-}" ]] && printf 'judge\n' > "$MOCK_OPENCODE_JUDGE_HIT"
+  [[ -n "${MOCK_JUDGE_WS_WRITE:-}" ]] && printf 'judge-touched\n' > "${MOCK_JUDGE_WS_WRITE}/SNEAKY-BY-JUDGE.txt"
+  [[ -n "${MOCK_JUDGE_WS_UNREAD:-}" ]] && { printf 'locked-by-judge\n' > "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; chmod 000 "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; }
+  if [[ -n "${MOCK_OPENCODE_JUDGE_FILE:-}" && -f "$MOCK_OPENCODE_JUDGE_FILE" ]]; then
+    cat "$MOCK_OPENCODE_JUDGE_FILE"; exit 0
+  fi
+  printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: judge r1\nNEXT: none\nHANDOFF: veredicto viz\nVERDICT: REQUEST_REVISION\n'
+  exit 0
+fi
+# Gate 14B.4.1: con MOCK_OPENCODE_COUNT_FILE y sin rol de juez, la 1ª
+# invocación es el intento de fallback del implementador (r1) que fuerza la
+# disputa; el resto usa el archivo clásico. Sin la variable, el mock clásico
+# por archivo queda intacto para los casos 1-14.
 if [[ -n "${MOCK_OPENCODE_COUNT_FILE:-}" ]]; then
   c=0; [[ -f "$MOCK_OPENCODE_COUNT_FILE" ]] && c="$(cat "$MOCK_OPENCODE_COUNT_FILE")"
   c=$((c+1)); echo "$c" > "$MOCK_OPENCODE_COUNT_FILE"
-  case "$c" in
-    1) printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl r1\nNEXT: none\nHANDOFF: disputa r1\n'; exit 0 ;;
-    2) [[ -n "${MOCK_JUDGE_WS_WRITE:-}" ]] && printf 'judge-touched\n' > "${MOCK_JUDGE_WS_WRITE}/SNEAKY-BY-JUDGE.txt"
-       [[ -n "${MOCK_JUDGE_WS_UNREAD:-}" ]] && { printf 'locked-by-judge\n' > "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; chmod 000 "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; }
-       printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: judge r1\nNEXT: none\nHANDOFF: veredicto viz\nVERDICT: REQUEST_REVISION\n'; exit 0 ;;
-  esac
+  if [[ "$c" -eq 1 ]]; then
+    printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl r1\nNEXT: none\nHANDOFF: disputa r1\n'
+    exit 0
+  fi
 fi
 [[ -n "${MOCK_OPENCODE_FILE:-}" && -f "$MOCK_OPENCODE_FILE" ]] && { cat "$MOCK_OPENCODE_FILE"; exit 0; }
 exit 1
@@ -90,6 +105,26 @@ EOF
 
 cat > "$mockbin/agy" <<'EOF'
 #!/usr/bin/env bash
+# Gate 14B.4.2: el rol se registra por el contenido del prompt que llega por
+# stdin (ask-antigravity alimenta `< prompt_file"); si contiene
+# "third-party judge" es ÁRBITRO y toca su hit-file (registro inequívoco).
+body="$(cat)"
+if [[ "$body" == *"third-party judge"* ]]; then
+  [[ -n "${MOCK_AGY_JUDGE_HIT:-}" ]] && printf 'judge\n' > "$MOCK_AGY_JUDGE_HIT"
+  if [[ -n "${MOCK_AGY_JUDGE_FILE:-}" && -f "$MOCK_AGY_JUDGE_FILE" ]]; then
+    cat "$MOCK_AGY_JUDGE_FILE"; exit 0
+  fi
+fi
+# Gate 14B.4.2: contador opcional de invocaciones SIN rol de juez: la 1ª
+# (implementador fallback r1) fuerza la disputa; el resto usa el archivo clásico.
+if [[ -n "${MOCK_AGY_COUNT_FILE:-}" ]]; then
+  c=0; [[ -f "$MOCK_AGY_COUNT_FILE" ]] && c="$(cat "$MOCK_AGY_COUNT_FILE")"
+  c=$((c+1)); echo "$c" > "$MOCK_AGY_COUNT_FILE"
+  if [[ "$c" -eq 1 ]]; then
+    printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl r1\nNEXT: none\nHANDOFF: agy impl\n'
+    exit 0
+  fi
+fi
 [[ -n "${MOCK_AGY_FILE:-}" && -f "$MOCK_AGY_FILE" ]] && { cat "$MOCK_AGY_FILE"; exit 0; }
 exit 1
 EOF
@@ -452,6 +487,130 @@ if [[ "$locked" -eq 1 && "$rc18" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tm
   case_pass judge_ws_unreliable_with_verify_success
 else
   case_fail judge_ws_unreliable_with_verify_success "rc=2+VERIFY_FAILING+UNRELIABLE tras snapshot del juez, verify exit=0 no lo restaura (RED: aborto de set -e)" "$rc18" "" "$tmp_root/judge-ws4.full"
+fi
+
+# ══ Gate 14B.4.2 (RT-01a): independencia del ÁRBITRO vs implementador y revisor ══
+# Registro de rol: cada mock escribe su hit-file SOLO cuando se ejecuta con el
+# prompt del árbitro ("third-party judge"), de modo que la prueba valida la
+# identidad real del proveedor, no que el motor termine con un código dado.
+# Protocolos válidos de árbitro por proveedor (marcador inequívoco en HANDOFF).
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl dispute\nNEXT: none\nHANDOFF: disputa impl\n' > "$tmp_root/rt01a-impl-dispute.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl dispute\nNEXT: none\nHANDOFF: disputa claude\n' > "$tmp_root/rt01a-impl-claude.txt"
+printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: impl r2\nNEXT: none\nHANDOFF: ok\n' > "$tmp_root/rt01a-impl-agy-r2.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rev oc\nNEXT: none\nHANDOFF: disputa rev oc\n' > "$tmp_root/rt01a-rev-oc.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rev agy\nNEXT: none\nHANDOFF: disputa rev agy\n' > "$tmp_root/rt01a-rev-agy.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: arbiter\nNEXT: none\nHANDOFF: arbiter-agy-marker\nVERDICT: REQUEST_REVISION\n' > "$tmp_root/rt01a-agy-judge.txt"
+
+# ── Caso 19 (rt01a_agy_arbitrates_when_oc_implemented): OpenCode implementa,
+# Codex revisa. OpenCode NO puede arbitrar; debe seleccionarse AGY.
+# RED (engine actual): opencode se auto-arbitra → hit de arbiter opencode.
+rm -rf "$tmp_root/workspace/rt01a-ws1" "$tmp_root/rt01a-1-oc-count" "$tmp_root/rt01a-1-xd-count" "$tmp_root/hit-oc-judge-1" "$tmp_root/hit-agy-judge-1"
+mkdir -p "$tmp_root/workspace/rt01a-ws1"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c15rev.txt" \
+    MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
+    MOCK_OPENCODE_FILE="$tmp_root/rt01a-impl-dispute.txt" \
+    MOCK_OPENCODE_COUNT_FILE="$tmp_root/rt01a-1-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/rt01a-1-xd-count" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-1" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-1" \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01a-1"
+  bash "$engine" "$tmp_root/workspace/rt01a-ws1" "RT-01a: impl opencode, rev codex" 2 > "$tmp_root/rt01a-1.full" 2>&1
+  echo $? > "$tmp_root/rt01a-1.rc"
+)
+rcN1="$(cat "$tmp_root/rt01a-1.rc")"
+agy_hit_1=0; [[ -f "$tmp_root/hit-agy-judge-1" ]] && agy_hit_1=1
+oc_hit_1=0; [[ -f "$tmp_root/hit-oc-judge-1" ]] && oc_hit_1=1
+if [[ "$agy_hit_1" -eq 1 && "$oc_hit_1" -eq 0 ]] \
+   && grep -q "Implementer (opencode)" "$tmp_root/rt01a-1.full" \
+   && grep -q "judge: OpenCode excluded (independence: implemented/reviewed this round)" "$tmp_root/rt01a-1.full" \
+   && grep -q "HANDOFF: arbiter-agy-marker" "$tmp_root/rt01a-1.full"; then
+  case_pass rt01a_agy_arbitrates_when_oc_implemented
+else
+  case_fail rt01a_agy_arbitrates_when_oc_implemented "opencode implementó y no puede arbitrar (RED: opencode se auto-arbitró)" "$rcN1" "agy_hit=$agy_hit_1 oc_hit=$oc_hit_1" "$tmp_root/rt01a-1.full"
+fi
+
+# ── Caso 20 (rt01a_oc_arbitrates_when_agy_implemented): AGY implementa vía
+# AGENT_BRIDGE_FALLBACKS="agy" (OpenCode nunca falló: sigue disponible), Codex
+# revisa. OpenCode es independiente y precede como candidato: debe arbitrar.
+rm -rf "$tmp_root/workspace/rt01a-ws2" "$tmp_root/rt01a-2-gy-count" "$tmp_root/rt01a-2-xd-count" "$tmp_root/hit-oc-judge-2" "$tmp_root/hit-agy-judge-2"
+mkdir -p "$tmp_root/workspace/rt01a-ws2"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c15rev.txt" \
+    MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
+    AGENT_BRIDGE_FALLBACKS="agy" \
+    MOCK_AGY_FILE="$tmp_root/rt01a-impl-agy-r2.txt" \
+    MOCK_AGY_COUNT_FILE="$tmp_root/rt01a-2-gy-count" MOCK_CODEX_COUNT_FILE="$tmp_root/rt01a-2-xd-count" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-2" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-2" \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01a-2"
+  bash "$engine" "$tmp_root/workspace/rt01a-ws2" "RT-01a: impl agy, rev codex" 2 > "$tmp_root/rt01a-2.full" 2>&1
+  echo $? > "$tmp_root/rt01a-2.rc"
+)
+rcN2="$(cat "$tmp_root/rt01a-2.rc")"
+agy_hit_2=0; [[ -f "$tmp_root/hit-agy-judge-2" ]] && agy_hit_2=1
+oc_hit_2=0; [[ -f "$tmp_root/hit-oc-judge-2" ]] && oc_hit_2=1
+if [[ "$oc_hit_2" -eq 1 && "$agy_hit_2" -eq 0 ]] \
+   && grep -q "Implementer (agy)" "$tmp_root/rt01a-2.full" \
+   && grep -q "escalating to OpenCode judge" "$tmp_root/rt01a-2.full" \
+   && grep -q "Done: CONSENSUS" "$tmp_root/rt01a-2.full" && [[ "$rcN2" -eq 0 ]]; then
+  case_pass rt01a_oc_arbitrates_when_agy_implemented
+else
+  case_fail rt01a_oc_arbitrates_when_agy_implemented "agy implementó y no puede arbitrar; opcode disponible debe preceder (RED: mismo estado actual esperado)" "$rcN2" "agy_hit=$agy_hit_2 oc_hit=$oc_hit_2" "$tmp_root/rt01a-2.full"
+fi
+
+# ── Caso 21 (rt01a_no_independent_judge_failclosed): OpenCode implementa,
+# AGY revisa (codex falla). Ningún candidato independiente permanece: el
+# arbitraje DEBE rechazarse con estado explícito NO_INDEPENDENT_JUDGE rc=8,
+# sin árbitro ejecutado y sin continuar hacia un consenso posterior.
+rm -rf "$tmp_root/workspace/rt01a-ws3" "$tmp_root/rt01a-3-oc-count" "$tmp_root/hit-oc-judge-3" "$tmp_root/hit-agy-judge-3"
+mkdir -p "$tmp_root/workspace/rt01a-ws3"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL=1 \
+    MOCK_OPENCODE_FILE="$tmp_root/rt01a-impl-dispute.txt" \
+    MOCK_OPENCODE_COUNT_FILE="$tmp_root/rt01a-3-oc-count" \
+    MOCK_AGY_FILE="$tmp_root/rt01a-rev-agy.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-3" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-3" \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01a-3"
+  bash "$engine" "$tmp_root/workspace/rt01a-ws3" "RT-01a: sin candidato independiente" 2 > "$tmp_root/rt01a-3.full" 2>&1
+  echo $? > "$tmp_root/rt01a-3.rc"
+)
+rcN3="$(cat "$tmp_root/rt01a-3.rc")"
+agy_hit_3=0; [[ -f "$tmp_root/hit-agy-judge-3" ]] && agy_hit_3=1
+oc_hit_3=0; [[ -f "$tmp_root/hit-oc-judge-3" ]] && oc_hit_3=1
+if [[ "$rcN3" -eq 8 ]] && grep -q "Done: NO_INDEPENDENT_JUDGE" "$tmp_root/rt01a-3.full" \
+   && grep -q "no candidate is independent of implementer 'opencode' and reviewer 'agy'" "$tmp_root/rt01a-3.full" \
+   && grep -q "Implementer (opencode)" "$tmp_root/rt01a-3.full" \
+   && grep -q "Reviewer (agy)" "$tmp_root/rt01a-3.full" \
+   && [[ "$oc_hit_3" -eq 0 && "$agy_hit_3" -eq 0 ]]; then
+  case_pass rt01a_no_independent_judge_failclosed
+else
+  case_fail rt01a_no_independent_judge_failclosed "rc=8+NO_INDEPENDENT_JUDGE sin árbitro ejecutado (RED: opencode se auto-arbitró y la corrida continuó)" "$rcN3" "agy_hit=$agy_hit_3 oc_hit=$oc_hit_3" "$tmp_root/rt01a-3.full"
+fi
+
+# ── Caso 22 (rt01a_agy_arbitrates_when_oc_reviewed): Claude implementa,
+# Codex falla y OpenCode revisa (excluye a claude por independencia). El
+# árbitro debe excluir también al REVISOR: opencode no puede arbitrar, AGY sí.
+rm -rf "$tmp_root/workspace/rt01a-ws4" "$tmp_root/hit-oc-judge-4" "$tmp_root/hit-agy-judge-4"
+mkdir -p "$tmp_root/workspace/rt01a-ws4"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CODEX_FAIL=1 \
+    MOCK_OPENCODE_FILE="$tmp_root/rt01a-rev-oc.txt" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-4" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-4" \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01a-4"
+  bash "$engine" "$tmp_root/workspace/rt01a-ws4" "RT-01a: impl claude, rev opencode" 2 > "$tmp_root/rt01a-4.full" 2>&1
+  echo $? > "$tmp_root/rt01a-4.rc"
+)
+rcN4="$(cat "$tmp_root/rt01a-4.rc")"
+agy_hit_4=0; [[ -f "$tmp_root/hit-agy-judge-4" ]] && agy_hit_4=1
+oc_hit_4=0; [[ -f "$tmp_root/hit-oc-judge-4" ]] && oc_hit_4=1
+if [[ "$agy_hit_4" -eq 1 && "$oc_hit_4" -eq 0 ]] \
+   && grep -q "Reviewer (opencode)" "$tmp_root/rt01a-4.full" \
+   && grep -q "judge: OpenCode excluded (independence: implemented/reviewed this round)" "$tmp_root/rt01a-4.full" \
+   && grep -q "HANDOFF: arbiter-agy-marker" "$tmp_root/rt01a-4.full" \
+   && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt01a-4.full"; then
+  case_pass rt01a_agy_arbitrates_when_oc_reviewed
+else
+  case_fail rt01a_agy_arbitrates_when_oc_reviewed "opencode revisó y no puede arbitrar (RED: opencode se auto-arbitró como revisor)" "$rcN4" "agy_hit=$agy_hit_4 oc_hit=$oc_hit_4" "$tmp_root/rt01a-4.full"
 fi
 
 if [[ $ok_count -eq $total ]]; then
