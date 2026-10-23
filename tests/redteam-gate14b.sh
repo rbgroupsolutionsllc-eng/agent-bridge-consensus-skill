@@ -54,12 +54,35 @@ for a in "$@"; do
   [[ "$_p" == "--output-last-message" ]] && out="$a"
   _p="$a"
 done
+# Gate 14B.4.1: con MOCK_CODEX_COUNT_FILE activado, la 1ª invocación (revisor r1)
+# devuelve DISAGREE; las siguientes usan el archivo clásico (VERIFIED en r2).
+if [[ -n "${MOCK_CODEX_COUNT_FILE:-}" ]]; then
+  c=0; [[ -f "$MOCK_CODEX_COUNT_FILE" ]] && c="$(cat "$MOCK_CODEX_COUNT_FILE")"
+  c=$((c+1)); echo "$c" > "$MOCK_CODEX_COUNT_FILE"
+  if [[ "$c" -eq 1 ]]; then
+    printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rev r1\nNEXT: none\nHANDOFF: disputa r1\n' > "$out"
+    exit 0
+  fi
+fi
 cat "${MOCK_CODEX_FILE:?}" > "$out"
 exit 0
 EOF
 
 cat > "$mockbin/opencode" <<'EOF'
 #!/usr/bin/env bash
+# Gate 14B.4.1: con MOCK_OPENCODE_COUNT_FILE activado, la 1ª invocación es el
+# intento de fallback del implementador (r1), la 2ª es el ÁRBITRO (call_judge)
+# y las siguientes vuelven al implementador (r2+). Sin la variable, el mock
+# clásico por archivo queda intacto para los casos 1-14.
+if [[ -n "${MOCK_OPENCODE_COUNT_FILE:-}" ]]; then
+  c=0; [[ -f "$MOCK_OPENCODE_COUNT_FILE" ]] && c="$(cat "$MOCK_OPENCODE_COUNT_FILE")"
+  c=$((c+1)); echo "$c" > "$MOCK_OPENCODE_COUNT_FILE"
+  case "$c" in
+    1) printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl r1\nNEXT: none\nHANDOFF: disputa r1\n'; exit 0 ;;
+    2) [[ -n "${MOCK_JUDGE_WS_WRITE:-}" ]] && printf 'judge-touched\n' > "${MOCK_JUDGE_WS_WRITE}/SNEAKY-BY-JUDGE.txt"
+       printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: judge r1\nNEXT: none\nHANDOFF: veredicto viz\nVERDICT: REQUEST_REVISION\n'; exit 0 ;;
+  esac
+fi
 [[ -n "${MOCK_OPENCODE_FILE:-}" && -f "$MOCK_OPENCODE_FILE" ]] && { cat "$MOCK_OPENCODE_FILE"; exit 0; }
 exit 1
 EOF
@@ -311,6 +334,64 @@ else
   else
     case_fail unreliable_blocks_consensus_with_verify "rc=2+VERIFY_FAILING+verify exit=0+rechazo UNRELIABLE" "$rc14" "" "$tmp_root/unrel.full"
   fi
+fi
+
+# ── Gate 14B.4.1 (RT-02): el árbitro MODIFICA el workspace durante call_judge ─
+# Caso 15 (judge_ws_write_no_verify_cmd): OpenCode implementa en r1, disputa
+# con codex, el ÁRBITRO (2ª invocación de opencode) crea un archivo en el
+# workspace y r2 termina en VERIFIED. RED actual: todo queda fuera de las
+# ventanas delta → CONSENSUS rc=0 no verificado. GREEN esperado: fail-closed,
+# rc=2 + VERIFY_FAILING + rechazo objetivo.
+printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: impl r2\nNEXT: none\nHANDOFF: ok\n' > "$tmp_root/c15impl-r2.txt"
+printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: rev r2\nNEXT: none\nHANDOFF: ok\n' > "$tmp_root/c15rev.txt"
+rm -rf "$tmp_root/workspace/judge-ws" "$tmp_root/judge15-oc-count" "$tmp_root/judge15-xd-count"
+mkdir -p "$tmp_root/workspace/judge-ws"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c15rev.txt" \
+    MOCK_OPENCODE_FILE="$tmp_root/c15impl-r2.txt" \
+    MOCK_OPENCODE_COUNT_FILE="$tmp_root/judge15-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/judge15-xd-count" \
+    MOCK_JUDGE_WS_WRITE="$tmp_root/workspace/judge-ws" AGENT_BRIDGE_HOME="$tmp_root/bridge-judge-ws" \
+    MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL=""
+  bash "$engine" "$tmp_root/workspace/judge-ws" "juez modifica workspace" 2 > "$tmp_root/judge-ws.full" 2>&1
+  echo $? > "$tmp_root/judge-ws.rc"
+)
+rc15="$(cat "$tmp_root/judge-ws.rc")"
+tampered=0; [[ -f "$tmp_root/workspace/judge-ws/SNEAKY-BY-JUDGE.txt" ]] && tampered=1
+if [[ "$tampered" -ne 1 ]]; then
+  case_fail judge_ws_write_no_verify_cmd "el escenario no aplicó: el juez no tocó el workspace (preparación mal formada)" "?" "" "$tmp_root/judge-ws.full"
+elif [[ "$rc15" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/judge-ws.full" \
+     && grep -q "workspace changed without objective verification" "$tmp_root/judge-ws.full" \
+     && grep -q "during judge arbitration" "$tmp_root/judge-ws.full"; then
+  case_pass judge_ws_write_no_verify_cmd
+else
+  case_fail judge_ws_write_no_verify_cmd "rc=2+VERIFY_FAILING+rechazo objetivo (RED actual: CONSENSUS rc=0 no verificado)" "$rc15" "" "$tmp_root/judge-ws.full"
+fi
+
+# ── Gate 14B.4.1 (RT-02): delta del juez con AGENT_BRIDGE_VERIFY_CMD fallido ──
+# Caso 16 (judge_ws_delta_runs_verify): mismo escenario + verify que FALLA.
+# El control objetivo del motor debe correr Ground Truth por causa del delta
+# del juez: la corrida debe registrar `verify: exit=1` y el marcador VERIFY-RAN,
+# y nunca llegar a CONSENSUS (rc=2).
+rm -rf "$tmp_root/workspace/judge-ws2" "$tmp_root/judge16-oc-count" "$tmp_root/judge16-xd-count" "$tmp_root/verify-judge16.log"
+mkdir -p "$tmp_root/workspace/judge-ws2"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c15rev.txt" \
+    MOCK_OPENCODE_FILE="$tmp_root/c15impl-r2.txt" \
+    MOCK_OPENCODE_COUNT_FILE="$tmp_root/judge16-oc-count" MOCK_CODEX_COUNT_FILE="$tmp_root/judge16-xd-count" \
+    MOCK_JUDGE_WS_WRITE="$tmp_root/workspace/judge-ws2" AGENT_BRIDGE_HOME="$tmp_root/bridge-judge-ws2" \
+    MOCK_CLAUDE_FAIL=1 MOCK_CODEX_FAIL="" \
+    AGENT_BRIDGE_VERIFY_CMD="echo VERIFY-RAN >> $tmp_root/verify-judge16.log; false"
+  bash "$engine" "$tmp_root/workspace/judge-ws2" "delta del juez con verify fallido" 2 > "$tmp_root/judge-ws2.full" 2>&1
+  echo $? > "$tmp_root/judge-ws2.rc"
+)
+rc16="$(cat "$tmp_root/judge-ws2.rc")"
+verify_ran=0; [[ -s "$tmp_root/verify-judge16.log" ]] && verify_ran=1
+if [[ "$rc16" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/judge-ws2.full" \
+   && grep -q '^  verify: exit=1' "$tmp_root/judge-ws2.full" \
+   && [[ "$verify_ran" -eq 1 ]]; then
+  case_pass judge_ws_delta_runs_verify
+else
+  case_fail judge_ws_delta_runs_verify "rc=2+VERIFY_FAILING+verify exit=1 corrió por delta del juez" "$rc16" "" "$tmp_root/judge-ws2.full"
 fi
 
 if [[ $ok_count -eq $total ]]; then
