@@ -530,7 +530,9 @@ judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 # OpenCode's decoy narration (STATUS anchored, no VERDICT, narration lines,
 # missing CHANGED/NEXT) is structurally invalid and must be rejected, not
 # accepted merely because a STATUS: line exists somewhere in the text.
-assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+# Gate 14B.4.3 (RT-01b): el fallo en ROL ÁRBITRO se registra en el estado
+# árbitro (mensaje específico), sin marcar globalmente al proveedor.
+assert_contains "$state/stderr.log" "provider unavailable for arbitration this session: opencode"
 assert_contains "$state/stdout.log" "judge: OpenCode unavailable, trying agy"
 # agy is the distinct fallback judge and its real, anchored VERDICT
 # propagates into the next round's prompt.
@@ -874,8 +876,9 @@ write_judge_body "$decoy_no_verdict_body" \
   'HANDOFF: judge reviewed both proposals'
 state="$(run_judge_case decoy_narration_no_verdict "$decoy_no_verdict_body" "")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
-assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
-assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
+# Gate 14B.4.3 (RT-01b): fallo en rol árbitro → estado árbitro, no global.
+assert_contains "$state/stderr.log" "provider unavailable for arbitration this session: opencode"
+assert_contains "$state/stderr.log" "provider unavailable for arbitration this session: agy"
 [[ ! -e "$judge_run_dir/round-1-judge.out.md" ]] || {
   echo "expected invalid judge artifact to be removed, but it survived" >&2
   exit 1
@@ -1078,7 +1081,8 @@ write_judge_body "$agy_valid_body" \
   'NEXT: none' 'HANDOFF: agy fallback judge verdict' 'VERDICT: ACCEPT_CODEX'
 state="$(run_judge_case opencode_invalid_then_agy_valid "$judge_status_only_body" "$agy_valid_body" 2)"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
-assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
+# Gate 14B.4.3 (RT-01b): fallo en rol árbitro → estado árbitro, no global.
+assert_contains "$state/stderr.log" "provider unavailable for arbitration this session: opencode"
 assert_contains "$state/stdout.log" "judge: OpenCode unavailable, trying agy"
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_CODEX"
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "agy fallback judge verdict"
@@ -1091,8 +1095,9 @@ agy_calls="$(cat "$state/agy-count" 2>/dev/null || echo 0)"
 # fake verdict reaches the next prompt, no consensus produced.
 state="$(run_judge_case all_invalid "$judge_status_only_body" "$judge_status_only_body")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
-assert_contains "$state/stderr.log" "provider unavailable for this session: opencode"
-assert_contains "$state/stderr.log" "provider unavailable for this session: agy"
+# Gate 14B.4.3 (RT-01b): ambos árbitros inválidos → estado árbitro, no global.
+assert_contains "$state/stderr.log" "provider unavailable for arbitration this session: opencode"
+assert_contains "$state/stderr.log" "provider unavailable for arbitration this session: agy"
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
 assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
 assert_not_contains "$state/stdout.log" "=== Done: CONSENSUS ==="

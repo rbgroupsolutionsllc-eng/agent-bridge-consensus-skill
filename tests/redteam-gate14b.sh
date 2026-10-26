@@ -717,6 +717,79 @@ else
   fi
 fi
 
+# ── Caso 25 (rt01b_globally_failed_provider_never_arbitrates, RT-01b):
+# GUARDA del GREEN: un proveedor caído en un rol GLOBAL (fallback del
+# implementador en r1) permanece inhabilitado para arbitrar. Claude falla;
+# el fallback implementador intenta OpenCode (falla, is_failed global) y AGY
+# implementa (DISAGREE); codex DISAGREE → árbitro: OpenCode NO debe invocarse
+# (estado global) y AGY está excluido por participación → JUDGE UNAVAILABLE
+# en ambas rondas → MAX_ROUNDS rc=1. Válido antes y después del GREEN: protege
+# que is_failed_judge no eluda nunca el estado global en la selección del
+# árbitro.
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: impl agy\nNEXT: none\nHANDOFF: impl agy dispute\n' > "$tmp_root/rt01b-impl-agy.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rev codex\nNEXT: none\nHANDOFF: rev codex dispute\n' > "$tmp_root/rt01b-rev-codex.txt"
+rm -rf "$tmp_root/workspace/rt01b-ws2" "$tmp_root/hit-oc-judge-25" "$tmp_root/hit-agy-judge-25"
+mkdir -p "$tmp_root/workspace/rt01b-ws2"
+( cd /tmp
+  export MOCK_CLAUDE_FAIL=1 \
+    AGENT_BRIDGE_FALLBACKS="opencode,agy" \
+    MOCK_AGY_FILE="$tmp_root/rt01b-impl-agy.txt" \
+    MOCK_CODEX_FILE="$tmp_root/rt01b-rev-codex.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-25" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-25" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01b-2"
+  bash "$engine" "$tmp_root/workspace/rt01b-ws2" "RT-01b: caído global no vuelve a arbitrar" 2 > "$tmp_root/rt01b-2.full" 2>&1
+  echo $? > "$tmp_root/rt01b-2.rc"
+)
+rcB2="$(cat "$tmp_root/rt01b-2.rc")"
+oc_judge_hit_25=0; [[ -f "$tmp_root/hit-oc-judge-25" ]] && oc_judge_hit_25=1
+agy_exclusions_25="$(grep -c 'judge: agy excluded (independence: implemented/reviewed this round)' "$tmp_root/rt01b-2.full" 2>/dev/null; true)"
+if [[ "$rcB2" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt01b-2.full" \
+   && grep -q "Implementer (agy)" "$tmp_root/rt01b-2.full" \
+   && grep -q "provider unavailable for this session: opencode" "$tmp_root/rt01b-2.full" \
+   && [[ "$agy_exclusions_25" -eq 2 ]] \
+   && ! grep -q "escalating to OpenCode judge" "$tmp_root/rt01b-2.full" \
+   && ! grep -q "provider unavailable for arbitration this session" "$tmp_root/rt01b-2.full" \
+   && ! grep -q "Done: CONSENSUS" "$tmp_root/rt01b-2.full" \
+   && [[ "$oc_judge_hit_25" -eq 0 ]]; then
+  case_pass rt01b_globally_failed_provider_never_arbitrates
+else
+  case_fail rt01b_globally_failed_provider_never_arbitrates "caído global en otro rol nunca arbitra (opencode_hit=$oc_judge_hit_25)" "$rcB2" "" "$tmp_root/rt01b-2.full"
+fi
+
+# ── Caso 26 (rt01b_judge_fail_persists_for_judging, RT-01b): GUARDA del
+# GREEN: un proveedor caído como ÁRBITRO en r1 permanece inhabilitado como
+# árbitro en rondas posteriores (el fallo es persistente para el rol árbitro).
+# Claude DISAGREE y codex DISAGREE en ambas rondas; el árbitro OpenCode sale
+# protocolo-garbage en r1 → AGY también arbitra en r2 (OpenCode solo intenta
+# el arbitraje UNA vez en toda la corrida) → MAX_ROUNDS rc=1.
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rev codex r1-r2\nNEXT: none\nHANDOFF: rev codex persistente\n' > "$tmp_root/rt01b-rev-codex-persist.txt"
+rm -rf "$tmp_root/workspace/rt01b-ws3" "$tmp_root/hit-oc-judge-26" "$tmp_root/hit-agy-judge-26"
+mkdir -p "$tmp_root/workspace/rt01b-ws3"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CODEX_FILE="$tmp_root/rt01b-rev-codex-persist.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt01a-judge-garbage.txt" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-26" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-26" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01b-3"
+  bash "$engine" "$tmp_root/workspace/rt01b-ws3" "RT-01b: fallo del árbitro persiste para arbitrar" 2 > "$tmp_root/rt01b-3.full" 2>&1
+  echo $? > "$tmp_root/rt01b-3.rc"
+)
+rcB3="$(cat "$tmp_root/rt01b-3.rc")"
+oc_escalations_26="$(grep -c 'escalating to OpenCode judge' "$tmp_root/rt01b-3.full" 2>/dev/null; true)"
+agy_fallbacks_26="$(grep -c 'judge: OpenCode unavailable, trying agy' "$tmp_root/rt01b-3.full" 2>/dev/null; true)"
+if [[ "$rcB3" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt01b-3.full" \
+   && grep -q "provider unavailable for arbitration this session: opencode" "$tmp_root/rt01b-3.full" \
+   && [[ "$agy_fallbacks_26" -eq 2 ]] \
+   && [[ "$(sed -n '1p' "$tmp_root/hit-oc-judge-26" 2>/dev/null)" == "judge" ]] \
+   && [[ "$oc_escalations_26" -eq 1 ]]; then
+  case_pass rt01b_judge_fail_persists_for_judging
+else
+  case_fail rt01b_judge_fail_persists_for_judging "fallo como árbitro persiste para el rol árbitro (intentos de arbitraje de opencode=$oc_escalations_26)" "$rcB3" "" "$tmp_root/rt01b-3.full"
+fi
+
 if [[ $ok_count -eq $total ]]; then
   echo "redteam-gate14b: ok ($ok_count casos; id -u = $(id -u)${skip_count:+, $skip_count omitidos por privilegio})"
   exit 0

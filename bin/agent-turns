@@ -156,6 +156,16 @@ mkdir -p "$run_dir"
 _failed_providers=" "
 mark_failed() { _failed_providers+="${1} "; echo "  provider unavailable for this session: $1" >&2; }
 is_failed()   { [[ "$_failed_providers" == *" ${1} "* ]]; }
+# Gate 14B.4.3 (RT-01b): los fallos ocurridos EXCLUSIVAMENTE en el rol árbitro
+# se registran en esta lista paralela, sin marcar globalmente al proveedor.
+# is_failed_judge() se consulta SOLO en call_judge(), junto al estado global;
+# call_fallback() sigue consultando únicamente is_failed(), de modo que un
+# proveedor caído solo como árbitro conserva su elegibilidad para
+# implementador/revisor, mientras que un caído en un rol global permanece
+# inhabilitado también para el árbitro (call_judge comprueba AMBOS estados).
+_failed_judge_providers=" "
+mark_failed_judge() { _failed_judge_providers+="${1} "; echo "  provider unavailable for arbitration this session: $1" >&2; }
+is_failed_judge()   { [[ "$_failed_judge_providers" == *" ${1} "* ]]; }
 
 # ── Gate 14B / P0-3: detección objetiva de cambios en el workspace ───────────
 # Hash del estado del workspace: cada archivo/symlink/directorio entra con
@@ -721,21 +731,21 @@ call_judge() {
   _g14b_pre_judge="$(ws_snapshot)"                                   # Gate 14B.4: estado justo antes de que el árbitro se ejecute
   rm -f "$out"
   # Primary judge: OpenCode (Gate 14B.4.2: solo si no implementó ni revisó esta ronda)
-  if [[ "$_g14b_oc_eligible" -eq 1 ]] && ! is_failed opencode; then
+  if [[ "$_g14b_oc_eligible" -eq 1 ]] && ! is_failed opencode && ! is_failed_judge opencode; then
     echo "  escalating to OpenCode judge..."
     set +e
     timeout "$turn_timeout" "$script_dir/ask-opencode" "$workspace" "$prompt" "$out"
     jrc=$?
     set -e
     if [[ $jrc -ne 0 || ! -s "$out" ]] || ! validate_judge_protocol "$out"; then
-      mark_failed opencode
+      mark_failed_judge opencode
       rm -f "$out"
     fi
   elif [[ "$_g14b_oc_eligible" -eq 0 ]] && ! is_failed opencode; then
     echo "  judge: OpenCode excluded (independence: implemented/reviewed this round)"
   fi
   # Fallback judge: agy (Gate 14B.4.2: solo si no implementó ni revisó esta ronda)
-  if [[ ! -s "$out" ]] && [[ "$_g14b_agy_eligible" -eq 1 ]] && ! is_failed agy; then
+  if [[ ! -s "$out" ]] && [[ "$_g14b_agy_eligible" -eq 1 ]] && ! is_failed agy && ! is_failed_judge agy; then
     echo "  judge: OpenCode unavailable, trying agy..."
     rm -f "$out"
     set +e
@@ -743,7 +753,7 @@ call_judge() {
     jrc=$?
     set -e
     if [[ $jrc -ne 0 || ! -s "$out" ]] || ! validate_judge_protocol "$out"; then
-      mark_failed agy
+      mark_failed_judge agy
       rm -f "$out"
     fi
   elif [[ ! -s "$out" ]] && [[ "$_g14b_agy_eligible" -eq 0 ]] && ! is_failed agy; then
