@@ -669,6 +669,54 @@ else
   case_fail rt01a_eligible_failed_judge_unavailable "independiente elegible pero fallido → JUDGE_UNAVAILABLE (MAX_ROUNDS rc=1), NUNCA rc=8 (RED: rc=8 por is_failed del candidato)" "$rcN5" "agy_hit=$agy_hit_5 oc_hit=$oc_hit_5" "$tmp_root/rt01a-5.full"
 fi
 
+# ══ Gate 14B.4.3 (RT-01b) RED: un fallo de protocolo del ÁRBITRO contamina la
+# disponibilidad del proveedor para OTROS roles posteriores en la misma sesión.
+# mark_failed() (motor L157) acumula en la lista global session-scoped
+# _failed_providers SIN distinguir el rol; is_failed() la consulta para
+# cualquier rol. Ronda 1: claude DISAGREE, codex DISAGREE → árbitro OpenCode
+# con protocolo-garbage → mark_failed opencode; respaldo del árbitro: AGY
+# (REQUEST_REVISION válido). Ronda 2: codex falla (CLI rc=1) → fallback del
+# revisor; OpenCode es el candidato natural (sano, independiente de claude),
+# pero call_fallback() lo salta por is_failed opencode → intenta AGY, que
+# también falla como revisor → CODEX_ERROR rc=5 con un proveedor sano excluido
+# indebidamente por un fallo cuyo rol fue ÁRBITRO.
+# Comportamiento esperado (GREEN): el fallo del árbitro queda confinado al rol
+# árbitro; OpenCode participa como revisor de respaldo en r2 → CONSENSUS rc=0
+# con "Round 2 - Reviewer (opencode)" registrado por el orquestador.
+rm -rf "$tmp_root/workspace/rt01b-ws1" "$tmp_root/hit-oc-judge-24" "$tmp_root/hit-agy-judge-24" "$tmp_root/rt01b-codex-r2-missing.txt"
+mkdir -p "$tmp_root/workspace/rt01b-ws1"
+printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: rev opencode r2\nNEXT: none\nHANDOFF: rt01b-rev-opencode-marker\n' > "$tmp_root/rt01b-rev-oc-verified.txt"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt01a-judge-garbage.txt" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-agy-judge.txt" \
+    MOCK_OPENCODE_FILE="$tmp_root/rt01b-rev-oc-verified.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-24" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-24" \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt01b-24-xd-count" \
+    MOCK_CODEX_FILE="$tmp_root/rt01b-codex-r2-missing.txt" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt01b-1"
+  bash "$engine" "$tmp_root/workspace/rt01b-ws1" "RT-01b: fallo del árbitro r1; revisor de respaldo r2" 2 > "$tmp_root/rt01b-1.full" 2>&1
+  echo $? > "$tmp_root/rt01b-1.rc"
+)
+rcB1="$(cat "$tmp_root/rt01b-1.rc")"
+oc_hit_b=0; [[ -f "$tmp_root/hit-oc-judge-24" ]] && oc_hit_b=1
+agy_hit_b=0; [[ -f "$tmp_root/hit-agy-judge-24" ]] && agy_hit_b=1
+if [[ "$oc_hit_b" -ne 1 || "$agy_hit_b" -ne 1 ]]; then
+  case_fail rt01b_judge_failure_poisons_reviewer_fallback "el escenario no aplicó: los árbitros no se ejecutaron en r1 (preparación mal formada)" "$rcB1" "oc_hit=$oc_hit_b agy_hit=$agy_hit_b" "$tmp_root/rt01b-1.full"
+else
+  oc_reviewer_hit_b=0; grep -q "Round 2 - Reviewer (opencode)" "$tmp_root/rt01b-1.full" && oc_reviewer_hit_b=1
+  oc_skipped_b=0; grep -q "fallback: skipping opencode (unavailable this session)" "$tmp_root/rt01b-1.full" && oc_skipped_b=1
+  if [[ "$rcB1" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt01b-1.full" \
+     && [[ "$oc_reviewer_hit_b" -eq 1 && "$oc_skipped_b" -eq 0 ]] \
+     && grep -q "  fallback: trying opencode for reviewer" "$tmp_root/rt01b-1.full" \
+     && grep -q "HANDOFF: rt01b-rev-opencode-marker" "$tmp_root/rt01b-1.full"; then
+    case_pass rt01b_judge_failure_poisons_reviewer_fallback
+  else
+    case_fail rt01b_judge_failure_poisons_reviewer_fallback "fallo del árbitro solo en r1 no debe excluir a opencode como revisor en r2 (RED: exclusión indebida session-scoped)" "$rcB1" "oc_hit=$oc_hit_b agy_hit=$agy_hit_b oc_skipped=$oc_skipped_b oc_reviewer=$oc_reviewer_hit_b" "$tmp_root/rt01b-1.full"
+  fi
+fi
+
 if [[ $ok_count -eq $total ]]; then
   echo "redteam-gate14b: ok ($ok_count casos; id -u = $(id -u)${skip_count:+, $skip_count omitidos por privilegio})"
   exit 0
