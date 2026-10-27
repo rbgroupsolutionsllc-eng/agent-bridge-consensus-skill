@@ -305,7 +305,15 @@ push_note() {
   trim_handoff
 }
 
-round_verify_failed=0
+# F8: el fallo de ground truth es run-scoped y solo lo borra un run_verify
+# posterior exitoso (nunca el cambio de ronda). _g14b_verify_ran_round evita
+# re-verificar dos veces en la misma ronda; _g14b_verify_pass_round es la última
+# ronda en que un DELTA del implementador superó el verify (evidencia de
+# resolución de una obligación; ni el re-verify del motor, ni el del juez o el
+# revisor cuentan).
+verify_failed_pending=0
+_g14b_verify_ran_round=0
+_g14b_verify_pass_round=""
 
 run_verify() {
   local round="$1" agent="$2" log rc
@@ -314,14 +322,29 @@ run_verify() {
   ( cd "$workspace" && timeout "$verify_timeout" bash -c "$verify_cmd" ) > "$log" 2>&1
   rc=$?
   set -e
+  _g14b_verify_ran_round=1
   if [[ $rc -eq 0 ]]; then
-    round_verify_failed=0
+    verify_failed_pending=0
     push_note "GROUND TRUTH after $agent (round $round): \`$verify_cmd\` exit=0 :: $(tail -c 300 "$log" | tr '\n' ' ')"
   else
-    round_verify_failed=1
+    verify_failed_pending=1
     push_note "GROUND TRUTH FAILED after $agent (round $round): \`$verify_cmd\` exit=$rc - VERIFIED/COMPLETE will be rejected this round :: $(tail -c 300 "$log" | tr '\n' ' ')"
   fi
   echo "  verify: exit=$rc ($log)"
+}
+
+# F7: regla única de precedencia de integridad. La usan el árbitro (BLOCKED),
+# el revisor (BLOCKED) y el cierre de consenso (VERIFIED/COMPLETE). Devuelve 0 y
+# fija integrity_reason si alguna condición de integridad falla.
+integrity_reason=""
+integrity_failed() {
+  integrity_reason=""
+  if   [[ "$verify_failed_pending" -eq 1 ]];      then integrity_reason="verify_failing"
+  elif [[ "$ws_judge_verify_failed_run" -eq 1 ]]; then integrity_reason="judge_verify_failed"
+  elif [[ "$ws_detection_reliable" -eq 0 ]];      then integrity_reason="detection_unreliable"
+  elif [[ "$ws_delta_unverified_run" -eq 1 ]];    then integrity_reason="delta_unverified"
+  fi
+  [[ -n "$integrity_reason" ]]
 }
 
 build_prompt() {
@@ -667,12 +690,20 @@ judge_ws_gate() {
   fi
   if [[ "$delta" -eq 1 ]]; then
     if [[ -n "$verify_cmd" ]]; then
+      # El verify del juez ni borra un fallo previo (F8) ni lo convierte en
+      # tamper del juez: se aísla su resultado y se restaura el estado previo.
+      _g14b_prev_pending="$verify_failed_pending"
+      verify_failed_pending=0
       run_verify "$round" "judge"
       # C-REGRESIÓN set -e: el `[[ ... ]] && asg` devolvía 1 cuando verify había
       # salido exitoso, como última sentencia de la función → aborto prematuro
       # del motor vía call_judge. `if` explícito y `return 0` garantizado.
-      if [[ "$round_verify_failed" -eq 1 ]]; then
-        ws_judge_verify_failed_run=1 # Gate 14B.4: persiste (round_verify_failed se resetea por ronda y el tamper puede cerrarse en ronda posterior)
+      if [[ "$verify_failed_pending" -eq 1 ]]; then
+        ws_judge_verify_failed_run=1 # Gate 14B.4: persiste (el tamper del juez no lo borra un verify posterior del implementador)
+      fi
+      if [[ "$_g14b_prev_pending" -eq 1 ]]; then
+        verify_failed_pending=1
+        _g14b_verify_ran_round=0                                   # permite el re-verify del motor antes de cerrar
       fi
     else
       ws_delta_unverified_run=1
@@ -800,6 +831,11 @@ process_judge_verdict() {
       else
         _g14b_judge_obligation="$_g14b_judge_current_verdict"
         _g14b_judge_obligation_round="$round"
+        # Ancla objetiva (F5/F6): solo si el ground truth FALLABA al arbitrar la
+        # obligación es resoluble por el motor (fallo -> validación posterior).
+        # Una disputa sin ancla verificable no se libera por STATUS, HANDOFF ni
+        # delta genérico: se conserva y solo la sustituye un arbitraje posterior.
+        if [[ "$verify_failed_pending" -eq 1 ]]; then _g14b_judge_obligation_anchor="VERIFY_FAILING"; else _g14b_judge_obligation_anchor="NONE"; fi
       fi
       _g14b_judge_obligation_last_round="$round"
       # Sin push_note: las notas añadidas desplazan la ventana de
@@ -810,11 +846,20 @@ process_judge_verdict() {
       # La objeción del revisor queda retirada POR el arbitraje; sin
       # obligación. El consenso posterior exige la revisión independiente
       # post-arbitraje más los controles de seguridad del workspace.
-      # Una obligación previa pendiente NO se borra aquí (solo la libera una
-      # entrega acreditada posterior).
+      # Un arbitraje independiente posterior ACCEPT_CLAUDE (validado, anclado en
+      # su artefacto round-N-judge.out.md) SUSTITUYE explícitamente la obligación
+      # previa. Nunca neutraliza la integridad: el consenso posterior sigue
+      # sujeto a integrity_failed y a la revisión independiente.
+      if [[ -n "$_g14b_judge_obligation" ]]; then
+        echo "  judge obligation superseded by ACCEPT_CLAUDE (origin: $_g14b_judge_obligation, round $_g14b_judge_obligation_round; superseding arbitration round $round)"
+        _g14b_judge_obligation=""
+        _g14b_judge_obligation_round=""
+        _g14b_judge_obligation_last_round=""
+        _g14b_judge_obligation_anchor=""
+      fi
       ;;
     BLOCKED)
-      if [[ "$round_verify_failed" -eq 1 || "$ws_judge_verify_failed_run" -eq 1 || "$ws_delta_unverified_run" -eq 1 || "$ws_detection_reliable" -eq 0 ]]; then
+      if integrity_failed; then
         echo "  arbiter verdict BLOCKED overridden by failing workspace integrity"
         final_state="VERIFY_FAILING"
       else
@@ -838,7 +883,7 @@ claude_status=""
 codex_status=""
 ws_delta_unverified_run=0   # Gate 14B: hubo cambios reales sin ground truth ejecutable
 ws_detection_reliable=1     # Gate 14B: detección de delta garantizable; 0 = límite detectado → fail closed
-ws_judge_verify_failed_run=0 # Gate 14B.4: ground truth falló tras delta del juez; run-scoped porque round_verify_failed es por ronda
+ws_judge_verify_failed_run=0 # Gate 14B.4: ground truth falló tras delta del juez; run-scoped (verify_failed_pending lo puede borrar un verify posterior; el tamper del juez no)
 _g14b_judge_independence_failed=0 # Gate 14B.4.2: sin árbitro independiente esta ronda → NO_INDEPENDENT_JUDGE, se reinicia en cada invocación del juez
 # ── Gate 14B.4.4 (RT-03): estado vinculante del árbitro ────────────────────
 # _g14b_judge_current_verdict: el veredicto VALIDADO de la invocación del
@@ -855,9 +900,10 @@ _g14b_judge_current_verdict=""
 _g14b_judge_obligation=""
 _g14b_judge_obligation_round=""
 _g14b_judge_obligation_last_round=""
+_g14b_judge_obligation_anchor=""
 
 for ((round=1; round<=rounds; round++)); do
-  round_verify_failed=0
+  _g14b_verify_ran_round=0
   impl_provider=""
   review_provider=""
 
@@ -904,6 +950,7 @@ for ((round=1; round<=rounds; round++)); do
   if [[ "$_g14b_impl_delta" -eq 1 ]]; then
     if [[ -n "$verify_cmd" ]]; then
       run_verify "$round" "$impl_provider"
+      if [[ "$verify_failed_pending" -eq 0 ]]; then _g14b_verify_pass_round="$round"; fi
     else
       ws_delta_unverified_run=1
       push_note "VERIFY REQUIRED (round $round): workspace changed during implementer turn but AGENT_BRIDGE_VERIFY_CMD is unset; consensus will be refused without objective verification"
@@ -996,47 +1043,62 @@ for ((round=1; round<=rounds; round++)); do
     break
   fi
 
+  # F8: un fallo de ground truth pendiente se re-verifica UNA vez antes de
+  # evaluar un cierre (VERIFIED/COMPLETE/BLOCKED) si esta ronda no corrió verify:
+  # un verify posterior exitoso lo borra; si sigue fallando, persiste.
+  if [[ "$verify_failed_pending" -eq 1 && -n "$verify_cmd" && "$_g14b_verify_ran_round" -eq 0 ]]; then
+    case "$codex_status" in
+      VERIFIED|COMPLETE|BLOCKED)
+        echo "  re-verifying pending ground-truth failure before closing (round $round)"
+        run_verify "$round" "gate"
+        ;;
+    esac
+  fi
+
   case "$codex_status" in
     VERIFIED|COMPLETE)
-      if [[ "$round_verify_failed" -eq 1 ]]; then
-        push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth command is failing; fix it before closing"
-        echo "  consensus REJECTED: verify failing"
-        final_state="VERIFY_FAILING"
-      elif [[ "$ws_judge_verify_failed_run" -eq 1 ]]; then         # Gate 14B.4: verify falló tras delta del juez en una ronda previa
-        push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth failed after workspace change during judge arbitration; fix it before closing"
-        echo "  consensus REJECTED: ground truth failing after judge arbitration"
-        final_state="VERIFY_FAILING"
-      elif [[ "$ws_detection_reliable" -eq 0 ]]; then                # Gate 14B.3: UNRELIABLE bloquea CONSENSUS incluso con verify exitoso
-        push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace snapshot unreliable (detection limit); an exit=0 of verify does not restore the lost confidence"
-        echo "  consensus REJECTED: workspace snapshot unreliable (detection limit)"
-        final_state="VERIFY_FAILING"
-      elif [[ "$ws_delta_unverified_run" -eq 1 ]]; then               # Gate 14B / P0-3: fail closed
-        push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace changed without objective ground-truth verification (AGENT_BRIDGE_VERIFY_CMD unset${ws_detection_reliable:+; detection limit invoked})"
-        echo "  consensus REJECTED: workspace changed without objective verification"
+      if integrity_failed; then
+        case "$integrity_reason" in
+          verify_failing)
+            push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth command is failing; fix it before closing"
+            echo "  consensus REJECTED: verify failing"
+            ;;
+          judge_verify_failed)                                       # Gate 14B.4: verify falló tras delta del juez
+            push_note "ORCHESTRATOR REJECTED $codex_status (round $round): ground truth failed after workspace change during judge arbitration; fix it before closing"
+            echo "  consensus REJECTED: ground truth failing after judge arbitration"
+            ;;
+          detection_unreliable)                                      # Gate 14B.3: UNRELIABLE bloquea CONSENSUS incluso con verify exitoso
+            push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace snapshot unreliable (detection limit); an exit=0 of verify does not restore the lost confidence"
+            echo "  consensus REJECTED: workspace snapshot unreliable (detection limit)"
+            ;;
+          delta_unverified)                                          # Gate 14B / P0-3: fail closed
+            push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace changed without objective ground-truth verification (AGENT_BRIDGE_VERIFY_CMD unset${ws_detection_reliable:+; detection limit invoked})"
+            echo "  consensus REJECTED: workspace changed without objective verification"
+            ;;
+        esac
         final_state="VERIFY_FAILING"
       elif [[ -n "$_g14b_judge_obligation" ]]; then                   # Gate 14B.4.4: obligación del árbitro fail-closed
-        # Un VERIFIED/COMPLETE del revisor solo cierra el consenso si el
-        # implementador acredita la entrega (ver regla siguiente).
-        # Liberación (F2/F3): ni la identidad distinta del revisor ni un STATUS
-        # declarado liberan por sí solos. Exige, tras el ÚLTIMO arbitraje, una
-        # entrega acreditada del implementador: cierre declarado
-        # (COMPLETE/VERIFIED) o delta objetivo del workspace (que ya superó la
-        # verificación de ground truth arriba), Y la revisión independiente
-        # de esta ronda (VERIFIED/COMPLETE, evaluada por el case). PROPOSED u
-        # otro estado sin delta, o el eco DISAGREE/REVISE, no liberan.
+        # Liberación (F5/F6): ni STATUS (COMPLETE/PROPOSED), ni HANDOFF, ni
+        # identidad del revisor, ni un delta genérico liberan. Se exige ancla
+        # objetiva (el ground truth FALLABA al arbitrar) y una validación
+        # posterior exitosa tras el ÚLTIMO arbitraje; la revisión independiente
+        # VERIFIED/COMPLETE de esta ronda la garantiza este case y las
+        # comprobaciones de integridad ya se aplicaron arriba. Sin ancla
+        # (NONE/vacía/no numérica) la obligación se conserva: solo un
+        # arbitraje posterior ACCEPT_CLAUDE la sustituye (process_judge_verdict).
         _g14b_obligation_released=0
-        if [[ "$_g14b_judge_obligation_last_round" =~ ^[0-9]+$ && "$round" -gt "$_g14b_judge_obligation_last_round" ]]; then   # estado no numérico → fail-closed
-          if [[ "$claude_status" == "COMPLETE" || "$claude_status" == "VERIFIED" ]]; then
-            _g14b_obligation_released=1
-          elif [[ "$_g14b_impl_delta" -eq 1 && "$claude_status" != "DISAGREE" && "$claude_status" != "REVISE" && "$claude_status" != "BLOCKED" ]]; then
-            _g14b_obligation_released=1
-          fi
+        if [[ "$_g14b_judge_obligation_anchor" == "VERIFY_FAILING" \
+              && "$_g14b_judge_obligation_last_round" =~ ^[0-9]+$ \
+              && "$_g14b_verify_pass_round" =~ ^[0-9]+$ \
+              && "$_g14b_verify_pass_round" -gt "$_g14b_judge_obligation_last_round" ]]; then
+          _g14b_obligation_released=1
         fi
         if [[ "$_g14b_obligation_released" -eq 1 ]]; then
-          echo "  judge obligation released (VERDICT: $_g14b_judge_obligation, round $_g14b_judge_obligation_round)"
+          echo "  judge obligation released (VERDICT: $_g14b_judge_obligation, round $_g14b_judge_obligation_round) by verify fail->pass (validation round $_g14b_verify_pass_round)"
           _g14b_judge_obligation=""
           _g14b_judge_obligation_round=""
           _g14b_judge_obligation_last_round=""
+          _g14b_judge_obligation_anchor=""
           final_state="CONSENSUS"
           break
         else
@@ -1049,7 +1111,13 @@ for ((round=1; round<=rounds; round++)); do
       fi
       ;;
     BLOCKED)
-      final_state="BLOCKED"
+      # F7: misma precedencia de integridad que el veredicto BLOCKED del árbitro.
+      if integrity_failed; then
+        echo "  reviewer BLOCKED overridden by failing workspace integrity ($integrity_reason)"
+        final_state="VERIFY_FAILING"
+      else
+        final_state="BLOCKED"
+      fi
       break
       ;;
     DISAGREE)

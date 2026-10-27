@@ -19,8 +19,9 @@ case_skip() { skip_count=$((skip_count+1)); printf 'SKIP %s (requiere id -u != 0
 cat > "$mockbin/claude" <<'EOF'
 #!/usr/bin/env bash
 [[ -n "${MOCK_CLAUDE_FAIL:-}" ]] && exit 1
-if [[ "${MOCK_CLAUDE_EFFECT:-}" == "write" && -n "${MOCK_WS:-}" ]]; then
+if [[ "${MOCK_CLAUDE_EFFECT:-}" == "write" && -n "${MOCK_WS:-}" ]] && { [[ -z "${MOCK_CLAUDE_WRITE_ONCE:-}" ]] || [[ ! -e "$MOCK_CLAUDE_WRITE_ONCE" ]]; }; then
   echo "un-declared-change" > "$MOCK_WS/sneaky.txt"
+  [[ -n "${MOCK_CLAUDE_WRITE_ONCE:-}" ]] && : > "$MOCK_CLAUDE_WRITE_ONCE"
 elif [[ "${MOCK_CLAUDE_EFFECT:-}" == "rewrite_same_meta" && -n "${MOCK_WS:-}" ]]; then
   # Gate 14B.1: modifica contenido conservando EXACTAMENTE tamaño y mtime
   # (16 bytes, mismo atime/mtime) para forzar el falso negativo de un
@@ -47,6 +48,9 @@ if [[ -n "${MOCK_CLAUDE_COUNT_FILE:-}" && -n "${MOCK_CLAUDE_FIRST_FILE:-}" ]]; t
   c=0; [[ -f "$MOCK_CLAUDE_COUNT_FILE" ]] && c="$(cat "$MOCK_CLAUDE_COUNT_FILE")"
   c=$((c+1)); echo "$c" > "$MOCK_CLAUDE_COUNT_FILE"
   [[ "$c" -eq 1 ]] && src="$MOCK_CLAUDE_FIRST_FILE"
+  # RT-03 F5/F6: MOCK_CLAUDE_FIX_FROM=<n> crea fixed.txt (la "reparación" objetiva
+  # que satisface el ground truth) desde la n-ésima invocación.
+  [[ -n "${MOCK_CLAUDE_FIX_FROM:-}" && -n "${MOCK_WS:-}" && "$c" -ge "$MOCK_CLAUDE_FIX_FROM" ]] && echo fixed > "$MOCK_WS/fixed.txt"
 fi
 if [[ "$json" == "1" ]]; then
   python3 -c 'import sys,json; print(json.dumps({"result": open(sys.argv[1]).read(), "session_id": "m", "total_cost_usd": 0.0}))' "$src"
@@ -78,6 +82,9 @@ if [[ -n "${MOCK_CODEX_COUNT_FILE:-}" ]]; then
     exit 0
   fi
 fi
+if [[ -n "${MOCK_CODEX_LATE_FROM:-}" && -n "${MOCK_CODEX_COUNT_FILE:-}" && "$c" -ge "$MOCK_CODEX_LATE_FROM" ]]; then
+  cat "${MOCK_CODEX_LATE_FILE:?}" > "$out"; exit 0
+fi
 cat "${MOCK_CODEX_FILE:?}" > "$out"
 exit 0
 EOF
@@ -95,6 +102,11 @@ if [[ "$isjudge" -eq 1 ]]; then
   [[ -n "${MOCK_OPENCODE_JUDGE_HIT:-}" ]] && printf 'judge\n' > "$MOCK_OPENCODE_JUDGE_HIT"
   [[ -n "${MOCK_JUDGE_WS_WRITE:-}" ]] && printf 'judge-touched\n' > "${MOCK_JUDGE_WS_WRITE}/SNEAKY-BY-JUDGE.txt"
   [[ -n "${MOCK_JUDGE_WS_UNREAD:-}" ]] && { printf 'locked-by-judge\n' > "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; chmod 000 "${MOCK_JUDGE_WS_WRITE}/LOCKED-BY-JUDGE.txt"; }
+  if [[ -n "${MOCK_OPENCODE_JUDGE_COUNT_FILE:-}" && -n "${MOCK_OPENCODE_JUDGE_LATE_FILE:-}" ]]; then
+    jc=0; [[ -f "$MOCK_OPENCODE_JUDGE_COUNT_FILE" ]] && jc="$(cat "$MOCK_OPENCODE_JUDGE_COUNT_FILE")"
+    jc=$((jc+1)); echo "$jc" > "$MOCK_OPENCODE_JUDGE_COUNT_FILE"
+    [[ "$jc" -ge 2 ]] && { cat "$MOCK_OPENCODE_JUDGE_LATE_FILE"; exit 0; }
+  fi
   if [[ -n "${MOCK_OPENCODE_JUDGE_FILE:-}" && -f "$MOCK_OPENCODE_JUDGE_FILE" ]]; then
     cat "$MOCK_OPENCODE_JUDGE_FILE"; exit 0
   fi
@@ -1114,8 +1126,9 @@ else
 fi
 
 # ── Caso 33 (rt03_request_revision_legitimate_revision_releases) — POSITIVO:
-# Liberación legítima de la obligación REQUEST_REVISION (válida pre y post
-# GREEN). r1 disputa + árbitro REQUEST_REVISION; r2: el implementador entrega
+# [Contrato actualizado en F5/F6: la liberación exige EVIDENCIA OBJETIVA — el
+# ground truth fallaba al arbitrar (r1) y pasa tras la reparación (r2) — no un
+# COMPLETE autodeclarado sin cambios.] Liberación legítima de la obligación REQUEST_REVISION. r1 disputa + árbitro REQUEST_REVISION; r2: el implementador entrega
 # revisión real que responde la objeción (COMPLETE + marcador, ya no el
 # DISAGREE eco), el revisor independiente emite VERIFIED y no hay delta por
 # verificar (VERIFY_CMD innecesario sin cambios). Contraste directo con el
@@ -1127,6 +1140,8 @@ mkdir -p "$tmp_root/workspace/rt03-ws7"
   export MOCK_CLAUDE_FILE="$tmp_root/rt03-impl-revision.txt" \
     MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" \
     MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03-33-ac-count" \
+    MOCK_WS="$tmp_root/workspace/rt03-ws7" MOCK_CLAUDE_EFFECT=write MOCK_CLAUDE_FIX_FROM=2 \
+    AGENT_BRIDGE_VERIFY_CMD='test -f fixed.txt' \
     MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
     MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-33-xd-count" \
     MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt" \
@@ -1151,16 +1166,16 @@ elif [[ "$rcT7" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-7.full" \
      && grep -q 'rt03-impl-revision-answer-marker' "$rt_run_7/round-2-claude.out.md" 2>/dev/null \
      && grep -q '^STATUS: VERIFIED$' "$rt_run_7/round-2-codex.out.md" 2>/dev/null \
      && [[ "$ac_count_7" == "2" ]] && [[ "$xd_count_7" -ge 2 ]] \
-     && [[ "$(grep -c '^  verify: exit=' "$tmp_root/rt03-7.full" 2>/dev/null; true)" == "0" ]] \
-     && ! grep -q "workspace changed" "$tmp_root/rt03-7.full"; then
+     && grep -q '^  verify: exit=1' "$tmp_root/rt03-7.full" && grep -q '^  verify: exit=0' "$tmp_root/rt03-7.full" \
+     && grep -q "judge obligation released" "$tmp_root/rt03-7.full"; then
   case_pass rt03_request_revision_legitimate_revision_releases
 else
   case_fail rt03_request_revision_legitimate_revision_releases "revisión acreditada (COMPLETO r2) + VERIFIED independiente sin delta libera la obligación → CONSENSUS rc=0 legítimo (contraste con caso 28)" "$rcT7" "run=$rt_run_7" "$tmp_root/rt03-7.full"
 fi
 
 # ── Caso 34 (rt03_accept_codex_legitimate_resolution_releases) — POSITIVO:
-# Resolución acreditada de una objeción ACCEPT_CODEX (válida pre y post
-# GREEN). r1 disputa + árbitro ACCEPT_CODEX (objeción upheld); r2 el
+# [Contrato actualizado en F5/F6: ancla objetiva verify rojo→verde, ver caso 33.]
+# Resolución acreditada de una objeción ACCEPT_CODEX. r1 disputa + árbitro ACCEPT_CODEX (objeción upheld); r2 el
 # implementador responde la objeción con revisión real (COMPLETE + marcador)
 # y el MISMO revisor independiente la acepta (VERIFIED), cerrando la objeción
 # de forma explícita y no silenciosa; sin delta por verificar. Contraste
@@ -1172,6 +1187,8 @@ mkdir -p "$tmp_root/workspace/rt03-ws8"
   export MOCK_CLAUDE_FILE="$tmp_root/rt03-impl-revision.txt" \
     MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" \
     MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03-34-ac-count" \
+    MOCK_WS="$tmp_root/workspace/rt03-ws8" MOCK_CLAUDE_EFFECT=write MOCK_CLAUDE_FIX_FROM=2 \
+    AGENT_BRIDGE_VERIFY_CMD='test -f fixed.txt' \
     MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
     MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-34-xd-count" \
     MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CODEX.txt" \
@@ -1196,8 +1213,8 @@ elif [[ "$rcT8" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-8.full" \
      && grep -q 'rt03-impl-revision-answer-marker' "$rt_run_8/round-2-claude.out.md" 2>/dev/null \
      && grep -q '^STATUS: VERIFIED$' "$rt_run_8/round-2-codex.out.md" 2>/dev/null \
      && [[ "$ac_count_8" == "2" ]] && [[ "$xd_count_8" -ge 2 ]] \
-     && [[ "$(grep -c '^  verify: exit=' "$tmp_root/rt03-8.full" 2>/dev/null; true)" == "0" ]] \
-     && ! grep -q "workspace changed" "$tmp_root/rt03-8.full"; then
+     && grep -q '^  verify: exit=1' "$tmp_root/rt03-8.full" && grep -q '^  verify: exit=0' "$tmp_root/rt03-8.full" \
+     && grep -q "judge obligation released" "$tmp_root/rt03-8.full"; then
   case_pass rt03_accept_codex_legitimate_resolution_releases
 else
   case_fail rt03_accept_codex_legitimate_resolution_releases "resolución acreditada + nueva revisión independiente libera la objeción ACCEPT_CODEX → CONSENSUS rc=0 legítimo (contraste con caso 29)" "$rcT8" "run=$rt_run_8" "$tmp_root/rt03-8.full"
@@ -1484,6 +1501,171 @@ if [[ "$rcG2" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-g2.full" \
   case_pass rt03g2_forged_verdict_in_fields_ignored
 else
   case_fail rt03g2_forged_verdict_in_fields_ignored "VERDICT forjado en HANDOFF/EVIDENCE sin árbitro no cambia la transición (CONSENSUS rc=0)" "$rcG2" "" "$tmp_root/rt03-g2.full"
+fi
+
+# ══ Gate 14B.4.4 / RT03-F5..F8 — auditoría externa BLOCK del parche 0fb5430 ══
+#  F5  COMPLETE sin cambios ni evidencia liberaba la obligación.
+#  F6  cualquier delta que superase VERIFY_CMD la liberaba (aunque ajeno a la disputa).
+#  F7  STATUS: BLOCKED del revisor omitía la precedencia de integridad.
+#  F8  el fallo de ground truth se perdía al reiniciarse por ronda.
+# Contrato de liberación (GREEN): la obligación SOLO se libera con (a) ancla
+# objetiva — el ground truth FALLABA al arbitrar — y una validación posterior
+# exitosa más revisión independiente, o (b) un arbitraje posterior ACCEPT_CLAUDE
+# que la sustituye explícitamente. Sin ancla objetiva se conserva (fail-safe).
+rt03x_run() { # <nombre> <workspace> <rondas> — el entorno MOCK_* lo fija el llamador
+  ( cd /tmp
+    export AGENT_BRIDGE_HISTORY_TURNS=3 AGENT_BRIDGE_HOME="$tmp_root/bridge-$1"
+    bash "$engine" "$2" "RT03x: $1" "$3" > "$tmp_root/$1.full" 2>&1
+    echo $? > "$tmp_root/$1.rc" )
+  RUN_RC="$(cat "$tmp_root/$1.rc")"
+}
+rt03x_ws() { rm -rf "$tmp_root/workspace/$1"; mkdir -p "$tmp_root/workspace/$1"; }
+
+# F5: COMPLETE + VERIFIED independiente, sin delta ni VERIFY_CMD → NO libera.
+rt03x_ws rt03x-f5
+( unset AGENT_BRIDGE_VERIFY_CMD
+  export MOCK_CLAUDE_FILE="$tmp_root/rt03-impl-revision.txt" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03x-f5-ac" MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/rt03x-f5-xd" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt"
+  rm -f "$tmp_root/rt03x-f5-ac" "$tmp_root/rt03x-f5-xd"
+  rt03x_run rt03x-f5 "$tmp_root/workspace/rt03x-f5" 2 )
+RUN_RC="$(cat "$tmp_root/rt03x-f5.rc")"
+if [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03x-f5.full" \
+   && ! grep -q "judge obligation released" "$tmp_root/rt03x-f5.full" \
+   && grep -q "consensus REJECTED: unresolved judge obligation" "$tmp_root/rt03x-f5.full"; then
+  case_pass rt03f5_complete_without_evidence_cannot_release
+else
+  case_fail rt03f5_complete_without_evidence_cannot_release "COMPLETE sin delta ni evidencia verificable no libera: rc=1 MAX_ROUNDS (RED: rc=0 CONSENSUS)" "$RUN_RC" "" "$tmp_root/rt03x-f5.full"
+fi
+
+# F6: delta ajeno a la disputa que supera VERIFY_CMD ('rm -f sneaky.txt') → NO libera.
+rt03x_ws rt03x-f6
+( export MOCK_WS="$tmp_root/workspace/rt03x-f6" MOCK_CLAUDE_EFFECT=write AGENT_BRIDGE_VERIFY_CMD='rm -f sneaky.txt' \
+    MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03x-f6-ac" MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/rt03x-f6-xd" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt"
+  rm -f "$tmp_root/rt03x-f6-ac" "$tmp_root/rt03x-f6-xd"
+  rt03x_run rt03x-f6 "$tmp_root/workspace/rt03x-f6" 2 )
+RUN_RC="$(cat "$tmp_root/rt03x-f6.rc")"
+if [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03x-f6.full" \
+   && ! grep -q "judge obligation released" "$tmp_root/rt03x-f6.full" \
+   && grep -q "consensus REJECTED: unresolved judge obligation" "$tmp_root/rt03x-f6.full"; then
+  case_pass rt03f6_unrelated_delta_cannot_release
+else
+  case_fail rt03f6_unrelated_delta_cannot_release "delta genérico que supera VERIFY_CMD (ancla ausente) no libera: rc=1 (RED: rc=0)" "$RUN_RC" "" "$tmp_root/rt03x-f6.full"
+fi
+
+# F7: STATUS BLOCKED del revisor + ground truth fallido → VERIFY_FAILING rc=2 (no BLOCKED rc=3).
+rt03x_ws rt03x-f7
+( export MOCK_WS="$tmp_root/workspace/rt03x-f7" MOCK_CLAUDE_EFFECT=write AGENT_BRIDGE_VERIFY_CMD=false \
+    MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c2r.txt"
+  rt03x_run rt03x-f7 "$tmp_root/workspace/rt03x-f7" 2 )
+RUN_RC="$(cat "$tmp_root/rt03x-f7.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03x-f7.full" \
+   && ! grep -q "Done: BLOCKED" "$tmp_root/rt03x-f7.full"; then
+  case_pass rt03f7_reviewer_blocked_integrity_prevails
+else
+  case_fail rt03f7_reviewer_blocked_integrity_prevails "BLOCKED del revisor con ground truth fallido: VERIFY_FAILING rc=2 (RED: rc=3)" "$RUN_RC" "" "$tmp_root/rt03x-f7.full"
+fi
+
+# F8: verify rojo en r1 (delta) y r2 sin delta ni verify nuevo → el fallo persiste: VERIFY_FAILING.
+rt03x_ws rt03x-f8
+rm -f "$tmp_root/rt03x-f8-once"
+( export MOCK_CLAUDE_WRITE_ONCE="$tmp_root/rt03x-f8-once" MOCK_WS="$tmp_root/workspace/rt03x-f8" MOCK_CLAUDE_EFFECT=write AGENT_BRIDGE_VERIFY_CMD=false \
+    MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/rt03x-f8-xd"
+  rm -f "$tmp_root/rt03x-f8-xd"
+  rt03x_run rt03x-f8 "$tmp_root/workspace/rt03x-f8" 2 )
+RUN_RC="$(cat "$tmp_root/rt03x-f8.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03x-f8.full" \
+   && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f8.full"; then
+  case_pass rt03f8_verify_failure_persists_across_rounds
+else
+  case_fail rt03f8_verify_failure_persists_across_rounds "fallo de ground truth en r1 persiste hasta validación exitosa: rc=2 (RED: rc=0 CONSENSUS)" "$RUN_RC" "" "$tmp_root/rt03x-f8.full"
+fi
+
+# F8b (positivo): el fallo NO es permanente — verify falla en r1, pasa al re-verificar en r2 → CONSENSUS.
+rt03x_ws rt03x-f8b
+rm -f "$tmp_root/rt03x-f8b-flag"
+rm -f "$tmp_root/rt03x-f8b-once"
+( export MOCK_CLAUDE_WRITE_ONCE="$tmp_root/rt03x-f8b-once" MOCK_WS="$tmp_root/workspace/rt03x-f8b" MOCK_CLAUDE_EFFECT=write \
+    AGENT_BRIDGE_VERIFY_CMD="test -f $tmp_root/rt03x-f8b-flag || { touch $tmp_root/rt03x-f8b-flag; false; }" \
+    MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/rt03x-f8b-xd"
+  rm -f "$tmp_root/rt03x-f8b-xd"
+  rt03x_run rt03x-f8b "$tmp_root/workspace/rt03x-f8b" 2 )
+RUN_RC="$(cat "$tmp_root/rt03x-f8b.rc")"
+if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f8b.full" \
+   && grep -q '^  verify: exit=1' "$tmp_root/rt03x-f8b.full" && grep -q '^  verify: exit=0' "$tmp_root/rt03x-f8b.full"; then
+  case_pass rt03f8b_verify_failure_cleared_by_later_success
+else
+  case_fail rt03f8b_verify_failure_cleared_by_later_success "verify rojo en r1 y verde al re-verificar: CONSENSUS rc=0 sin bloqueo permanente" "$RUN_RC" "" "$tmp_root/rt03x-f8b.full"
+fi
+
+# P1 (positivo, ancla objetiva): verify FALLABA al arbitrar (r1) y pasa tras la reparación (r2) + VERIFIED → libera.
+rt03x_ws rt03x-p1
+( export MOCK_WS="$tmp_root/workspace/rt03x-p1" MOCK_CLAUDE_EFFECT=write AGENT_BRIDGE_VERIFY_CMD='test -f fixed.txt' \
+    MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03x-p1-ac" MOCK_CLAUDE_FIX_FROM=2 \
+    MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/rt03x-p1-xd" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt"
+  rm -f "$tmp_root/rt03x-p1-ac" "$tmp_root/rt03x-p1-xd"
+  rt03x_run rt03x-p1 "$tmp_root/workspace/rt03x-p1" 2 )
+RUN_RC="$(cat "$tmp_root/rt03x-p1.rc")"
+if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03x-p1.full" \
+   && grep -q "judge obligation released" "$tmp_root/rt03x-p1.full" \
+   && grep -q '^  verify: exit=1' "$tmp_root/rt03x-p1.full" && grep -q '^  verify: exit=0' "$tmp_root/rt03x-p1.full"; then
+  case_pass rt03p1_anchor_fail_to_pass_releases
+else
+  case_fail rt03p1_anchor_fail_to_pass_releases "ancla (verify rojo al arbitrar) + verify verde posterior + VERIFIED → CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/rt03x-p1.full"
+fi
+
+# P3 (positivo, sustitución explícita): r1 REQUEST_REVISION; r2 segundo arbitraje ACCEPT_CLAUDE la sustituye;
+# r3 revisión independiente VERIFIED → CONSENSUS. Con integridad fallida (P3b) → VERIFY_FAILING.
+rt03x_p3() { # <nombre> <verify|-> 
+  rt03x_ws "$1"
+  ( export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
+      MOCK_CODEX_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/$1-xd" \
+      MOCK_CODEX_LATE_FROM=3 MOCK_CODEX_LATE_FILE="$tmp_root/c1r.txt" \
+      MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt" \
+      MOCK_OPENCODE_JUDGE_COUNT_FILE="$tmp_root/$1-jc" MOCK_OPENCODE_JUDGE_LATE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt"
+    rm -f "$tmp_root/$1-xd" "$tmp_root/$1-jc"
+    if [[ "$2" == "-" ]]; then unset AGENT_BRIDGE_VERIFY_CMD
+    else export AGENT_BRIDGE_VERIFY_CMD="$2" MOCK_WS="$tmp_root/workspace/$1" MOCK_CLAUDE_EFFECT=write; fi
+    rt03x_run "$1" "$tmp_root/workspace/$1" 3 )
+  RUN_RC="$(cat "$tmp_root/$1.rc")"
+}
+rt03x_p3 rt03x-p3 -
+if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03x-p3.full" \
+   && grep -q "judge obligation superseded by ACCEPT_CLAUDE" "$tmp_root/rt03x-p3.full" \
+   && ! grep -q "judge obligation released" "$tmp_root/rt03x-p3.full"; then
+  case_pass rt03p3_later_accept_claude_supersedes_explicitly
+else
+  case_fail rt03p3_later_accept_claude_supersedes_explicitly "ACCEPT_CLAUDE posterior sustituye explícitamente la obligación → CONSENSUS rc=0 en r3" "$RUN_RC" "" "$tmp_root/rt03x-p3.full"
+fi
+rt03x_p3 rt03x-p3b false
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03x-p3b.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03x-p3b.full"; then
+  case_pass rt03p3b_supersession_never_overrides_integrity
+else
+  case_fail rt03p3b_supersession_never_overrides_integrity "la sustitución de la obligación no neutraliza un ground truth fallido: rc=2" "$RUN_RC" "" "$tmp_root/rt03x-p3b.full"
+fi
+
+# D1: el re-verify del motor (verify no determinista que pasa) NO libera una obligación
+# anclada sin un delta del implementador posterior al arbitraje.
+rt03x_ws rt03x-d1
+rm -f "$tmp_root/rt03x-d1-flag" "$tmp_root/rt03x-d1-once"
+( export MOCK_CLAUDE_WRITE_ONCE="$tmp_root/rt03x-d1-once" MOCK_WS="$tmp_root/workspace/rt03x-d1" MOCK_CLAUDE_EFFECT=write \
+    AGENT_BRIDGE_VERIFY_CMD="test -f $tmp_root/rt03x-d1-flag || { touch $tmp_root/rt03x-d1-flag; false; }" \
+    MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/rt03x-d1-xd" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt"
+  rm -f "$tmp_root/rt03x-d1-xd"
+  rt03x_run rt03x-d1 "$tmp_root/workspace/rt03x-d1" 2 )
+RUN_RC="$(cat "$tmp_root/rt03x-d1.rc")"
+if [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03x-d1.full" \
+   && grep -q "re-verifying pending ground-truth failure" "$tmp_root/rt03x-d1.full" \
+   && ! grep -q "judge obligation released" "$tmp_root/rt03x-d1.full" \
+   && grep -q "consensus REJECTED: unresolved judge obligation" "$tmp_root/rt03x-d1.full"; then
+  case_pass rt03d1_engine_reverify_cannot_release
+else
+  case_fail rt03d1_engine_reverify_cannot_release "re-verify forzado verde sin delta del implementador no libera: rc=1 (obligación conservada)" "$RUN_RC" "" "$tmp_root/rt03x-d1.full"
 fi
 
 if [[ $ok_count -eq $total ]]; then
