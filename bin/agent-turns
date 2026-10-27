@@ -791,9 +791,17 @@ process_judge_verdict() {
   echo "  judge verdict processed (round $round): $_g14b_judge_current_verdict"
   case "$_g14b_judge_current_verdict" in
     REQUEST_REVISION|ACCEPT_CODEX)
-      _g14b_judge_obligation="$_g14b_judge_current_verdict"
-      _g14b_judge_obligation_round="$round"
-      _g14b_judge_obligation_reviewer="$review_provider"
+      # Conservación determinista: un arbitraje sucesivo nunca borra ni
+      # reinicia una obligación pendiente. Se conserva el origen (veredicto y
+      # ronda); solo avanza la ronda del último arbitraje, desde la cual debe
+      # acreditarse la entrega.
+      if [[ -n "$_g14b_judge_obligation" ]]; then
+        echo "  judge obligation preserved (origin: $_g14b_judge_obligation, round $_g14b_judge_obligation_round); superseding arbitration $_g14b_judge_current_verdict at round $round (Round $round - Reviewer ($review_provider))"
+      else
+        _g14b_judge_obligation="$_g14b_judge_current_verdict"
+        _g14b_judge_obligation_round="$round"
+      fi
+      _g14b_judge_obligation_last_round="$round"
       # Sin push_note: las notas añadidas desplazan la ventana de
       # trim_handoff y recortarían notas que los casos RT-02/RT-01a aserten.
       # El registro vinculante aquí es el estado interno + este echo.
@@ -802,9 +810,11 @@ process_judge_verdict() {
       # La objeción del revisor queda retirada POR el arbitraje; sin
       # obligación. El consenso posterior exige la revisión independiente
       # post-arbitraje más los controles de seguridad del workspace.
+      # Una obligación previa pendiente NO se borra aquí (solo la libera una
+      # entrega acreditada posterior).
       ;;
     BLOCKED)
-      if [[ "$ws_judge_verify_failed_run" -eq 1 || "$ws_delta_unverified_run" -eq 1 || "$ws_detection_reliable" -eq 0 ]]; then
+      if [[ "$round_verify_failed" -eq 1 || "$ws_judge_verify_failed_run" -eq 1 || "$ws_delta_unverified_run" -eq 1 || "$ws_detection_reliable" -eq 0 ]]; then
         echo "  arbiter verdict BLOCKED overridden by failing workspace integrity"
         final_state="VERIFY_FAILING"
       else
@@ -836,15 +846,15 @@ _g14b_judge_independence_failed=0 # Gate 14B.4.2: sin árbitro independiente est
 # (nunca del handoff, del stdout de agentes ni de comentarios). Se restablece
 # al inicio de cada call_judge: si el árbitro falla o queda indisponible no se
 # reutiliza un veredicto anterior.
-# _g14b_judge_obligation / _round / _reviewer: obligación persistente
-# (REQUEST_REVISION u ACCEPT_CODEX) con ronda de origen y el revisor de la
-# ronda arbitral. Vive en el estado del motor, NO en el handoff recortable; la
+# _g14b_judge_obligation / _round (origen) / _last_round (último arbitraje): obligación persistente
+# (REQUEST_REVISION u ACCEPT_CODEX) con ronda de origen; los arbitrajes
+# sucesivos la conservan (nunca la reemplazan). Vive en el estado del motor, NO en el handoff recortable; la
 # genera un veredicto válido activo y la cierra el proceso de resolución
-# del consenso; un veredicto arbitrario posterior la reemplaza.
+# del consenso; un arbitraje posterior la conserva (solo avanza _last_round).
 _g14b_judge_current_verdict=""
 _g14b_judge_obligation=""
 _g14b_judge_obligation_round=""
-_g14b_judge_obligation_reviewer=""
+_g14b_judge_obligation_last_round=""
 
 for ((round=1; round<=rounds; round++)); do
   round_verify_failed=0
@@ -1005,19 +1015,20 @@ for ((round=1; round<=rounds; round++)); do
         echo "  consensus REJECTED: workspace changed without objective verification"
         final_state="VERIFY_FAILING"
       elif [[ -n "$_g14b_judge_obligation" ]]; then                   # Gate 14B.4.4: obligación del árbitro fail-closed
-        # Un VERIFIED/COMPLETE posterior solo cierra el consenso si responde
-        # la obligación: una NUEVA intervención del implementador después del
-        # arbitraje que no siga en el eco de la disputa, O una revisión
-        # independiente de identidad DISTINTA a la del revisor de la ronda
-        # arbitral (caminos con acreditación independiente equivalente para
-        # el rescate de respaldo RT-01b). El mismo revisor de la disputa que
-        # ahora VERIFIED sin revisión del implementador es exactamente el
-        # 'simple VERIFIED posterior' que REQUEST_REVISION prohibió.
+        # Un VERIFIED/COMPLETE del revisor solo cierra el consenso si el
+        # implementador acredita la entrega (ver regla siguiente).
+        # Liberación (F2/F3): ni la identidad distinta del revisor ni un STATUS
+        # declarado liberan por sí solos. Exige, tras el ÚLTIMO arbitraje, una
+        # entrega acreditada del implementador: cierre declarado
+        # (COMPLETE/VERIFIED) o delta objetivo del workspace (que ya superó la
+        # verificación de ground truth arriba), Y la revisión independiente
+        # de esta ronda (VERIFIED/COMPLETE, evaluada por el case). PROPOSED u
+        # otro estado sin delta, o el eco DISAGREE/REVISE, no liberan.
         _g14b_obligation_released=0
-        if [[ "$round" -gt "$_g14b_judge_obligation_round" ]]; then
-          if [[ "$claude_status" != "DISAGREE" && "$claude_status" != "REVISE" ]]; then
+        if [[ "$_g14b_judge_obligation_last_round" =~ ^[0-9]+$ && "$round" -gt "$_g14b_judge_obligation_last_round" ]]; then   # estado no numérico → fail-closed
+          if [[ "$claude_status" == "COMPLETE" || "$claude_status" == "VERIFIED" ]]; then
             _g14b_obligation_released=1
-          elif [[ "$review_provider" != "$_g14b_judge_obligation_reviewer" ]]; then
+          elif [[ "$_g14b_impl_delta" -eq 1 && "$claude_status" != "DISAGREE" && "$claude_status" != "REVISE" && "$claude_status" != "BLOCKED" ]]; then
             _g14b_obligation_released=1
           fi
         fi
@@ -1025,7 +1036,7 @@ for ((round=1; round<=rounds; round++)); do
           echo "  judge obligation released (VERDICT: $_g14b_judge_obligation, round $_g14b_judge_obligation_round)"
           _g14b_judge_obligation=""
           _g14b_judge_obligation_round=""
-          _g14b_judge_obligation_reviewer=""
+          _g14b_judge_obligation_last_round=""
           final_state="CONSENSUS"
           break
         else
