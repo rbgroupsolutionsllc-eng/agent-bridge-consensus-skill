@@ -66,9 +66,13 @@ for a in "$@"; do
 done
 # Gate 14B.4.1: con MOCK_CODEX_COUNT_FILE activado, la 1ª invocación (revisor r1)
 # devuelve DISAGREE; las siguientes usan el archivo clásico (VERIFIED en r2).
+# RT03-F*: MOCK_CODEX_FAIL_AT=<n> fuerza el fallo EXACTO de la n-ésima
+# invocación (el contador avanza igualmente). Sin esa variable el mock queda
+# byte a byte idéntico para los casos 1-34.
 if [[ -n "${MOCK_CODEX_COUNT_FILE:-}" ]]; then
   c=0; [[ -f "$MOCK_CODEX_COUNT_FILE" ]] && c="$(cat "$MOCK_CODEX_COUNT_FILE")"
   c=$((c+1)); echo "$c" > "$MOCK_CODEX_COUNT_FILE"
+  [[ -n "${MOCK_CODEX_FAIL_AT:-}" && "$c" == "${MOCK_CODEX_FAIL_AT}" ]] && exit 1
   if [[ "$c" -eq 1 ]]; then
     printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rev r1\nNEXT: none\nHANDOFF: disputa r1\n' > "$out"
     exit 0
@@ -1197,6 +1201,236 @@ elif [[ "$rcT8" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-8.full" \
   case_pass rt03_accept_codex_legitimate_resolution_releases
 else
   case_fail rt03_accept_codex_legitimate_resolution_releases "resolución acreditada + nueva revisión independiente libera la objeción ACCEPT_CODEX → CONSENSUS rc=0 legítimo (contraste con caso 29)" "$rcT8" "run=$rt_run_8" "$tmp_root/rt03-8.full"
+fi
+
+# ══ Gate 14B.4.4 / RT03-F1..F4 — RED de regresión (auditoría del GREEN 9975e84) ══
+# Cuatro defectos bloqueantes reportados. Cada escenario exige transición y rc
+# EXACTOS (nunca un rc≠0 genérico); no se modifica el motor ni el README.
+#
+#  RT03-F1 — round_verify_failed no prevalece sobre el veredicto BLOCKED:
+#  process_judge_verdict() (branch BLOCKED) consulta ws_judge_verify_failed_run,
+#  ws_delta_unverified_run y ws_detection_reliable, PERO NO round_verify_failed.
+#  Un ground truth fallido ANTES del arbitraje (implementador) termina rc=3
+#  BLOCKED en lugar de rc=2 VERIFY_FAILING.
+#
+#  RT03-F2 — la sola identidad distinta del revisor libera la obligación:
+#  la rama de liberación es un OR; un respaldo VERIFIED de identidad distinta
+#  al revisor de la ronda arbitral cierra CONSENSUS aunque el implementador
+#  siga en DISAGREE sin responder la objeción.
+#
+#  RT03-F3 — STATUS: PROPOSED libera la obligación:
+#  la misma rama OR acepta any claude_status fuera de DISAGREE/REVISE; un
+#  PROPOSED sin entrega acreditada (sin delta, sin revisión que responda la
+#  objeción) termina en CONSENSUS rc=0.
+#
+#  RT03-F4 — ARBITRAJE SUCESIVO: el segundo veredicto que UPHELD la objeción
+#  (REQUEST_REVISION otra vez) SOBREESCRIBE el estado del árbitro (round y
+#  revisor de origen) sin registro de la sustitución, y en las rondas
+#  siguientes esa reinicialización dispara la liberación OR con condiciones
+#  que ya no corresponden a la exigencia original.
+
+cat > "$tmp_root/rt03-f3-impl-proposed.txt" <<'RT03F3P'
+STATUS: PROPOSED
+CHANGED: none
+EVIDENCE: respuesta sin entrega acreditada
+NEXT: none
+HANDOFF: rt03-f3-proposed-no-change
+RT03F3P
+
+# ── Caso F1 (rt03f1_verify_failed_beats_blocked): RED.
+# r1: claude DISAGREE escribe en el ws real (delta objetivo);
+# AGENT_BRIDGE_VERIFY_CMD=false → run_verify falla ANTES del arbitraje
+# ('verify: exit=1', round_verify_failed=1); codex DISAGREE; árbitro OpenCode
+# VERDICT: BLOCKED (procesado con ército). Contrato: la integridad fallida
+# PREVALECE → VERIFY_FAILING rc=2 en r1, sin Round 2, jamás BLOCKED ni
+# CONSENSUS. RED actual: rc=3 BLOCKED.
+rm -rf "$tmp_root/workspace/rt03-ws9" "$tmp_root/hit-oc-judge-f1" "$tmp_root/hit-agy-judge-f1" "$tmp_root/rt03-f1-xd-count"
+mkdir -p "$tmp_root/workspace/rt03-ws9"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_WS="$tmp_root/workspace/rt03-ws9" MOCK_CLAUDE_EFFECT=write \
+    AGENT_BRIDGE_VERIFY_CMD=false \
+    MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-f1-xd-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-BLOCKED.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-f1" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-f1" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-f1"
+  bash "$engine" "$tmp_root/workspace/rt03-ws9" "RT03-F1: ground truth fallido prevalece sobre BLOCKED" 2 > "$tmp_root/rt03-f1.full" 2>&1
+  echo $? > "$tmp_root/rt03-f1.rc"
+)
+rcF1="$(cat "$tmp_root/rt03-f1.rc")"
+oc_hit_f1=0; [[ -f "$tmp_root/hit-oc-judge-f1" ]] && oc_hit_f1=1
+rt_run_f1="$(rt03_artifacts "$tmp_root/rt03-f1.full")"
+if [[ "$oc_hit_f1" -ne 1 ]]; then
+  case_fail rt03f1_verify_failed_beats_blocked "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcF1" "oc_hit=$oc_hit_f1" "$tmp_root/rt03-f1.full"
+elif [[ "$rcF1" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03-f1.full" \
+     && ! grep -q "Done: BLOCKED" "$tmp_root/rt03-f1.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-f1.full" \
+     && ! grep -q "=== Round 2:" "$tmp_root/rt03-f1.full" \
+     && grep -q '^  verify: exit=1' "$tmp_root/rt03-f1.full" \
+     && grep -q "judge verdict processed (round 1): BLOCKED" "$tmp_root/rt03-f1.full" \
+     && [[ -f "$rt_run_f1/round-1-judge.out.md" ]] && grep -q '^VERDICT: BLOCKED$' "$rt_run_f1/round-1-judge.out.md"; then
+  case_pass rt03f1_verify_failed_beats_blocked
+else
+  case_fail rt03f1_verify_failed_beats_blocked "ground truth fallido ANTES del arbitraje prevalece sobre BLOCKED: VERIFY_FAILING rc=2 en r1 sin Round 2 (RED: branch BLOCKED no consulta round_verify_failed y termina rc=3)" "$rcF1" "run=$rt_run_f1" "$tmp_root/rt03-f1.full"
+fi
+
+# ── Caso F2 (rt03f2_distinct_reviewer_cannot_release) — RED.
+# r1: claude DISAGREE, codex DISAGREE (contador) → árbitro OpenCode
+# VERDICT: REQUEST_REVISION (obligación r1, revisor arbitrado codex).
+# r2: codex cae EXACTAMENTE en su 2ª invocación; respaldo del revisor:
+# opencode VERIFIED (independiente). El implementador SIGUE en DISAGREE
+# (eco de la disputa), sin responder la objeción y sin tocar el ws.
+# Contrato: la liberación exige TAMBIÉN la entrega acreditada del
+# implementador post-arbitraje (patrón válido del caso 33); la identidad
+# distinta del revisor sola no basta → rc=1 MAX_ROUNDS + rechazo
+# determinista por obligación pendiente. RED actual: rc=0 CONSENSUS.
+rm -rf "$tmp_root/workspace/rt03-ws10" "$tmp_root/hit-oc-judge-f2" "$tmp_root/hit-agy-judge-f2" "$tmp_root/rt03-f2-xd-count"
+mkdir -p "$tmp_root/workspace/rt03-ws10"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    MOCK_CODEX_FAIL_AT=2 \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-f2-xd-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-f2" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-f2" \
+    MOCK_OPENCODE_FILE="$tmp_root/rt01b-rev-oc-verified.txt" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-f2"
+  bash "$engine" "$tmp_root/workspace/rt03-ws10" "RT03-F2: identidad distinta del revisor no libera sola" 2 > "$tmp_root/rt03-f2.full" 2>&1
+  echo $? > "$tmp_root/rt03-f2.rc"
+)
+rcF2="$(cat "$tmp_root/rt03-f2.rc")"
+oc_hit_f2=0; [[ -f "$tmp_root/hit-oc-judge-f2" ]] && oc_hit_f2=1
+rt_run_f2="$(rt03_artifacts "$tmp_root/rt03-f2.full")"
+xd_count_f2="$(cat "$tmp_root/rt03-f2-xd-count" 2>/dev/null || echo 0)"
+if [[ "$oc_hit_f2" -ne 1 ]]; then
+  case_fail rt03f2_distinct_reviewer_cannot_release "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcF2" "oc_hit=$oc_hit_f2" "$tmp_root/rt03-f2.full"
+elif [[ "$rcF2" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03-f2.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-f2.full" \
+     && ! grep -q "judge obligation released" "$tmp_root/rt03-f2.full" \
+     && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: REQUEST_REVISION, round 1)" "$tmp_root/rt03-f2.full" \
+     && grep -q "Round 2 - Reviewer (opencode)" "$tmp_root/rt03-f2.full" \
+     && grep -q 'provider unavailable for this session: codex' "$tmp_root/rt03-f2.full" \
+     && [[ "$xd_count_f2" == "2" ]] \
+     && [[ -f "$rt_run_f2/round-1-judge.out.md" ]] && grep -q '^VERDICT: REQUEST_REVISION$' "$rt_run_f2/round-1-judge.out.md" \
+     && [[ -f "$rt_run_f2/round-2-codex.out.md" ]] && grep -q '^STATUS: VERIFIED$' "$rt_run_f2/round-2-codex.out.md" 2>/dev/null; then
+  case_pass rt03f2_distinct_reviewer_cannot_release
+else
+  case_fail rt03f2_distinct_reviewer_cannot_release "la identidad distinta del revisor nunca libera sola: rc=1 + obligación pendiente sin entrega acreditada (RED: OR de liberación → 'judge obligation released' → CONSENSUS rc=0)" "$rcF2" "run=$rt_run_f2 xd=$xd_count_f2" "$tmp_root/rt03-f2.full"
+fi
+
+# ── Caso F3 (rt03f3_proposed_impl_cannot_release) — RED.
+# r1: claude DISAGREE (1ª invocación, contador) + codex DISAGREE (contador)
+# → árbitro OpenCode VERDICT: REQUEST_REVISION (obligación r1, revisor codex).
+# r2: claude responde PROPOSED (CHANGED: none — sin delta, sin entrega) y
+# codex VERIFIED (c1r por contador). Contrato: la intervención del
+# implementador libera SOLO como entrega acreditada post-arbitraje (caso 33:
+# COMPLETE); PROPOSED sin resolución acreditada NUNCA libera → rc=1 MAX_ROUNDS
+# + rechazo determinista. RED actual: la rama claude_status != DISAGREE/REVISE
+# dispara 'judge obligation released' → CONSENSUS rc=0.
+rm -rf "$tmp_root/workspace/rt03-ws11" "$tmp_root/hit-oc-judge-f3" "$tmp_root/hit-agy-judge-f3" "$tmp_root/rt03-f3-xd-count" "$tmp_root/rt03-f3-ac-count"
+mkdir -p "$tmp_root/workspace/rt03-ws11"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt03-f3-impl-proposed.txt" \
+    MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03-f3-ac-count" \
+    MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-f3-xd-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-f3" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-f3" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-f3"
+  bash "$engine" "$tmp_root/workspace/rt03-ws11" "RT03-F3: PROPOSED sin entrega acreditada no libera" 2 > "$tmp_root/rt03-f3.full" 2>&1
+  echo $? > "$tmp_root/rt03-f3.rc"
+)
+rcF3="$(cat "$tmp_root/rt03-f3.rc")"
+oc_hit_f3=0; [[ -f "$tmp_root/hit-oc-judge-f3" ]] && oc_hit_f3=1
+rt_run_f3="$(rt03_artifacts "$tmp_root/rt03-f3.full")"
+xd_count_f3="$(cat "$tmp_root/rt03-f3-xd-count" 2>/dev/null || echo 0)"
+ac_count_f3="$(cat "$tmp_root/rt03-f3-ac-count" 2>/dev/null || echo 0)"
+if [[ "$oc_hit_f3" -ne 1 ]]; then
+  case_fail rt03f3_proposed_impl_cannot_release "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcF3" "oc_hit=$oc_hit_f3" "$tmp_root/rt03-f3.full"
+elif [[ "$rcF3" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03-f3.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-f3.full" \
+     && ! grep -q "judge obligation released" "$tmp_root/rt03-f3.full" \
+     && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: REQUEST_REVISION, round 1)" "$tmp_root/rt03-f3.full" \
+     && [[ -f "$rt_run_f3/round-1-judge.out.md" ]] && grep -q '^VERDICT: REQUEST_REVISION$' "$rt_run_f3/round-1-judge.out.md" \
+     && [[ -f "$rt_run_f3/round-2-claude.out.md" ]] && grep -q '^STATUS: PROPOSED$' "$rt_run_f3/round-2-claude.out.md" 2>/dev/null \
+     && grep -q 'rt03-f3-proposed-no-change' "$rt_run_f3/round-2-claude.out.md" 2>/dev/null \
+     && [[ -f "$rt_run_f3/round-2-codex.out.md" ]] && grep -q '^STATUS: VERIFIED$' "$rt_run_f3/round-2-codex.out.md" 2>/dev/null \
+     && [[ "$xd_count_f3" == "2" ]] && [[ "$ac_count_f3" == "2" ]] \
+     && [[ "$(grep -c '^  verify: exit=' "$tmp_root/rt03-f3.full" 2>/dev/null; true)" == "0" ]] \
+     && ! grep -q "workspace changed" "$tmp_root/rt03-f3.full"; then
+  case_pass rt03f3_proposed_impl_cannot_release
+else
+  case_fail rt03f3_proposed_impl_cannot_release "PROPOSED sin entrega acreditada (sin delta, sin resolución) nunca libera: rc=1 + rechazo determinista (RED: OR de liberación acepta claude PROPOSED → CONSENSUS rc=0)" "$rcF3" "run=$rt_run_f3 xd=$xd_count_f3 ac=$ac_count_f3" "$tmp_root/rt03-f3.full"
+fi
+
+# ── Caso F4 (rt03f4_second_arbitration_keeps_failclosed) — RED.
+# ARBITRAJE SUCESIVO en 3 rondas (invocación explícita rounds=3):
+#  r1: claude DISAGREE; codex DISAGREE (c1) → árbitro OpenCode
+#      REQUEST_REVISION → obligación (round 1, revisor codex).
+#  r2: codex cae EXACTAMENTE en la 2ª invocación (FAIL_AT=2) → respaldo del
+#      revisor: AGY (1er candidato de AGENT_BRIDGE_FALLBACKS="agy,opencode",
+#      contador agy c1 → DISAGREE). Segundo arbitraje (OpenCode, 2ª escalación)
+#      con VERDICT: REQUEST_REVISION. HOY se SOBREESCRIBE el estado del
+#      árbitro → (round 2, revisor agy), perdiendo la ronda 1 SIN registro de
+#      la sustitución.
+#  r3: AGY falla como revisor (contador agy c2 sin MOCK_AGY_FILE);
+#      respaldo: opencode VERIFIED (invocación no-juez nº1… vía
+#      MOCK_OPENCODE_FILE) → identidad DISTINTA del revisor del ÚLTIMO
+#      arbitraje → la liberación OR se dispara SIN entrega acreditada del
+#      implementador (claude queda en DISAGREE eco todas las rondas).
+#  Contrato: la segunda REQUEST_REVISION NO resetea ni amplía nada — la
+#  exigencia activa se preserva (ronda 1 como origen registrado, fail-closed)
+#  y la liberación exige entrega acreditada del implementador + revisión
+#  independiente post-arbitraje. rc=1 MAX_ROUNDS + rechazo determinista; los
+#  dos arbitrajes quedan acreditados por sus artefactos (sin arbitraje
+#  silenciosamente omitido).
+#  RED actual: reinicialización del estado → 'judge obligation released
+#  (…round 2)' → CONSENSUS rc=0 en r3.
+rm -rf "$tmp_root/workspace/rt03-ws12" "$tmp_root/hit-oc-judge-f4" "$tmp_root/hit-agy-judge-f4" \
+       "$tmp_root/rt03-f4-xd-count" "$tmp_root/rt03-f4-agy-count"
+mkdir -p "$tmp_root/workspace/rt03-ws12"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    MOCK_CODEX_FAIL_AT=2 \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-f4-xd-count" \
+    MOCK_AGY_COUNT_FILE="$tmp_root/rt03-f4-agy-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-f4" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-f4" \
+    MOCK_OPENCODE_FILE="$tmp_root/rt01b-rev-oc-verified.txt" \
+    AGENT_BRIDGE_FALLBACKS="agy,opencode" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-f4"
+  bash "$engine" "$tmp_root/workspace/rt03-ws12" "RT03-F4: el segundo arbitraje no resetea la obligación" 3 > "$tmp_root/rt03-f4.full" 2>&1
+  echo $? > "$tmp_root/rt03-f4.rc"
+)
+rcF4="$(cat "$tmp_root/rt03-f4.rc")"
+oc_hit_f4=0; [[ -f "$tmp_root/hit-oc-judge-f4" ]] && oc_hit_f4=1
+rt_run_f4="$(rt03_artifacts "$tmp_root/rt03-f4.full")"
+esc_f4="$(rt03_judge_escalations "$tmp_root/rt03-f4.full")"
+xd_count_f4="$(cat "$tmp_root/rt03-f4-xd-count" 2>/dev/null || echo 0)"
+if [[ "$oc_hit_f4" -ne 1 ]]; then
+  case_fail rt03f4_second_arbitration_keeps_failclosed "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcF4" "oc_hit=$oc_hit_f4" "$tmp_root/rt03-f4.full"
+elif [[ "$rcF4" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03-f4.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-f4.full" \
+     && ! grep -q "judge obligation released" "$tmp_root/rt03-f4.full" \
+     && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: REQUEST_REVISION" "$tmp_root/rt03-f4.full" \
+     && grep -q 'provider unavailable for this session: codex' "$tmp_root/rt03-f4.full" \
+     && grep -q 'provider unavailable for this session: agy' "$tmp_root/rt03-f4.full" \
+     && grep -q "Round 2 - Reviewer (agy)" "$tmp_root/rt03-f4.full" \
+     && grep -q "Round 3 - Reviewer (opencode)" "$tmp_root/rt03-f4.full" \
+     && [[ "$esc_f4" == "2" ]] \
+     && [[ "$xd_count_f4" == "2" ]] \
+     && [[ -f "$rt_run_f4/round-1-judge.out.md" ]] && grep -q '^VERDICT: REQUEST_REVISION$' "$rt_run_f4/round-1-judge.out.md" \
+     && [[ -f "$rt_run_f4/round-2-judge.out.md" ]] && grep -q '^VERDICT: REQUEST_REVISION$' "$rt_run_f4/round-2-judge.out.md"; then
+  case_pass rt03f4_second_arbitration_keeps_failclosed
+else
+  case_fail rt03f4_second_arbitration_keeps_failclosed "el segundo arbitraje (upheld) no resetea la obligación ni amplía la liberación: rc=1 + rechazo determinista con los DOS arbitrajes acreditados (RED: reinicialización → 'judge obligation released (…round 2)' → CONSENSUS rc=0 en r3)" "$rcF4" "run=$rt_run_f4 xd=$xd_count_f4 esc=$esc_f4" "$tmp_root/rt03-f4.full"
 fi
 
 if [[ $ok_count -eq $total ]]; then
