@@ -38,10 +38,20 @@ PY
 fi
 json=0; _p=""
 for a in "$@"; do [[ "$_p" == "--output-format" && "$a" == "json" ]] && json=1; _p="$a"; done
+# Gate 14B.4.4: contador de invocaciones para pruebas de revisión legítima.
+# La 1ª invocación puede responder con otro archivo (posición de disputa r1)
+# y las siguientes con el clásico (revisión r2). Sin ambas variables el
+# comportamiento es idéntico al anterior (casos 1-31 intocables).
+src="$MOCK_CLAUDE_FILE"
+if [[ -n "${MOCK_CLAUDE_COUNT_FILE:-}" && -n "${MOCK_CLAUDE_FIRST_FILE:-}" ]]; then
+  c=0; [[ -f "$MOCK_CLAUDE_COUNT_FILE" ]] && c="$(cat "$MOCK_CLAUDE_COUNT_FILE")"
+  c=$((c+1)); echo "$c" > "$MOCK_CLAUDE_COUNT_FILE"
+  [[ "$c" -eq 1 ]] && src="$MOCK_CLAUDE_FIRST_FILE"
+fi
 if [[ "$json" == "1" ]]; then
-  python3 -c 'import sys,json; print(json.dumps({"result": open(sys.argv[1]).read(), "session_id": "m", "total_cost_usd": 0.0}))' "$MOCK_CLAUDE_FILE"
+  python3 -c 'import sys,json; print(json.dumps({"result": open(sys.argv[1]).read(), "session_id": "m", "total_cost_usd": 0.0}))' "$src"
 else
-  cat "$MOCK_CLAUDE_FILE"
+  cat "$src"
 fi
 exit 0
 EOF
@@ -817,6 +827,13 @@ EVIDENCE: rev codex r2
 NEXT: none
 HANDOFF: rt03-rev-codex-disputa-r2
 RT03REV
+cat > "$tmp_root/rt03-impl-revision.txt" <<RT03REVIMPL
+STATUS: COMPLETE
+CHANGED: none
+EVIDENCE: rt03 revision addresses reviewer objection
+NEXT: none
+HANDOFF: rt03-impl-revision-answer-marker
+RT03REVIMPL
 rt03_judge_escalations() { grep -c 'escalating to OpenCode judge' "${1:-}" 2>/dev/null || true; }
 # Directorio de artefactos de la corrida (línea 'Artifacts:' del motor; libre
 # de trim_handoff: los round-*.out.md no se recortan).
@@ -1052,6 +1069,134 @@ elif [[ "$rcT5" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03-5.ful
   case_pass rt03_accept_claude_never_bypasses_safety
 else
   case_fail rt03_accept_claude_never_bypasses_safety "ACCEPT_CLAUDE no puede puentear delta real no verificado: rc=2 VERIFY_FAILING con rechazo objetivo (valido pre y post GREEN)" "$rcT5" "" "$tmp_root/rt03-5.full"
+fi
+
+# ── Caso 32 (rt03_blocked_ws_integrity_failure_prevails) — RED:
+# Precedencia de la integridad del workspace sobre el veredicto BLOCKED.
+# r1: claude escribe en el ws real (delta no verificado, VERIFY_CMD unset),
+# codex DISAGREE (inv 1) → árbitro OpenCode VERDICT: BLOCKED.
+# Contrato GREEN: BLOCKED detiene rondas (rc=3) SOLO con integridad limpia;
+# con un fallo de integridad del ws sin verificar PREVALECE VERIFY_FAILING
+# rc=2: detenido igualmente en r1 (sin Round 2), NUNCA CONSENSUO.
+# RED (motor actual): veredicto ignorado → corre r2 → MAX_ROUNDS rc=1.
+rm -rf "$tmp_root/workspace/rt03-ws6" "$tmp_root/hit-oc-judge-32" "$tmp_root/hit-agy-judge-32" "$tmp_root/rt03-32-xd-count"
+mkdir -p "$tmp_root/workspace/rt03-ws6"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CODEX_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-32-xd-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-BLOCKED.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-32" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-32" \
+    MOCK_WS="$tmp_root/workspace/rt03-ws6" MOCK_CLAUDE_EFFECT=write \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-6"
+  bash "$engine" "$tmp_root/workspace/rt03-ws6" "RT-03: integridad prevalece sobre BLOCKED" 2 > "$tmp_root/rt03-6.full" 2>&1
+  echo $? > "$tmp_root/rt03-6.rc"
+)
+rcT6="$(cat "$tmp_root/rt03-6.rc")"
+oc_hit_t6=0; [[ -f "$tmp_root/hit-oc-judge-32" ]] && oc_hit_t6=1
+rt_run_6="$(rt03_artifacts "$tmp_root/rt03-6.full")"
+if [[ "$oc_hit_t6" -ne 1 ]]; then
+  case_fail rt03_blocked_ws_integrity_failure_prevails "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT6" "oc_hit=$oc_hit_t6" "$tmp_root/rt03-6.full"
+elif [[ "$rcT6" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03-6.full" \
+     && ! grep -q "Done: BLOCKED" "$tmp_root/rt03-6.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-6.full" \
+     && ! grep -q "=== Round 2:" "$tmp_root/rt03-6.full" \
+     && grep -q "workspace changed" "$tmp_root/rt03-6.full" \
+     && [[ -f "$rt_run_6/round-1-judge.out.md" ]] && grep -q '^VERDICT: BLOCKED$' "$rt_run_6/round-1-judge.out.md"; then
+  case_pass rt03_blocked_ws_integrity_failure_prevails
+else
+  case_fail rt03_blocked_ws_integrity_failure_prevails "integridad del ws sin verificar prevalece sobre BLOCKED: VERIFY_FAILING rc=2 sin Round 2 (RED: veredicto ignorado, corrida continúa)" "$rcT6" "run=$rt_run_6" "$tmp_root/rt03-6.full"
+fi
+
+# ── Caso 33 (rt03_request_revision_legitimate_revision_releases) — POSITIVO:
+# Liberación legítima de la obligación REQUEST_REVISION (válida pre y post
+# GREEN). r1 disputa + árbitro REQUEST_REVISION; r2: el implementador entrega
+# revisión real que responde la objeción (COMPLETE + marcador, ya no el
+# DISAGREE eco), el revisor independiente emite VERIFIED y no hay delta por
+# verificar (VERIFY_CMD innecesario sin cambios). Contraste directo con el
+# caso 28: condiciones equivalentes sin revisión acreditada → rechazo
+# determinista rc=1; con revisión acreditada → CONSENSUS rc=0 legítimo.
+rm -rf "$tmp_root/workspace/rt03-ws7" "$tmp_root/hit-oc-judge-33" "$tmp_root/hit-agy-judge-33" "$tmp_root/rt03-33-xd-count" "$tmp_root/rt03-33-ac-count"
+mkdir -p "$tmp_root/workspace/rt03-ws7"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt03-impl-revision.txt" \
+    MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03-33-ac-count" \
+    MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-33-xd-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-33" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-33" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-7"
+  bash "$engine" "$tmp_root/workspace/rt03-ws7" "RT-03: revisión legítima libera REQUEST_REVISION" 2 > "$tmp_root/rt03-7.full" 2>&1
+  echo $? > "$tmp_root/rt03-7.rc"
+)
+rcT7="$(cat "$tmp_root/rt03-7.rc")"
+oc_hit_t7=0; [[ -f "$tmp_root/hit-oc-judge-33" ]] && oc_hit_t7=1
+rt_run_7="$(rt03_artifacts "$tmp_root/rt03-7.full")"
+xd_count_7="$(cat "$tmp_root/rt03-33-xd-count" 2>/dev/null || echo 0)"
+ac_count_7="$(cat "$tmp_root/rt03-33-ac-count" 2>/dev/null || echo 0)"
+if [[ "$oc_hit_t7" -ne 1 ]]; then
+  case_fail rt03_request_revision_legitimate_revision_releases "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT7" "oc_hit=$oc_hit_t7" "$tmp_root/rt03-7.full"
+elif [[ "$rcT7" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-7.full" \
+     && ! grep -q "consensus REJECTED: unresolved judge obligation" "$tmp_root/rt03-7.full" \
+     && [[ -f "$rt_run_7/round-1-judge.out.md" ]] && grep -q '^VERDICT: REQUEST_REVISION$' "$rt_run_7/round-1-judge.out.md" \
+     && grep -q '^STATUS: DISAGREE$' "$rt_run_7/round-1-claude.out.md" 2>/dev/null \
+     && grep -q '^STATUS: COMPLETE$' "$rt_run_7/round-2-claude.out.md" 2>/dev/null \
+     && grep -q 'rt03-impl-revision-answer-marker' "$rt_run_7/round-2-claude.out.md" 2>/dev/null \
+     && grep -q '^STATUS: VERIFIED$' "$rt_run_7/round-2-codex.out.md" 2>/dev/null \
+     && [[ "$ac_count_7" == "2" ]] && [[ "$xd_count_7" -ge 2 ]] \
+     && [[ "$(grep -c '^  verify: exit=' "$tmp_root/rt03-7.full" 2>/dev/null; true)" == "0" ]] \
+     && ! grep -q "workspace changed" "$tmp_root/rt03-7.full"; then
+  case_pass rt03_request_revision_legitimate_revision_releases
+else
+  case_fail rt03_request_revision_legitimate_revision_releases "revisión acreditada (COMPLETO r2) + VERIFIED independiente sin delta libera la obligación → CONSENSUS rc=0 legítimo (contraste con caso 28)" "$rcT7" "run=$rt_run_7" "$tmp_root/rt03-7.full"
+fi
+
+# ── Caso 34 (rt03_accept_codex_legitimate_resolution_releases) — POSITIVO:
+# Resolución acreditada de una objeción ACCEPT_CODEX (válida pre y post
+# GREEN). r1 disputa + árbitro ACCEPT_CODEX (objeción upheld); r2 el
+# implementador responde la objeción con revisión real (COMPLETE + marcador)
+# y el MISMO revisor independiente la acepta (VERIFIED), cerrando la objeción
+# de forma explícita y no silenciosa; sin delta por verificar. Contraste
+# directo con el caso 29: sin resolución acreditada → rechazo rc=1; con
+# resolución acreditada + nueva revisión independiente → CONSENSUS rc=0.
+rm -rf "$tmp_root/workspace/rt03-ws8" "$tmp_root/hit-oc-judge-34" "$tmp_root/hit-agy-judge-34" "$tmp_root/rt03-34-xd-count" "$tmp_root/rt03-34-ac-count"
+mkdir -p "$tmp_root/workspace/rt03-ws8"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt03-impl-revision.txt" \
+    MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03-34-ac-count" \
+    MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-34-xd-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CODEX.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-34" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-34" \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-8"
+  bash "$engine" "$tmp_root/workspace/rt03-ws8" "RT-03: resolución acreditada libera ACCEPT_CODEX" 2 > "$tmp_root/rt03-8.full" 2>&1
+  echo $? > "$tmp_root/rt03-8.rc"
+)
+rcT8="$(cat "$tmp_root/rt03-8.rc")"
+oc_hit_t8=0; [[ -f "$tmp_root/hit-oc-judge-34" ]] && oc_hit_t8=1
+rt_run_8="$(rt03_artifacts "$tmp_root/rt03-8.full")"
+xd_count_8="$(cat "$tmp_root/rt03-34-xd-count" 2>/dev/null || echo 0)"
+ac_count_8="$(cat "$tmp_root/rt03-34-ac-count" 2>/dev/null || echo 0)"
+if [[ "$oc_hit_t8" -ne 1 ]]; then
+  case_fail rt03_accept_codex_legitimate_resolution_releases "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT8" "oc_hit=$oc_hit_t8" "$tmp_root/rt03-8.full"
+elif [[ "$rcT8" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-8.full" \
+     && ! grep -q "consensus REJECTED: unresolved judge obligation" "$tmp_root/rt03-8.full" \
+     && [[ -f "$rt_run_8/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_CODEX$' "$rt_run_8/round-1-judge.out.md" \
+     && grep -q '^STATUS: DISAGREE$' "$rt_run_8/round-1-claude.out.md" 2>/dev/null \
+     && grep -q '^STATUS: COMPLETE$' "$rt_run_8/round-2-claude.out.md" 2>/dev/null \
+     && grep -q 'rt03-impl-revision-answer-marker' "$rt_run_8/round-2-claude.out.md" 2>/dev/null \
+     && grep -q '^STATUS: VERIFIED$' "$rt_run_8/round-2-codex.out.md" 2>/dev/null \
+     && [[ "$ac_count_8" == "2" ]] && [[ "$xd_count_8" -ge 2 ]] \
+     && [[ "$(grep -c '^  verify: exit=' "$tmp_root/rt03-8.full" 2>/dev/null; true)" == "0" ]] \
+     && ! grep -q "workspace changed" "$tmp_root/rt03-8.full"; then
+  case_pass rt03_accept_codex_legitimate_resolution_releases
+else
+  case_fail rt03_accept_codex_legitimate_resolution_releases "resolución acreditada + nueva revisión independiente libera la objeción ACCEPT_CODEX → CONSENSUS rc=0 legítimo (contraste con caso 29)" "$rcT8" "run=$rt_run_8" "$tmp_root/rt03-8.full"
 fi
 
 if [[ $ok_count -eq $total ]]; then
