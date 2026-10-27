@@ -1053,10 +1053,20 @@ for verdict in ACCEPT_CLAUDE ACCEPT_CODEX REQUEST_REVISION BLOCKED; do
     'NEXT: apply the accepted verdict' "HANDOFF: valid $verdict verdict" "VERDICT: $verdict"
   state="$(run_judge_case "valid_$verdict" "$body" "" 2)"
   judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
-  # round-2-claude.prompt.md is built from the handoff BEFORE round 2's own
-  # sections are pushed/trimmed, so it reliably captures round 1's judge
-  # verdict propagation regardless of later trim_handoff eviction.
-  assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: $verdict"
+  # Gate 14B.4.4 (RT-03): BLOCKED es vinculante — la corrida termina en la
+  # ronda del arbitraje (rc=3) sin ronda 2, así que no hay prompt de segunda
+  # ronda que retransmita el veredicto. La propagación a la ronda posterior
+  # se sigue verificando para los tres veredictos que continúan: su prompt
+  # de ronda 2 — construido del handoff ANTES de que las secciones propias de
+  # ronda 2 se empujen/recorten — captura de forma fiable el veredicto de
+  # ronda 1 aunque trim_handoff lo expulse después.
+  if [[ "$verdict" == "BLOCKED" ]]; then
+    [[ "$(cat "$state/exit-code")" == "3" ]] || { echo "expected exit code 3 for binding BLOCKED verdict, got $(cat "$state/exit-code")" >&2; exit 1; }
+    assert_contains "$state/stdout.log" "=== Done: BLOCKED ==="
+    assert_not_contains "$state/stdout.log" "=== Round 2:"
+  else
+    assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: $verdict"
+  fi
 done
 
 # --- Decoy token in EVIDENCE PLUS a real anchored VERDICT: only the

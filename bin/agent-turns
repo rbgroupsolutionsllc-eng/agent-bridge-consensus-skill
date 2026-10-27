@@ -701,6 +701,10 @@ call_judge() {
   } > "$prompt"
 
   local jrc _g14b_pre_judge
+  # Gate 14B.4.4: restablecer el estado TEMPORAL del árbitro antes de cada
+  # invocación; un fallo/indisponibilidad posterior jamás reutiliza el
+  # veredicto de una invocación previa. La OBLIGACIÓN persistente no se toca.
+  _g14b_judge_current_verdict=""
   # ── Gate 14B.4.2 (RT-01a): el árbitro debe ser independiente ───────────
   # Identidades REALES registradas por el orquestador (impl_provider /
   # review_provider), normalizadas con normalize_provider(); la exclusión es
@@ -765,7 +769,50 @@ call_judge() {
     return 0
   fi
   push_note "JUDGE VERDICT (round $round): $(judge_summary "$out")"
+  # Gate 14B.4.4: registro del ÚNICO veredicto vigente (campo validado y
+  # anclado; la respuesta ya pasó validate_judge_protocol).
+  _g14b_judge_current_verdict="$(judge_verdict "$out")"
   judge_ws_gate "$round" "$_g14b_pre_judge"                          # Gate 14B.4: delta del juez → mismo control que implementador/revisor
+}
+
+# ── Gate 14B.4.4 (RT-03): la decisión arbitral gobierna las transiciones ────
+# Procesa el veredicto VALIDADO por call_judge (solo judge_verdict(); jamás
+# texto del handoff, stdout de agentes o comentarios). Las rondas posteriores
+# ya no ignoran BLOCKED/REQUEST_REVISION/ACCEPT_CODEX/ACCEPT_CLAUDE.
+# BLOCKED: termina en la misma ronda (rc=3), salvo fallo de integridad del
+# workspace, en cuyo caso prevalece VERIFY_FAILING (rc=2) — una decisión
+# arbitral nunca neutraliza una condición de integridad fallida.
+# REQUEST_REVISION/ACCEPT_CODEX: obligación persistente con ronda de origen.
+# ACCEPT_CLAUDE: la objeción del revisor queda retirada POR el arbitraje; no
+# hay obligación, y el consenso posterior exige la revisión independiente
+# post-arbitraje más los controles de seguridad del workspace existentes.
+process_judge_verdict() {
+  local round="$1"
+  echo "  judge verdict processed (round $round): $_g14b_judge_current_verdict"
+  case "$_g14b_judge_current_verdict" in
+    REQUEST_REVISION|ACCEPT_CODEX)
+      _g14b_judge_obligation="$_g14b_judge_current_verdict"
+      _g14b_judge_obligation_round="$round"
+      _g14b_judge_obligation_reviewer="$review_provider"
+      # Sin push_note: las notas añadidas desplazan la ventana de
+      # trim_handoff y recortarían notas que los casos RT-02/RT-01a aserten.
+      # El registro vinculante aquí es el estado interno + este echo.
+      ;;
+    ACCEPT_CLAUDE)
+      # La objeción del revisor queda retirada POR el arbitraje; sin
+      # obligación. El consenso posterior exige la revisión independiente
+      # post-arbitraje más los controles de seguridad del workspace.
+      ;;
+    BLOCKED)
+      if [[ "$ws_judge_verify_failed_run" -eq 1 || "$ws_delta_unverified_run" -eq 1 || "$ws_detection_reliable" -eq 0 ]]; then
+        echo "  arbiter verdict BLOCKED overridden by failing workspace integrity"
+        final_state="VERIFY_FAILING"
+      else
+        final_state="BLOCKED"
+      fi
+      ;;
+  esac
+  return 0
 }
 
 changed_something() {
@@ -783,6 +830,21 @@ ws_delta_unverified_run=0   # Gate 14B: hubo cambios reales sin ground truth eje
 ws_detection_reliable=1     # Gate 14B: detección de delta garantizable; 0 = límite detectado → fail closed
 ws_judge_verify_failed_run=0 # Gate 14B.4: ground truth falló tras delta del juez; run-scoped porque round_verify_failed es por ronda
 _g14b_judge_independence_failed=0 # Gate 14B.4.2: sin árbitro independiente esta ronda → NO_INDEPENDENT_JUDGE, se reinicia en cada invocación del juez
+# ── Gate 14B.4.4 (RT-03): estado vinculante del árbitro ────────────────────
+# _g14b_judge_current_verdict: el veredicto VALIDADO de la invocación del
+# árbitro en curso, leído EXCLUSIVAMENTE del campo anclado por judge_verdict()
+# (nunca del handoff, del stdout de agentes ni de comentarios). Se restablece
+# al inicio de cada call_judge: si el árbitro falla o queda indisponible no se
+# reutiliza un veredicto anterior.
+# _g14b_judge_obligation / _round / _reviewer: obligación persistente
+# (REQUEST_REVISION u ACCEPT_CODEX) con ronda de origen y el revisor de la
+# ronda arbitral. Vive en el estado del motor, NO en el handoff recortable; la
+# genera un veredicto válido activo y la cierra el proceso de resolución
+# del consenso; un veredicto arbitrario posterior la reemplaza.
+_g14b_judge_current_verdict=""
+_g14b_judge_obligation=""
+_g14b_judge_obligation_round=""
+_g14b_judge_obligation_reviewer=""
 
 for ((round=1; round<=rounds; round++)); do
   round_verify_failed=0
@@ -942,6 +1004,34 @@ for ((round=1; round<=rounds; round++)); do
         push_note "ORCHESTRATOR REJECTED $codex_status (round $round): workspace changed without objective ground-truth verification (AGENT_BRIDGE_VERIFY_CMD unset${ws_detection_reliable:+; detection limit invoked})"
         echo "  consensus REJECTED: workspace changed without objective verification"
         final_state="VERIFY_FAILING"
+      elif [[ -n "$_g14b_judge_obligation" ]]; then                   # Gate 14B.4.4: obligación del árbitro fail-closed
+        # Un VERIFIED/COMPLETE posterior solo cierra el consenso si responde
+        # la obligación: una NUEVA intervención del implementador después del
+        # arbitraje que no siga en el eco de la disputa, O una revisión
+        # independiente de identidad DISTINTA a la del revisor de la ronda
+        # arbitral (caminos con acreditación independiente equivalente para
+        # el rescate de respaldo RT-01b). El mismo revisor de la disputa que
+        # ahora VERIFIED sin revisión del implementador es exactamente el
+        # 'simple VERIFIED posterior' que REQUEST_REVISION prohibió.
+        _g14b_obligation_released=0
+        if [[ "$round" -gt "$_g14b_judge_obligation_round" ]]; then
+          if [[ "$claude_status" != "DISAGREE" && "$claude_status" != "REVISE" ]]; then
+            _g14b_obligation_released=1
+          elif [[ "$review_provider" != "$_g14b_judge_obligation_reviewer" ]]; then
+            _g14b_obligation_released=1
+          fi
+        fi
+        if [[ "$_g14b_obligation_released" -eq 1 ]]; then
+          echo "  judge obligation released (VERDICT: $_g14b_judge_obligation, round $_g14b_judge_obligation_round)"
+          _g14b_judge_obligation=""
+          _g14b_judge_obligation_round=""
+          _g14b_judge_obligation_reviewer=""
+          final_state="CONSENSUS"
+          break
+        else
+          echo "  consensus REJECTED: unresolved judge obligation (VERDICT: $_g14b_judge_obligation, round $_g14b_judge_obligation_round)"
+          # Sin break: una ronda posterior puede acreditar la resolución.
+        fi
       else
         final_state="CONSENSUS"
         break
@@ -960,6 +1050,14 @@ for ((round=1; round<=rounds; round++)); do
         if [[ "$_g14b_judge_independence_failed" -eq 1 ]]; then
           final_state="NO_INDEPENDENT_JUDGE"
           break
+        fi
+        # Gate 14B.4.4 (RT-03): con árbitro independiente, su veredicto
+        # VALIDADO gobierna la transición (nunca texto del handoff/stdout).
+        if [[ -n "$_g14b_judge_current_verdict" ]]; then
+          process_judge_verdict "$round"
+          if [[ "$_g14b_judge_current_verdict" == "BLOCKED" ]]; then
+            break
+          fi
         fi
       fi
       ;;

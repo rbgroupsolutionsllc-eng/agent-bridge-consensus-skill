@@ -100,6 +100,8 @@ Any provider that fails (any exit code, timeout, or empty response) is automatic
 
 **Judge-scoped failures (Gate 14B.4.3):** a provider whose attempt failed *only in the arbiter role* (invalid judge protocol, unreachable as judge, etc.) is recorded in a separate arbiter-scoped failure list instead of the global unavailable list. When selecting an arbiter, the engine checks **both** states: global failures (`is_failed`) and arbiter-scoped failures (`is_failed_judge`), so a provider disabled globally by a failure in any other role never arbitrates. `call_fallback()` keeps consulting only the global list, so an arbiter-only failure never blocks the provider as implementer or reviewer in later rounds (Gate 14B / RT-01b). Arbiter-scoped failures persist for the rest of the session for the arbiter role, exactly as global failures do.
 
+**Binding arbiter verdicts (Gate 14B.4.4 / RT-03):** the engine reads only the anchored, validated `VERDICT:` field of a successfully accepted judge response (never narration, handoff text, stdout, or comments) and resets the per-invocation verdict state before each arbitration, so a failed or unavailable judge can never reuse an earlier verdict. Verdicts are binding: `BLOCKED` stops the run in the arbitration round with `BLOCKED` (exit `3`); if a workspace-integrity condition has failed, it prevails over the verdict and the run ends as `VERIFY_FAILING` (exit `2`) instead. `REQUEST_REVISION` and `ACCEPT_CODEX` register a persistent pending obligation (with its origin round and the arbitrated-round reviewer) that lives in orchestrator state — never in the trimmable handoff. A later `VERIFIED`/`CLOSE` does not close consensus while the obligation is pending: release requires a post-arbitration implementer turn that is no longer an echo of the arbitrated dispute, or an independent re-review from a reviewer identity distinct from the arbitrated one; otherwise the round is rejected as an *unresolved judge obligation* and the run ends `MAX_ROUNDS` (exit `1`) if rounds are exhausted. `ACCEPT_CLAUDE` is processed, not auto-consensus: the reviewer objection is withdrawn by arbitration and any later consensus still requires the existing workspace safety controls (with no extra objective verification when no workspace changes occurred).
+
 Final states:
 
 ```text
@@ -113,7 +115,7 @@ CONSENSUS | BLOCKED | VERIFY_FAILING | CLAUDE_ERROR | CODEX_ERROR | NO_INDEPENDE
 | `0` | `CONSENSUS`: the loop reached independently-verified agreement |
 | `1` | `MAX_ROUNDS`, or an unmapped internal state |
 | `2` | `VERIFY_FAILING`: ground truth failed, or the workspace changed without objective verification |
-| `3` | `BLOCKED`: round-1 reviewer reported BLOCKED |
+| `3` | `BLOCKED`: the reviewer reported BLOCKED, or the arbiter issued a binding `BLOCKED` verdict with clean workspace integrity (Gate 14B.4.4) |
 | `4` | `CLAUDE_ERROR`: implementer (and fallbacks) failed or were protocol-invalid |
 | `5` | `CODEX_ERROR`: reviewer (and fallbacks) failed or were protocol-invalid |
 | `6` | `NO_INDEPENDENT_REVIEWER`: no distinct reviewer provider exists for this round |
