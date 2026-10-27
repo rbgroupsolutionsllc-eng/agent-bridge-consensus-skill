@@ -1668,6 +1668,115 @@ else
   case_fail rt03d1_engine_reverify_cannot_release "re-verify forzado verde sin delta del implementador no libera: rc=1 (obligación conservada)" "$RUN_RC" "" "$tmp_root/rt03x-d1.full"
 fi
 
+# ══ Gate 14B.4.4 / RT03-F10, F11 — desacuerdo ignorado y árbitro indisponible ══
+#  F10  implementador DISAGREE/REVISE/BLOCKED + revisor VERIFIED/COMPLETE cerraba CONSENSUS.
+#  F11  una disputa no arbitrada (árbitro indisponible/inválido) se perdía al cambiar de ronda.
+printf 'STATUS: BLOCKED\nCHANGED: none\nEVIDENCE: impl blocked\nNEXT: none\nHANDOFF: rt03-f10-impl-blocked\n' > "$tmp_root/rt03-f10-impl-blocked.txt"
+printf 'STATUS: REVISE\nCHANGED: none\nEVIDENCE: impl revise\nNEXT: none\nHANDOFF: rt03-f10-impl-revise\n' > "$tmp_root/rt03-f10-impl-revise.txt"
+printf 'STATUS: COMPLETE\nCHANGED: none\nEVIDENCE: rev complete\nNEXT: none\nHANDOFF: rt03-f10-rev-complete\n' > "$tmp_root/rt03-f10-rev-complete.txt"
+
+rt03f10_case() { # <nombre> <archivo-implementador> <archivo-revisor> <esperado: reject|consensus>
+  rt03x_ws "$1"
+  ( unset AGENT_BRIDGE_VERIFY_CMD
+    export MOCK_CLAUDE_FILE="$2" MOCK_CODEX_FILE="$3"
+    rt03x_run "$1" "$tmp_root/workspace/$1" 2 )
+  RUN_RC="$(cat "$tmp_root/$1.rc")"
+  if [[ "$4" == "reject" ]]; then
+    [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/$1.full" \
+      && ! grep -q "Done: CONSENSUS" "$tmp_root/$1.full" && grep -q "consensus REJECTED: implementer disagreement unresolved" "$tmp_root/$1.full"
+  else
+    [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/$1.full"
+  fi
+}
+for st in disagree:rt01a-impl-claude blocked:rt03-f10-impl-blocked revise:rt03-f10-impl-revise; do
+  nm="${st%%:*}"; fl="${st##*:}"
+  if rt03f10_case "rt03x-f10-$nm" "$tmp_root/$fl.txt" "$tmp_root/c1r.txt" reject; then
+    case_pass "rt03f10_impl_${nm}_reviewer_verified_cannot_close"
+  else
+    case_fail "rt03f10_impl_${nm}_reviewer_verified_cannot_close" "implementador $nm + revisor VERIFIED sin resolución: rc=1 MAX_ROUNDS (RED: rc=0 CONSENSUS)" "$RUN_RC" "" "$tmp_root/rt03x-f10-$nm.full"
+  fi
+done
+if rt03f10_case rt03x-f10-rev-complete "$tmp_root/rt01a-impl-claude.txt" "$tmp_root/rt03-f10-rev-complete.txt" reject; then
+  case_pass rt03f10_impl_disagree_reviewer_complete_cannot_close
+else
+  case_fail rt03f10_impl_disagree_reviewer_complete_cannot_close "implementador DISAGREE + revisor COMPLETE: rc=1 (RED: rc=0)" "$RUN_RC" "" "$tmp_root/rt03x-f10-rev-complete.full"
+fi
+# Contraste: estados compatibles siguen cerrando consenso.
+if rt03f10_case rt03x-f10-ok-proposed "$tmp_root/c1c.txt" "$tmp_root/c1r.txt" consensus \
+   && rt03f10_case rt03x-f10-ok-complete "$tmp_root/rt03-impl-revision.txt" "$tmp_root/c1r.txt" consensus; then
+  case_pass rt03f10_compatible_statuses_still_reach_consensus
+else
+  case_fail rt03f10_compatible_statuses_still_reach_consensus "PROPOSED/COMPLETE + VERIFIED siguen cerrando CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/rt03x-f10-ok-proposed.full"
+fi
+# Precedencia: ground truth fallido + implementador BLOCKED + revisor VERIFIED → VERIFY_FAILING rc=2 (no rc=1/3).
+rt03x_ws rt03x-f10-vf
+( export MOCK_WS="$tmp_root/workspace/rt03x-f10-vf" MOCK_CLAUDE_EFFECT=write AGENT_BRIDGE_VERIFY_CMD=false \
+    MOCK_CLAUDE_FILE="$tmp_root/rt03-f10-impl-blocked.txt" MOCK_CODEX_FILE="$tmp_root/c1r.txt"
+  rt03x_run rt03x-f10-vf "$tmp_root/workspace/rt03x-f10-vf" 2 )
+RUN_RC="$(cat "$tmp_root/rt03x-f10-vf.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03x-f10-vf.full" && ! grep -q "Done: BLOCKED" "$tmp_root/rt03x-f10-vf.full"; then
+  case_pass rt03f10_verify_failing_precedes_impl_blocked
+else
+  case_fail rt03f10_verify_failing_precedes_impl_blocked "VERIFY_FAILING rc=2 prevalece sobre implementador BLOCKED" "$RUN_RC" "" "$tmp_root/rt03x-f10-vf.full"
+fi
+
+# F11: r1 disputa (C DISAGREE, X DISAGREE) con TODOS los árbitros indisponibles; r2 implementador PROPOSED
+# + revisor VERIFIED. La disputa no arbitrada no puede desaparecer: sin resolución acreditada → rc=1.
+printf 'not a protocol block\n' > "$tmp_root/rt03-f11-judge-garbage.txt"
+rt03f11_case() { # <nombre> <historial> [env extra via exports del llamador]
+  rt03x_ws "$1"
+  ( export MOCK_CLAUDE_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_COUNT_FILE="$tmp_root/$1-ac" \
+      MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/$1-xd" \
+      MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-f11-judge-garbage.txt"
+    rm -f "$tmp_root/$1-ac" "$tmp_root/$1-xd"
+    unset AGENT_BRIDGE_VERIFY_CMD
+    [[ -n "${F11_VERIFY:-}" ]] && export AGENT_BRIDGE_VERIFY_CMD="$F11_VERIFY" MOCK_WS="$tmp_root/workspace/$1" MOCK_CLAUDE_EFFECT=write MOCK_CLAUDE_FIX_FROM=2
+    export AGENT_BRIDGE_HISTORY_TURNS_OVERRIDE="$2"
+    ( cd /tmp; export AGENT_BRIDGE_HISTORY_TURNS="$2" AGENT_BRIDGE_HOME="$tmp_root/bridge-$1"
+      bash "$engine" "$tmp_root/workspace/$1" "RT03x: $1" 3 > "$tmp_root/$1.full" 2>&1; echo $? > "$tmp_root/$1.rc" ) )
+  RUN_RC="$(cat "$tmp_root/$1.rc")"
+}
+for h in 3 1; do
+  rt03f11_case "rt03x-f11-h$h" "$h"
+  if [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03x-f11-h$h.full" \
+     && grep -q "unarbitrated dispute registered as pending obligation (round 1)" "$tmp_root/rt03x-f11-h$h.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f11-h$h.full" \
+     && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: UNARBITRATED, round 1)" "$tmp_root/rt03x-f11-h$h.full"; then
+    case_pass "rt03f11_unarbitrated_dispute_persists_history_$h"
+  else
+    case_fail "rt03f11_unarbitrated_dispute_persists_history_$h" "disputa no arbitrada (juez indisponible r1) sobrevive a r2/r3 (historial=$h): rc=1 (RED: rc=0 CONSENSUS)" "$RUN_RC" "" "$tmp_root/rt03x-f11-h$h.full"
+  fi
+done
+# Positivo (no bloqueo permanente): ancla objetiva — verify rojo en la disputa y verde tras la reparación del implementador.
+F11_VERIFY='test -f fixed.txt' rt03f11_case rt03x-f11-anchor 3
+if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f11-anchor.full" \
+   && grep -q "judge obligation released (VERDICT: UNARBITRATED" "$tmp_root/rt03x-f11-anchor.full"; then
+  case_pass rt03f11_unarbitrated_released_by_objective_anchor
+else
+  case_fail rt03f11_unarbitrated_released_by_objective_anchor "disputa no arbitrada con ancla verify rojo→verde tras delta del implementador libera: CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/rt03x-f11-anchor.full"
+fi
+
+# F10-D1: el ACCEPT_CLAUDE de r1 resolvió el DISAGREE de r1; un BLOCKED/REVISE NUEVO del implementador en r2
+# (con revisor VERIFIED) no queda cubierto por esa resolución → no cierra CONSENSUS.
+for st in blocked:rt03-f10-impl-blocked revise:rt03-f10-impl-revise; do
+  nm="${st%%:*}"; fl="${st##*:}"
+  rt03x_ws "rt03x-f10d1-$nm"
+  ( unset AGENT_BRIDGE_VERIFY_CMD
+    export MOCK_CLAUDE_FILE="$tmp_root/$fl.txt" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03x-f10d1-$nm-ac" \
+      MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/rt03x-f10d1-$nm-xd" \
+      MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt"
+    rm -f "$tmp_root/rt03x-f10d1-$nm-ac" "$tmp_root/rt03x-f10d1-$nm-xd"
+    rt03x_run "rt03x-f10d1-$nm" "$tmp_root/workspace/rt03x-f10d1-$nm" 2 )
+  RUN_RC="$(cat "$tmp_root/rt03x-f10d1-$nm.rc")"
+  if [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03x-f10d1-$nm.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f10d1-$nm.full" \
+     && grep -q "judge verdict processed (round 1): ACCEPT_CLAUDE" "$tmp_root/rt03x-f10d1-$nm.full" \
+     && grep -q "consensus REJECTED: implementer disagreement unresolved (STATUS: ${nm^^})" "$tmp_root/rt03x-f10d1-$nm.full"; then
+    case_pass "rt03f10_stale_resolution_does_not_cover_new_${nm}"
+  else
+    case_fail "rt03f10_stale_resolution_does_not_cover_new_${nm}" "ACCEPT_CLAUDE de r1 no cubre un ${nm^^} nuevo en r2: rc=1 (RED: rc=0)" "$RUN_RC" "" "$tmp_root/rt03x-f10d1-$nm.full"
+  fi
+done
+
 if [[ $ok_count -eq $total ]]; then
   echo "redteam-gate14b: ok ($ok_count casos; id -u = $(id -u)${skip_count:+, $skip_count omitidos por privilegio})"
   exit 0

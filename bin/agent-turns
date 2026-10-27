@@ -846,6 +846,7 @@ process_judge_verdict() {
       # La objeción del revisor queda retirada POR el arbitraje; sin
       # obligación. El consenso posterior exige la revisión independiente
       # post-arbitraje más los controles de seguridad del workspace.
+      _g14b_dispute_resolved="$claude_status"   # resolución acotada al estado arbitrado
       # Un arbitraje independiente posterior ACCEPT_CLAUDE (validado, anclado en
       # su artefacto round-N-judge.out.md) SUSTITUYE explícitamente la obligación
       # previa. Nunca neutraliza la integridad: el consenso posterior sigue
@@ -901,6 +902,10 @@ _g14b_judge_obligation=""
 _g14b_judge_obligation_round=""
 _g14b_judge_obligation_last_round=""
 _g14b_judge_obligation_anchor=""
+# F10: un ACCEPT_CLAUDE válido es la resolución acreditada del desacuerdo del
+# implementador; se anula al abrirse una nueva disputa. Sin él, un implementador
+# fuera de {PROPOSED,VERIFIED,COMPLETE} bloquea el cierre de consenso.
+_g14b_dispute_resolved=""   # estado del implementador que un ACCEPT_CLAUDE resolvió (no cubre otro estado)
 
 for ((round=1; round<=rounds; round++)); do
   _g14b_verify_ran_round=0
@@ -1043,6 +1048,13 @@ for ((round=1; round<=rounds; round++)); do
     break
   fi
 
+  _g14b_impl_compatible=0
+  case "$claude_status" in PROPOSED|VERIFIED|COMPLETE) _g14b_impl_compatible=1 ;; esac
+  # F10: la resolución arbitral solo cubre el estado que el árbitro resolvió; un
+  # desacuerdo distinto (p. ej. BLOCKED/REVISE nuevo) vuelve a bloquear el cierre.
+  _g14b_dispute_covered=0
+  if [[ -n "$_g14b_dispute_resolved" && "$claude_status" == "$_g14b_dispute_resolved" ]]; then _g14b_dispute_covered=1; fi
+
   # F8: un fallo de ground truth pendiente se re-verifica UNA vez antes de
   # evaluar un cierre (VERIFIED/COMPLETE/BLOCKED) si esta ronda no corrió verify:
   # un verify posterior exitoso lo borra; si sigue fallando, persiste.
@@ -1087,7 +1099,8 @@ for ((round=1; round<=rounds; round++)); do
         # (NONE/vacía/no numérica) la obligación se conserva: solo un
         # arbitraje posterior ACCEPT_CLAUDE la sustituye (process_judge_verdict).
         _g14b_obligation_released=0
-        if [[ "$_g14b_judge_obligation_anchor" == "VERIFY_FAILING" \
+        if [[ "$_g14b_impl_compatible" -eq 1 || "$_g14b_dispute_covered" -eq 1 ]] \
+           && [[ "$_g14b_judge_obligation_anchor" == "VERIFY_FAILING" \
               && "$_g14b_judge_obligation_last_round" =~ ^[0-9]+$ \
               && "$_g14b_verify_pass_round" =~ ^[0-9]+$ \
               && "$_g14b_verify_pass_round" -gt "$_g14b_judge_obligation_last_round" ]]; then
@@ -1105,6 +1118,9 @@ for ((round=1; round<=rounds; round++)); do
           echo "  consensus REJECTED: unresolved judge obligation (VERDICT: $_g14b_judge_obligation, round $_g14b_judge_obligation_round)"
           # Sin break: una ronda posterior puede acreditar la resolución.
         fi
+      elif [[ "$_g14b_impl_compatible" -eq 0 && "$_g14b_dispute_covered" -eq 0 ]]; then
+        # F10: el revisor conforme no anula el desacuerdo del implementador.
+        echo "  consensus REJECTED: implementer disagreement unresolved (STATUS: ${claude_status:-?}); no arbitration resolved it"
       else
         final_state="CONSENSUS"
         break
@@ -1123,6 +1139,7 @@ for ((round=1; round<=rounds; round++)); do
     DISAGREE)
       if [[ "$claude_status" == "DISAGREE" || "$claude_status" == "REVISE" ]]; then
         _g14b_judge_independence_failed=0
+        _g14b_dispute_resolved=""                                     # F10: nueva disputa abierta
         call_judge "$round"
         # Gate 14B.4.2: sin árbitro independiente no se continúa silenciosamente
         # hacia un posible consenso posterior; corte explícito de la ronda.
@@ -1132,6 +1149,17 @@ for ((round=1; round<=rounds; round++)); do
         fi
         # Gate 14B.4.4 (RT-03): con árbitro independiente, su veredicto
         # VALIDADO gobierna la transición (nunca texto del handoff/stdout).
+        # F11: disputa no arbitrada (árbitros indisponibles/inválidos, sin ser
+        # NO_INDEPENDENT_JUDGE). Se registra como obligación del motor (fuera del
+        # handoff recortable) con el mismo ancla y liberación que el resto; un
+        # juez caído nunca deshace una obligación previa.
+        if [[ -z "$_g14b_judge_current_verdict" && -z "$_g14b_judge_obligation" ]]; then
+          _g14b_judge_obligation="UNARBITRATED"
+          _g14b_judge_obligation_round="$round"
+          _g14b_judge_obligation_last_round="$round"
+          if [[ "$verify_failed_pending" -eq 1 ]]; then _g14b_judge_obligation_anchor="VERIFY_FAILING"; else _g14b_judge_obligation_anchor="NONE"; fi
+          echo "  unarbitrated dispute registered as pending obligation (round $round)"
+        fi
         if [[ -n "$_g14b_judge_current_verdict" ]]; then
           process_judge_verdict "$round"
           if [[ "$_g14b_judge_current_verdict" == "BLOCKED" ]]; then
