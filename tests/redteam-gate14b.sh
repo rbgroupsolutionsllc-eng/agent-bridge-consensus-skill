@@ -818,6 +818,9 @@ NEXT: none
 HANDOFF: rt03-rev-codex-disputa-r2
 RT03REV
 rt03_judge_escalations() { grep -c 'escalating to OpenCode judge' "${1:-}" 2>/dev/null || true; }
+# Directorio de artefactos de la corrida (línea 'Artifacts:' del motor; libre
+# de trim_handoff: los round-*.out.md no se recortan).
+rt03_artifacts() { awk '/^Artifacts: / {print $2}' "${1:-}" 2>/dev/null | tail -1; }
 
 # ── Caso 27 (rt03_judge_blocked_halt): VERDICT: BLOCKED del árbitro. Ronda 1
 # termina en disputa arbitada; el veredicto BLOQUEA. Contraste esperado
@@ -852,13 +855,28 @@ else
   case_fail rt03_judge_blocked_halt "VERDICT BLOCKED debe impedir rondas posteriores y terminar bloqueado rc=3, 1 escalación (RED: veredicto ignorado, 2 rondas, esc=$esc_t1)" "$rcT1" "" "$tmp_root/rt03-1.full"
 fi
 
-# ── Caso 28 (rt03_judge_request_revision_forces_verifiable_review):
+# ── Caso 28 (rt03_judge_request_revision_forces_verifiable_review) — ENDURECIDO:
 # VERDICT: REQUEST_REVISION r1 exige una revisión verificable ANTES de aceptar
-# consenso. r2: claude SIN revisar (de nuevo DISAGREE), codex VERIFIED sin
-# haber corrido verificación objetiva (sin AGENT_BRIDGE_VERIFY_CMD, ws sin
-# delta). GREEN esperado: la objeción requirida impide el consenso automático
-# (NOT CONSensus rc=0); RED (motor actual): consenso en r2 rc=0 pese a que el
-# árbitro exigió revisión y ninguna ocurrió.
+# consenso. Contrato determinista (GREEN pendiente):
+#  C1 Árbitro ejecutó su rol: hit-file + artefacto round-1 con VERDICT anclado.
+#  C2 Codex respondió VERIFIED en r2: artefacto anclado + contador de
+#     invocaciones >= 2 (registro inequívoco del orquestador).
+#  C3 La objeción no fue modificada ni resuelta verificablemente: claude r2
+#     sigue DISAGREE (eco, sin revisión), sin delta de ws, sin verificación
+#     objetiva (0 líneas 'verify:'), ws sin cambios.
+#  C4 Consenso NO aceptado con transición determinista y evidencia en stdout
+#     (inmune a trim_handoff) del arbitraje PROCESADO y la obligación
+#     PENDIENTE:
+#       'judge verdict processed (round 1): REQUEST_REVISION'
+#       'consensus REJECTED: unresolved judge obligation (VERDICT: REQUEST_REVISION, round 1)'
+#     Estado final determinista MAX_ROUNDS rc=1. Ningún otro rc≠0 constituye
+#     éxito; la sola ausencia de CONSENSUS tampoco.
+#  Liberación legítima de la obligación (contrato; prueba positiva de guardia
+#  en fase GREEN): en una ronda R > 1 el implementador entrega una revisión
+#  real que responde la objeción (ya no el DISAGREE eco del r1), el revisor
+#  independiente emite VERIFIED en esa ronda y la verificación objetiva
+#  correspondiente corre con éxito (o no hay delta por verificar). Solo
+#  entonces el consenso es legítimo.
 rm -rf "$tmp_root/workspace/rt03-ws2" "$tmp_root/hit-oc-judge-28" "$tmp_root/hit-agy-judge-28" "$tmp_root/rt03-28-xd-count"
 mkdir -p "$tmp_root/workspace/rt03-ws2"
 ( cd /tmp
@@ -874,22 +892,42 @@ mkdir -p "$tmp_root/workspace/rt03-ws2"
 )
 rcT2="$(cat "$tmp_root/rt03-2.rc")"
 oc_hit_t2=0; [[ -f "$tmp_root/hit-oc-judge-28" ]] && oc_hit_t2=1
+rt_run_2="$(rt03_artifacts "$tmp_root/rt03-2.full")"
+xd_count_2="$(cat "$tmp_root/rt03-28-xd-count" 2>/dev/null || echo 0)"
+verify_runs_2="$(grep -c '^  verify: exit=' "$tmp_root/rt03-2.full" 2>/dev/null; true)"
 if [[ "$oc_hit_t2" -ne 1 ]]; then
   case_fail rt03_judge_request_revision_forces_verifiable_review "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT2" "oc_hit=$oc_hit_t2" "$tmp_root/rt03-2.full"
-elif [[ "$rcT2" -ne 0 ]] && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-2.full" \
-     && grep -q "JUDGE VERDICT (round 1): VERDICT: REQUEST_REVISION" "$tmp_root/rt03-2.full" \
-     && grep -q "=== Round 2:" "$tmp_root/rt03-2.full"; then
+elif [[ "$rcT2" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03-2.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-2.full" \
+     && grep -q "judge verdict processed (round 1): REQUEST_REVISION" "$tmp_root/rt03-2.full" \
+     && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: REQUEST_REVISION, round 1)" "$tmp_root/rt03-2.full" \
+     && grep -q "=== Round 2:" "$tmp_root/rt03-2.full" \
+     && [[ -f "$rt_run_2/round-1-judge.out.md" ]] && grep -q '^VERDICT: REQUEST_REVISION$' "$rt_run_2/round-1-judge.out.md" \
+     && grep -q '^STATUS: VERIFIED$' "$rt_run_2/round-2-codex.out.md" 2>/dev/null \
+     && grep -q '^STATUS: DISAGREE$' "$rt_run_2/round-2-claude.out.md" 2>/dev/null \
+     && [[ "$verify_runs_2" == "0" ]] \
+     && ! grep -q "workspace changed" "$tmp_root/rt03-2.full" \
+     && [[ "$xd_count_2" -ge 2 ]]; then
   case_pass rt03_judge_request_revision_forces_verifiable_review
 else
-  case_fail rt03_judge_request_revision_forces_verifiable_review "REQUEST_REVISION exige revisión verificable antes de aceptar consenso (RED: consenso automático rc=0 sin revisión)" "$rcT2" "" "$tmp_root/rt03-2.full"
+  case_fail rt03_judge_request_revision_forces_verifiable_review "REQUEST_REVISION exige revisión verificable antes de aceptar consenso: rc determinista 1 + arbitraje procesado + obligación pendiente en stdout (RED: consenso automático rc=0 sin revisión ni procesamiento)" "$rcT2" "run=$rt_run_2" "$tmp_root/rt03-2.full"
 fi
 
-# ── Caso 29 (rt03_judge_accept_codex_deterministic_resolution):
+# ── Caso 29 (rt03_judge_accept_codex_deterministic_resolution) — ENDURECIDO:
 # VERDICT: ACCEPT_CODEX r1 = la objeción del revisor UPHELD de forma
-# determinista. r2: claude SIN revisar (DISAGREE), codex VERIFIED sin verificación objetiva.
-# GREEN esperado: objeción persistente en vigor no puede evitarse CONSENSUS sin
-# resolución registrada (NOT rc=0). RED (motor actual): consenso rc=0 pese a
-# veredicto determinista contradictorio.
+# determinista (misma columna exigente del 28):
+#  C1/C2 Árbitro válido r1 + codex VERIFIED en r2 (artefacto + contador).
+#  C3 La objeción upheld queda SIN resolución verificable: claude r2 sigue
+#     DISAGREE, sin ws delta, sin verificación objetiva.
+#  C4 Consenso NO aceptado con evidencia determinista en stdout:
+#       'judge verdict processed (round 1): ACCEPT_CODEX'
+#       'consensus REJECTED: unresolved judge obligation (VERDICT: ACCEPT_CODEX, round 1)'
+#     Estado final determinista MAX_ROUNDS rc=1; otro rc≠0 o la ausencia
+#     simple de CONSENSUS no constituye éxito.
+#  Liberación legítima (contrato): en una ronda R > 1 el implementador
+#  responde la objeción de codex con revisión real, el revisor independiente
+#  emite VERIFIED en esa ronda y los controles aplicables (verify de cualquier
+#  delta) corren con éxito → recién entonces el consenso es legítimo.
 rm -rf "$tmp_root/workspace/rt03-ws3" "$tmp_root/hit-oc-judge-29" "$tmp_root/hit-agy-judge-29" "$tmp_root/rt03-29-xd-count"
 mkdir -p "$tmp_root/workspace/rt03-ws3"
 ( cd /tmp
@@ -905,21 +943,46 @@ mkdir -p "$tmp_root/workspace/rt03-ws3"
 )
 rcT3="$(cat "$tmp_root/rt03-3.rc")"
 oc_hit_t3=0; [[ -f "$tmp_root/hit-oc-judge-29" ]] && oc_hit_t3=1
+rt_run_3="$(rt03_artifacts "$tmp_root/rt03-3.full")"
+xd_count_3="$(cat "$tmp_root/rt03-29-xd-count" 2>/dev/null || echo 0)"
+verify_runs_3="$(grep -c '^  verify: exit=' "$tmp_root/rt03-3.full" 2>/dev/null; true)"
 if [[ "$oc_hit_t3" -ne 1 ]]; then
   case_fail rt03_judge_accept_codex_deterministic_resolution "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT3" "oc_hit=$oc_hit_t3" "$tmp_root/rt03-3.full"
-elif [[ "$rcT3" -ne 0 ]] && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-3.full" \
-     && grep -q "JUDGE VERDICT (round 1): VERDICT: ACCEPT_CODEX" "$tmp_root/rt03-3.full" \
-     && grep -q "=== Round 2:" "$tmp_root/rt03-3.full"; then
+elif [[ "$rcT3" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03-3.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-3.full" \
+     && grep -q "judge verdict processed (round 1): ACCEPT_CODEX" "$tmp_root/rt03-3.full" \
+     && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: ACCEPT_CODEX, round 1)" "$tmp_root/rt03-3.full" \
+     && grep -q "=== Round 2:" "$tmp_root/rt03-3.full" \
+     && [[ -f "$rt_run_3/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_CODEX$' "$rt_run_3/round-1-judge.out.md" \
+     && grep -q '^STATUS: VERIFIED$' "$rt_run_3/round-2-codex.out.md" 2>/dev/null \
+     && grep -q '^STATUS: DISAGREE$' "$rt_run_3/round-2-claude.out.md" 2>/dev/null \
+     && [[ "$verify_runs_3" == "0" ]] \
+     && ! grep -q "workspace changed" "$tmp_root/rt03-3.full" \
+     && [[ "$xd_count_3" -ge 2 ]]; then
   case_pass rt03_judge_accept_codex_deterministic_resolution
 else
-  case_fail rt03_judge_accept_codex_deterministic_resolution "ACCEPT_CODEX: objeción del revisor upheld → sin consenso automático sin resolución determinista (RED: rc=0 sin revisión)" "$rcT3" "" "$tmp_root/rt03-3.full"
+  case_fail rt03_judge_accept_codex_deterministic_resolution "ACCEPT_CODEX upheld: objeción persistente bloquea consenso hasta resolución determinista (RED: rc=0 sin procesamiento ni resolución)" "$rcT3" "run=$rt_run_3" "$tmp_root/rt03-3.full"
 fi
 
-# ── Caso 30 (rt03_judge_accept_claude_requires_independent_verify):
-# VERDICT: ACCEPT_CLAUDE r1 = decisión reconocida. GREEN esperado: consenso con
-# revisión independiente VERIFIED requiere además verificación objetiva; con
-# AGENT_BRIDGE_VERIFY_CMD unset y sin delta la corrida NO llega a consenso
-# automático. RED (motor actual): consenso rc=0 en r2 sin verificación alguna.
+# ── Caso 30 (rt03_judge_accept_claude_processed_transition) — ENDURECIDO:
+# Contrato explícito de transición para ACCEPT_CLAUDE (GREEN pendiente):
+#  T1 Arbitraje válido: hit-file + artefacto round-1 con VERDICT anclado
+#     ACCEPT_CLAUDE (validado por el motor antes de emitirlo).
+#  T2 La decisión fue PROCESADA, no solo registrada: registro anclado en
+#     stdout (inmune a trim_handoff):
+#       'judge verdict processed (round 1): ACCEPT_CLAUDE'
+#  T3 Transición: la objeción del revisor queda cerrada POR EL ARBITRAJE;
+#     el consenso posterior es legítimo únicamente cuando la revisión
+#     independiente post-arbitraje quedó registrada por el orquestador
+#     ('Round 2 - Reviewer (codex)' + artefacto VERIFIED de r2) y los
+#     controles de seguridad aplicables se satisfacen: sin delta del ws no
+#     hay verificación pendiente (VERIFY_CMD NO es obligatorio cuando el ws
+#     no cambió — suposición previa eliminada).
+#  T4 Resultado determinista GREEN: CONSENSUS rc=0, UNA sola escalación del
+#     árbitro, NINGUNA línea de obligación pendiente y NINGUNA verificación
+#     correl (no hubo delta).
+#  RED (motor actual): rc=0 idéntico pero SIN el registro de procesamiento de
+#  T2 → el caso falla por el defecto real (el veredicto se emitió y se ignoró).
 rm -rf "$tmp_root/workspace/rt03-ws4" "$tmp_root/hit-oc-judge-30" "$tmp_root/hit-agy-judge-30" "$tmp_root/rt03-30-xd-count"
 mkdir -p "$tmp_root/workspace/rt03-ws4"
 ( cd /tmp
@@ -930,19 +993,65 @@ mkdir -p "$tmp_root/workspace/rt03-ws4"
     MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-30" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-30" \
     AGENT_BRIDGE_HISTORY_TURNS=3 \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-4"
-  bash "$engine" "$tmp_root/workspace/rt03-ws4" "RT-03: ACCEPT_CLAUDE exige verificación objetiva" 2 > "$tmp_root/rt03-4.full" 2>&1
+  bash "$engine" "$tmp_root/workspace/rt03-ws4" "RT-03: ACCEPT_CLAUDE proceso determinista" 2 > "$tmp_root/rt03-4.full" 2>&1
   echo $? > "$tmp_root/rt03-4.rc"
 )
 rcT4="$(cat "$tmp_root/rt03-4.rc")"
 oc_hit_t4=0; [[ -f "$tmp_root/hit-oc-judge-30" ]] && oc_hit_t4=1
+rt_run_4="$(rt03_artifacts "$tmp_root/rt03-4.full")"
+xd_count_4="$(cat "$tmp_root/rt03-30-xd-count" 2>/dev/null || echo 0)"
+esc_t4="$(rt03_judge_escalations "$tmp_root/rt03-4.full")"
 if [[ "$oc_hit_t4" -ne 1 ]]; then
-  case_fail rt03_judge_accept_claude_requires_independent_verify "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT4" "oc_hit=$oc_hit_t4" "$tmp_root/rt03-4.full"
-elif [[ "$rcT4" -ne 0 ]] && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-4.full" \
-     && grep -q "JUDGE VERDICT (round 1): VERDICT: ACCEPT_CLAUDE" "$tmp_root/rt03-4.full" \
-     && grep -q "=== Round 2:" "$tmp_root/rt03-4.full"; then
-  case_pass rt03_judge_accept_claude_requires_independent_verify
+  case_fail rt03_judge_accept_claude_processed_transition "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT4" "oc_hit=$oc_hit_t4" "$tmp_root/rt03-4.full"
+elif [[ "$rcT4" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-4.full" \
+     && grep -q "judge verdict processed (round 1): ACCEPT_CLAUDE" "$tmp_root/rt03-4.full" \
+     && ! grep -q "consensus REJECTED: unresolved judge obligation" "$tmp_root/rt03-4.full" \
+     && grep -q "Round 2 - Reviewer (codex)" "$tmp_root/rt03-4.full" \
+     && [[ -f "$rt_run_4/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_CLAUDE$' "$rt_run_4/round-1-judge.out.md" \
+     && grep -q '^STATUS: VERIFIED$' "$rt_run_4/round-2-codex.out.md" 2>/dev/null \
+     && grep -q "=== Round 2:" "$tmp_root/rt03-4.full" \
+     && [[ "$esc_t4" -eq 1 ]] \
+     && [[ "$(grep -c '^  verify: exit=' "$tmp_root/rt03-4.full" 2>/dev/null; true)" == "0" ]] \
+     && ! grep -q "workspace changed" "$tmp_root/rt03-4.full" \
+     && [[ "$xd_count_4" -ge 2 ]]; then
+  case_pass rt03_judge_accept_claude_processed_transition
 else
-  case_fail rt03_judge_accept_claude_requires_independent_verify "ACCEPT_CLAUDE sin revisión independiente y verificación requerida no permite consenso automático (RED: rc=0)" "$rcT4" "" "$tmp_root/rt03-4.full"
+  case_fail rt03_judge_accept_claude_processed_transition "ACCEPT_CLAUDE: decisión procesada (registro stdout determinista) + consenso posterior legítimo solo con revisión independiente post-arbitraje (RED: procesamiento ausente aunque rc=0)" "$rcT4" "run=$rt_run_4" "$tmp_root/rt03-4.full"
+fi
+
+# ── Caso 31 (rt03_accept_claude_never_bypasses_safety) — GUARDA del contrato
+# del caso 30: ACCEPT_CLAUDE no puentea los controles de workspace.
+# r1 disputa + árbitro ACCEPT_CLAUDE; claude escribe en el ws REAL (r1 y r2);
+# r2 codex VERIFIED sin VERIFY_CMD. Transición esperada: el delta real no
+# verificado DOMINA cualquier decisión arbitral → rechazo objetivo
+# determinista VERIFY_FAILING rc=2 con la línea anclada
+# 'consensus REJECTED: workspace changed without objective verification'.
+# Válido antes y después del GREEN (no depende de notas recortadas).
+rm -rf "$tmp_root/workspace/rt03-ws5" "$tmp_root/hit-oc-judge-31" "$tmp_root/hit-agy-judge-31" "$tmp_root/rt03-31-xd-count"
+mkdir -p "$tmp_root/workspace/rt03-ws5"
+( cd /tmp
+  export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
+    MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-31-xd-count" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt" \
+    MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-31" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-31" \
+    MOCK_WS="$tmp_root/workspace/rt03-ws5" MOCK_CLAUDE_EFFECT=write \
+    AGENT_BRIDGE_HISTORY_TURNS=3 \
+    AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-5"
+  bash "$engine" "$tmp_root/workspace/rt03-ws5" "RT-03: ACCEPT_CLAUDE no puentea controles de ws" 2 > "$tmp_root/rt03-5.full" 2>&1
+  echo $? > "$tmp_root/rt03-5.rc"
+)
+rcT5="$(cat "$tmp_root/rt03-5.rc")"
+oc_hit_t5=0; [[ -f "$tmp_root/hit-oc-judge-31" ]] && oc_hit_t5=1
+if [[ "$oc_hit_t5" -ne 1 ]]; then
+  case_fail rt03_accept_claude_never_bypasses_safety "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT5" "oc_hit=$oc_hit_t5" "$tmp_root/rt03-5.full"
+elif [[ "$rcT5" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03-5.full" \
+     && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-5.full" \
+     && grep -q "consensus REJECTED: workspace changed without objective verification" "$tmp_root/rt03-5.full" \
+     && grep -q "=== Round 2:" "$tmp_root/rt03-5.full"; then
+  case_pass rt03_accept_claude_never_bypasses_safety
+else
+  case_fail rt03_accept_claude_never_bypasses_safety "ACCEPT_CLAUDE no puede puentear delta real no verificado: rc=2 VERIFY_FAILING con rechazo objetivo (valido pre y post GREEN)" "$rcT5" "" "$tmp_root/rt03-5.full"
 fi
 
 if [[ $ok_count -eq $total ]]; then
