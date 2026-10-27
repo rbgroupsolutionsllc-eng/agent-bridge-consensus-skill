@@ -1815,6 +1815,40 @@ else
   case_fail rt03f12_legitimate_revision_after_arbitration_closes "revisión posterior legítima (COMPLETE) + revisor VERIFIED cierra CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/rt03x-f12-rev.full"
 fi
 
+# ══ RT03-F12 (cierre) — response_id(): solo un protocolo VÁLIDO produce identidad ══
+# Se extraen del motor las funciones reales (extract_block, validate_turn_protocol, response_id) y se
+# ejercitan de forma aislada: respuesta ausente/vacía/ilegible/inválida → identidad VACÍA (nunca la huella
+# del texto de respaldo de extract_block), de modo que dos respuestas ausentes jamás coinciden.
+rt03_fn() { awk -v n="$1" '$0 ~ "^"n"\\(\\) \\{" {f=1} f {print} f && /^}/ {exit}' "$engine"; }
+{ echo 'set -u; fallback_chars=2000'
+  echo "_valid_status_re='^(PROPOSED|VERIFIED|DISAGREE|REVISE|BLOCKED|COMPLETE)\$'"
+  rt03_fn extract_block; rt03_fn validate_turn_protocol; rt03_fn response_id
+} > "$tmp_root/rt03-f12-fns.sh"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: a\nNEXT: none\nHANDOFF: A\n' > "$tmp_root/rt03-rid-valid-a.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: b\nNEXT: none\nHANDOFF: B\n' > "$tmp_root/rt03-rid-valid-b.txt"
+cp "$tmp_root/rt03-rid-valid-a.txt" "$tmp_root/rt03-rid-valid-a2.txt"
+: > "$tmp_root/rt03-rid-empty.txt"
+printf 'narración libre sin protocolo\n' > "$tmp_root/rt03-rid-invalid1.txt"
+printf 'otra narración distinta\n' > "$tmp_root/rt03-rid-invalid2.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nNEXT: none\nHANDOFF: x\nlinea ajena al protocolo\n' > "$tmp_root/rt03-rid-narration.txt"
+printf 'STATUS: MAYBE\nCHANGED: none\nNEXT: none\nHANDOFF: x\n' > "$tmp_root/rt03-rid-badstatus.txt"
+rid() { ( source "$tmp_root/rt03-f12-fns.sh"; response_id "$1" ); }
+rid_missing1="$(rid "$tmp_root/no-existe-1.txt")"; rid_missing2="$(rid "$tmp_root/no-existe-2.txt")"
+rid_empty="$(rid "$tmp_root/rt03-rid-empty.txt")"; rid_inv1="$(rid "$tmp_root/rt03-rid-invalid1.txt")"
+rid_inv2="$(rid "$tmp_root/rt03-rid-invalid2.txt")"; rid_nar="$(rid "$tmp_root/rt03-rid-narration.txt")"
+rid_bad="$(rid "$tmp_root/rt03-rid-badstatus.txt")"
+rid_a="$(rid "$tmp_root/rt03-rid-valid-a.txt")"; rid_a2="$(rid "$tmp_root/rt03-rid-valid-a2.txt")"; rid_b="$(rid "$tmp_root/rt03-rid-valid-b.txt")"
+if [[ -z "$rid_missing1" && -z "$rid_missing2" && -z "$rid_empty" && -z "$rid_inv1" && -z "$rid_inv2" && -z "$rid_nar" && -z "$rid_bad" ]]; then
+  case_pass rt03f12_response_id_empty_for_absent_or_invalid
+else
+  case_fail rt03f12_response_id_empty_for_absent_or_invalid "ausente/vacía/inválida → identidad vacía (RED: huella del texto de respaldo; ausentes coinciden)" "-" "missing=${rid_missing1:0:8}/${rid_missing2:0:8} empty=${rid_empty:0:8} inv=${rid_inv1:0:8} nar=${rid_nar:0:8} bad=${rid_bad:0:8}" ""
+fi
+if [[ -n "$rid_a" && "$rid_a" == "$rid_a2" && "$rid_a" != "$rid_b" && -n "$rid_b" ]]; then
+  case_pass rt03f12_response_id_distinguishes_valid_disputes
+else
+  case_fail rt03f12_response_id_distinguishes_valid_disputes "protocolo válido: A==A idéntica, A!=B, ambas no vacías" "-" "a=${rid_a:0:8} a2=${rid_a2:0:8} b=${rid_b:0:8}" ""
+fi
+
 if [[ $ok_count -eq $total ]]; then
   echo "redteam-gate14b: ok ($ok_count casos; id -u = $(id -u)${skip_count:+, $skip_count omitidos por privilegio})"
   exit 0

@@ -262,15 +262,22 @@ extract_block() {
   fi
 }
 
-# F12: huella de la respuesta concreta de un agente (bloque de protocolo
-# STATUS/CHANGED/EVIDENCE/NEXT/HANDOFF). Vacía si no se puede calcular → una
-# resolución nunca se considera aplicable (fail-closed).
+# F12: huella de la respuesta concreta de un agente. SOLO se calcula sobre un
+# protocolo válido (validate_turn_protocol): una respuesta ausente, ilegible,
+# vacía o inválida produce identidad VACÍA — nunca la huella del texto de
+# respaldo de extract_block — de modo que jamás coincide con otra ni cubre una
+# disputa. Vacía también si no hay herramienta de hash (fail-closed).
 response_id() {
+  local file="$1" block
+  [[ -r "$file" ]] && validate_turn_protocol "$file" || return 0
+  block="$(grep -E '^(STATUS|CHANGED|EVIDENCE|NEXT|HANDOFF):' "$file" 2>/dev/null)" || return 0
+  [[ -n "$block" ]] || return 0
   if command -v sha256sum >/dev/null 2>&1; then
-    extract_block "$1" 2>/dev/null | sha256sum 2>/dev/null | awk 'NF{print $1}' || true
+    printf '%s\n' "$block" | sha256sum 2>/dev/null | awk 'NF{print $1}' || true
   elif command -v shasum >/dev/null 2>&1; then
-    extract_block "$1" 2>/dev/null | shasum -a 256 2>/dev/null | awk 'NF{print $1}' || true
+    printf '%s\n' "$block" | shasum -a 256 2>/dev/null | awk 'NF{print $1}' || true
   fi
+  return 0
 }
 
 synth_block() {
