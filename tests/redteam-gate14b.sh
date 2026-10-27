@@ -1777,6 +1777,44 @@ for st in blocked:rt03-f10-impl-blocked revise:rt03-f10-impl-revise; do
   fi
 done
 
+# ══ Gate 14B.4.4 / RT03-F12 — la resolución arbitral se vincula a la disputa concreta, no al STATUS ══
+# r1: DISAGREE(A) + revisor DISAGREE → árbitro ACCEPT_CLAUDE (resuelve la disputa de r1).
+# r2: el implementador responde DISAGREE con OTRO contenido (EVIDENCE/HANDOFF distintos) y el revisor VERIFIED:
+#     misma etiqueta STATUS, disputa diferente → la decisión de r1 no se reutiliza.
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rt03-f12 segunda disputa distinta\nNEXT: none\nHANDOFF: rt03-f12-disputa-B\n' > "$tmp_root/rt03-f12-impl-B.txt"
+rt03f12_case() { # <nombre> <archivo-implementador-desde-r2>
+  rt03x_ws "$1"
+  ( unset AGENT_BRIDGE_VERIFY_CMD
+    export MOCK_CLAUDE_FILE="$2" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_COUNT_FILE="$tmp_root/$1-ac" \
+      MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/$1-xd" \
+      MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt"
+    rm -f "$tmp_root/$1-ac" "$tmp_root/$1-xd"
+    rt03x_run "$1" "$tmp_root/workspace/$1" 2 )
+  RUN_RC="$(cat "$tmp_root/$1.rc")"
+}
+rt03f12_case rt03x-f12 "$tmp_root/rt03-f12-impl-B.txt"
+if [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03x-f12.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f12.full" \
+   && grep -q "judge verdict processed (round 1): ACCEPT_CLAUDE" "$tmp_root/rt03x-f12.full" \
+   && grep -q "consensus REJECTED: implementer disagreement unresolved (STATUS: DISAGREE)" "$tmp_root/rt03x-f12.full"; then
+  case_pass rt03f12_same_status_different_dispute_not_covered
+else
+  case_fail rt03f12_same_status_different_dispute_not_covered "ACCEPT_CLAUDE de la disputa A no cubre una disputa B con el mismo STATUS: rc=1 (RED: rc=0 CONSENSUS)" "$RUN_RC" "" "$tmp_root/rt03x-f12.full"
+fi
+# Guarda positiva 1: el MISMO objeto arbitrado (eco idéntico de la disputa resuelta) sigue cubierto.
+rt03f12_case rt03x-f12-same "$tmp_root/rt01a-impl-claude.txt"
+if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f12-same.full"; then
+  case_pass rt03f12_same_arbitrated_dispute_remains_covered
+else
+  case_fail rt03f12_same_arbitrated_dispute_remains_covered "la misma disputa arbitrada (respuesta idéntica) + revisor VERIFIED cierra CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/rt03x-f12-same.full"
+fi
+# Guarda positiva 2: revisión legítima posterior de la misma disputa (el implementador entrega COMPLETE) cierra.
+rt03f12_case rt03x-f12-rev "$tmp_root/rt03-impl-revision.txt"
+if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f12-rev.full"; then
+  case_pass rt03f12_legitimate_revision_after_arbitration_closes
+else
+  case_fail rt03f12_legitimate_revision_after_arbitration_closes "revisión posterior legítima (COMPLETE) + revisor VERIFIED cierra CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/rt03x-f12-rev.full"
+fi
+
 if [[ $ok_count -eq $total ]]; then
   echo "redteam-gate14b: ok ($ok_count casos; id -u = $(id -u)${skip_count:+, $skip_count omitidos por privilegio})"
   exit 0

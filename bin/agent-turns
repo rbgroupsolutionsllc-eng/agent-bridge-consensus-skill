@@ -262,6 +262,17 @@ extract_block() {
   fi
 }
 
+# F12: huella de la respuesta concreta de un agente (bloque de protocolo
+# STATUS/CHANGED/EVIDENCE/NEXT/HANDOFF). Vacía si no se puede calcular → una
+# resolución nunca se considera aplicable (fail-closed).
+response_id() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    extract_block "$1" 2>/dev/null | sha256sum 2>/dev/null | awk 'NF{print $1}' || true
+  elif command -v shasum >/dev/null 2>&1; then
+    extract_block "$1" 2>/dev/null | shasum -a 256 2>/dev/null | awk 'NF{print $1}' || true
+  fi
+}
+
 synth_block() {
   cat > "$1" <<EOF
 STATUS: BLOCKED
@@ -846,7 +857,11 @@ process_judge_verdict() {
       # La objeción del revisor queda retirada POR el arbitraje; sin
       # obligación. El consenso posterior exige la revisión independiente
       # post-arbitraje más los controles de seguridad del workspace.
-      _g14b_dispute_resolved="$claude_status"   # resolución acotada al estado arbitrado
+      # F12: la resolución se vincula a la respuesta CONCRETA arbitrada (huella
+      # del bloque del implementador), no solo a su STATUS.
+      _g14b_dispute_resolved="$claude_status"
+      _g14b_dispute_resolved_id="$(response_id "$c_out")"
+      _g14b_dispute_resolved_round="$round"
       # Un arbitraje independiente posterior ACCEPT_CLAUDE (validado, anclado en
       # su artefacto round-N-judge.out.md) SUSTITUYE explícitamente la obligación
       # previa. Nunca neutraliza la integridad: el consenso posterior sigue
@@ -906,6 +921,8 @@ _g14b_judge_obligation_anchor=""
 # implementador; se anula al abrirse una nueva disputa. Sin él, un implementador
 # fuera de {PROPOSED,VERIFIED,COMPLETE} bloquea el cierre de consenso.
 _g14b_dispute_resolved=""   # estado del implementador que un ACCEPT_CLAUDE resolvió (no cubre otro estado)
+_g14b_dispute_resolved_round=""
+_g14b_dispute_resolved_id="" # huella de la respuesta arbitrada (F12): otra respuesta no reutiliza la decisión
 
 for ((round=1; round<=rounds; round++)); do
   _g14b_verify_ran_round=0
@@ -1053,7 +1070,9 @@ for ((round=1; round<=rounds; round++)); do
   # F10: la resolución arbitral solo cubre el estado que el árbitro resolvió; un
   # desacuerdo distinto (p. ej. BLOCKED/REVISE nuevo) vuelve a bloquear el cierre.
   _g14b_dispute_covered=0
-  if [[ -n "$_g14b_dispute_resolved" && "$claude_status" == "$_g14b_dispute_resolved" ]]; then _g14b_dispute_covered=1; fi
+  if [[ -n "$_g14b_dispute_resolved" && "$claude_status" == "$_g14b_dispute_resolved" && -n "$_g14b_dispute_resolved_id" \
+        && "$_g14b_dispute_resolved_round" =~ ^[0-9]+$ && "$round" -eq $((_g14b_dispute_resolved_round + 1)) \
+        && "$(response_id "$c_out")" == "$_g14b_dispute_resolved_id" ]]; then _g14b_dispute_covered=1; fi
 
   # F8: un fallo de ground truth pendiente se re-verifica UNA vez antes de
   # evaluar un cierre (VERIFIED/COMPLETE/BLOCKED) si esta ronda no corrió verify:
@@ -1140,6 +1159,8 @@ for ((round=1; round<=rounds; round++)); do
       if [[ "$claude_status" == "DISAGREE" || "$claude_status" == "REVISE" ]]; then
         _g14b_judge_independence_failed=0
         _g14b_dispute_resolved=""                                     # F10: nueva disputa abierta
+        _g14b_dispute_resolved_id=""
+        _g14b_dispute_resolved_round=""
         call_judge "$round"
         # Gate 14B.4.2: sin árbitro independiente no se continúa silenciosamente
         # hacia un posible consenso posterior; corte explícito de la ronda.
