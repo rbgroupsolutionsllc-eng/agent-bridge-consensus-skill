@@ -1031,17 +1031,19 @@ if [[ "$plan_phase" -eq 1 ]]; then
     echo "  plan STATUS: $(get_status "$p_out")"
   fi
   _g14b_post_plan="$(ws_snapshot)"
-  if [[ "$plan_abort" -eq 0 ]]; then
-    if ! ws_snapshot_ok "$_g14b_pre_plan" || ! ws_snapshot_ok "$_g14b_post_plan"; then
-      ws_detection_reliable=0
-    elif [[ "$_g14b_post_plan" != "$_g14b_pre_plan" ]]; then
-      ws_role_violation_run=1
-      push_note "ROLE VIOLATION (plan): Claude is read-only during planning but the workspace changed"
-      echo "  role violation: Claude modified the workspace during planning"
-      final_state="VERIFY_FAILING"; plan_abort=1
-    elif [[ "$(get_status "$p_out")" == "BLOCKED" ]]; then
-      final_state="BLOCKED"; plan_abort=1
-    fi
+  # La integridad se comprueba SIEMPRE tras intentar PLAN (también si el
+  # proveedor falló o devolvió protocolo inválido): la violación de rol tiene
+  # prioridad sobre PLANNER_ERROR.
+  if ! ws_snapshot_ok "$_g14b_pre_plan" || ! ws_snapshot_ok "$_g14b_post_plan"; then
+    ws_detection_reliable=0
+  elif [[ "$_g14b_post_plan" != "$_g14b_pre_plan" ]]; then
+    ws_role_violation_run=1
+    push_note "ROLE VIOLATION (plan): Claude is read-only during planning but the workspace changed"
+    echo "  role violation: Claude modified the workspace during planning"
+    final_state="VERIFY_FAILING"; plan_abort=1
+  fi
+  if [[ "$plan_abort" -eq 0 && "$(get_status "$p_out")" == "BLOCKED" ]]; then
+    final_state="BLOCKED"; plan_abort=1
   fi
   claude_session_id=""   # el auditor NO reanuda la sesión del planificador
 fi

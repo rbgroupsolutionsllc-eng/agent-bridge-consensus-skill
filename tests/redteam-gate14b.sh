@@ -32,9 +32,9 @@ case "$_body" in
 esac
 [[ -n "${MOCK_ROLE_LOG:-}" ]] && printf 'claude:%s\n' "$_role" >> "$MOCK_ROLE_LOG"
 [[ -n "${MOCK_ARGS_LOG:-}" ]] && printf 'claude:%s:%s\n' "$_role" "$*" >> "$MOCK_ARGS_LOG"
+[[ "$_role" == "planner" && -n "${MOCK_CLAUDE_PLAN_WRITE:-}" && -n "${MOCK_WS:-}" ]] && echo "plan-edit" > "$MOCK_WS/plan-sneaky.txt"
 [[ -n "${MOCK_CLAUDE_FAIL_ROLE:-}" && "$_role" == "$MOCK_CLAUDE_FAIL_ROLE" ]] && exit 1
 if [[ "$_role" == "planner" ]]; then
-  [[ -n "${MOCK_CLAUDE_PLAN_WRITE:-}" && -n "${MOCK_WS:-}" ]] && echo "plan-edit" > "$MOCK_WS/plan-sneaky.txt"
   _pf="$(mktemp)"; printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: plan-evidence\nNEXT: implement per plan\nHANDOFF: roles-plan-marker\n' > "$_pf"
   [[ -n "${MOCK_CLAUDE_PLAN_FILE:-}" ]] && cp "$MOCK_CLAUDE_PLAN_FILE" "$_pf"
   _pj=0; _q=""; for a in "$@"; do [[ "$_q" == "--output-format" && "$a" == "json" ]] && _pj=1; _q="$a"; done
@@ -1941,6 +1941,26 @@ if [[ "$RUN_RC" -eq 9 ]] && grep -q "Done: PLANNER_ERROR" "$tmp_root/roles-v4.fu
   case_pass roles_v2_planner_failure_fails_closed
 else
   case_fail roles_v2_planner_failure_fails_closed "planificador caído → PLANNER_ERROR rc=9 sin turno del implementador" "$RUN_RC" "" "$tmp_root/roles-v4.full"
+fi
+
+# V4b/V4c: PLAN modifica el workspace y LUEGO devuelve protocolo inválido / falla → la violación de rol
+# tiene prioridad sobre PLANNER_ERROR (VERIFY_FAILING rc=2, nunca rc=9).
+printf 'not a protocol block\n' > "$tmp_root/plan-invalid.txt"
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt" MOCK_CLAUDE_PLAN_WRITE=1 MOCK_CLAUDE_PLAN_FILE="$tmp_root/plan-invalid.txt"; rv2_run roles-v4b 2 )
+RUN_RC="$(cat "$tmp_root/roles-v4b.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/roles-v4b.full" && grep -q "role violation: Claude modified the workspace during planning" "$tmp_root/roles-v4b.full" \
+   && ! grep -q "Done: PLANNER_ERROR" "$tmp_root/roles-v4b.full" && ! grep -q "codex" "$tmp_root/roles-v4b.roles"; then
+  case_pass roles_v2_plan_write_then_invalid_protocol_is_role_violation
+else
+  case_fail roles_v2_plan_write_then_invalid_protocol_is_role_violation "PLAN escribe + protocolo inválido → VERIFY_FAILING rc=2 con ROLE VIOLATION" "$RUN_RC" "" "$tmp_root/roles-v4b.full"
+fi
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt" MOCK_CLAUDE_PLAN_WRITE=1 MOCK_CLAUDE_FAIL_ROLE=planner; rv2_run roles-v4c 2 )
+RUN_RC="$(cat "$tmp_root/roles-v4c.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/roles-v4c.full" && grep -q "role violation: Claude modified the workspace during planning" "$tmp_root/roles-v4c.full" \
+   && ! grep -q "Done: PLANNER_ERROR" "$tmp_root/roles-v4c.full" && ! grep -q "codex" "$tmp_root/roles-v4c.roles"; then
+  case_pass roles_v2_plan_write_then_failure_is_role_violation
+else
+  case_fail roles_v2_plan_write_then_failure_is_role_violation "PLAN escribe + falla rc!=0 → VERIFY_FAILING rc=2 con ROLE VIOLATION" "$RUN_RC" "" "$tmp_root/roles-v4c.full"
 fi
 
 # V5: árbitro AGY primero; OpenCode no es consultado cuando AGY responde.
