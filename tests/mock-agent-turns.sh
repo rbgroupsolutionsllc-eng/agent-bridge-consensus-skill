@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Regresión del motor con la disposición histórica de roles (ver AGENT_BRIDGE_ROLES en bin/agent-turns).
+export AGENT_BRIDGE_ROLES=legacy
 
 if ! command -v python3 >/dev/null 2>&1; then
   printf '%s\n' "mock-agent-turns: required dependency not found: python3" >&2
@@ -237,10 +239,10 @@ case "${MOCK_SCENARIO}" in
     printf '  STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
     ;;
   proto_verdict_line)
-    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nVERDICT: ACCEPT_CLAUDE\n'
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nVERDICT: ACCEPT_IMPLEMENTER\n'
     ;;
   judge_clean)
-    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: clean mock judge\nNEXT: apply accepted proposal\nHANDOFF: clean judge verdict issued\nVERDICT: ACCEPT_CLAUDE\n'
+    printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: clean mock judge\nNEXT: apply accepted proposal\nHANDOFF: clean judge verdict issued\nVERDICT: ACCEPT_IMPLEMENTER\n'
     ;;
   judgeproto_*)
     if [[ -n "${MOCK_JUDGE_BODY_OPENCODE:-}" && -f "${MOCK_JUDGE_BODY_OPENCODE:-}" ]]; then
@@ -310,7 +312,7 @@ case "${MOCK_SCENARIO:-}" in
     printf '  STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: mock evidence\nNEXT: none\nHANDOFF: complete\n'
     ;;
   proto_verdict_line)
-    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nVERDICT: ACCEPT_CLAUDE\n'
+    printf 'STATUS: PROPOSED\nCHANGED: none\nNEXT: none\nHANDOFF: done\nVERDICT: ACCEPT_IMPLEMENTER\n'
     ;;
   judge_noise)
     # OpenCode's decoy/noise output is invalid and rejected; agy is the
@@ -538,9 +540,9 @@ assert_contains "$state/stdout.log" "judge: OpenCode unavailable, trying agy"
 # propagates into the next round's prompt.
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: REQUEST_REVISION"
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "HANDOFF: judge says revise"
-# The decoy "ACCEPT_CODEX" narration from OpenCode's rejected output must
+# The decoy "ACCEPT_REVIEWER" narration from OpenCode's rejected output must
 # never surface as a verdict token in the propagated prompt.
-assert_not_contains "$judge_run_dir/round-2-claude.prompt.md" "ACCEPT_CODEX"
+assert_not_contains "$judge_run_dir/round-2-claude.prompt.md" "ACCEPT_REVIEWER"
 
 state="$(MOCK_SCENARIO=verify_fail_gate AGENT_BRIDGE_VERIFY_CMD='exit 1' run_case verify_fail_gate "$repo_dir/bin/agent-turns" "$workspace" "mock verify fail" 2)"
 assert_contains "$state/stdout.log" "consensus REJECTED: verify failing"
@@ -820,13 +822,13 @@ judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
   exit 1
 }
 # The anchored VERDICT line exists verbatim in the judge's own output.
-grep -q '^VERDICT: ACCEPT_CLAUDE$' "$judge_run_dir/round-1-judge.out.md" || {
-  echo "expected anchored VERDICT: ACCEPT_CLAUDE line in judge artifact" >&2
+grep -q '^VERDICT: ACCEPT_IMPLEMENTER$' "$judge_run_dir/round-1-judge.out.md" || {
+  echo "expected anchored VERDICT: ACCEPT_IMPLEMENTER line in judge artifact" >&2
   cat "$judge_run_dir/round-1-judge.out.md" >&2
   exit 1
 }
 # The verdict propagates into the next agent's (round 2 Claude) prompt.
-assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_CLAUDE"
+assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_IMPLEMENTER"
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "clean judge verdict issued"
 
 write_judge_body() {
@@ -863,7 +865,7 @@ run_judge_case() {
 
 # --- RED regression: decoy narration without an anchored VERDICT line must
 # never manufacture a false verdict (this exact case was PROVEN to leak
-# "VERDICT: ACCEPT_CODEX" into the next round's prompt before this fix,
+# "VERDICT: ACCEPT_REVIEWER" into the next round's prompt before this fix,
 # via the pre-fix whole-file token search in judge_summary combined with the
 # pre-fix acceptance check that only required an anchored STATUS: or
 # VERDICT: line ANYWHERE).
@@ -871,7 +873,7 @@ decoy_no_verdict_body="$tmp_root/judgeproto-decoy-no-verdict.md"
 write_judge_body "$decoy_no_verdict_body" \
   'STATUS: VERIFIED' \
   'CHANGED: none' \
-  'EVIDENCE: ACCEPT_CODEX was considered but rejected' \
+  'EVIDENCE: ACCEPT_REVIEWER was considered but rejected' \
   'NEXT: none' \
   'HANDOFF: judge reviewed both proposals'
 state="$(run_judge_case decoy_narration_no_verdict "$decoy_no_verdict_body" "")"
@@ -885,7 +887,7 @@ assert_contains "$state/stderr.log" "provider unavailable for arbitration this s
 }
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
 assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
-assert_not_contains "$judge_run_dir/handoff.md" "ACCEPT_CODEX"
+assert_not_contains "$judge_run_dir/handoff.md" "ACCEPT_REVIEWER"
 
 # --- Incomplete protocol shapes must all be rejected ---------------------
 judge_status_only_body="$tmp_root/judgeproto-status-only.md"
@@ -896,7 +898,7 @@ assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
 assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
 
 judge_verdict_only_body="$tmp_root/judgeproto-verdict-only.md"
-write_judge_body "$judge_verdict_only_body" 'VERDICT: ACCEPT_CLAUDE'
+write_judge_body "$judge_verdict_only_body" 'VERDICT: ACCEPT_IMPLEMENTER'
 state="$(run_judge_case verdict_only "$judge_verdict_only_body" "")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
@@ -942,7 +944,7 @@ assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
 
 # --- Extended/trailing-content verdict lines rejected ---------------------
 extended_idx=0
-for bad_line in "VERDICT: ACCEPT_CLAUDE extra" "VERDICT: ACCEPT_CLAUDE:" "VERDICT: ACCEPT_CLAUDE REQUEST_REVISION"; do
+for bad_line in "VERDICT: ACCEPT_IMPLEMENTER extra" "VERDICT: ACCEPT_IMPLEMENTER:" "VERDICT: ACCEPT_IMPLEMENTER REQUEST_REVISION"; do
   extended_idx=$((extended_idx + 1))
   body="$tmp_root/judgeproto-extended-$extended_idx.md"
   write_judge_body "$body" 'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' "$bad_line"
@@ -956,7 +958,7 @@ done
 judge_dup_verdict_body="$tmp_root/judgeproto-dup-verdict.md"
 write_judge_body "$judge_dup_verdict_body" \
   'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' \
-  'VERDICT: ACCEPT_CLAUDE' 'VERDICT: ACCEPT_CODEX'
+  'VERDICT: ACCEPT_IMPLEMENTER' 'VERDICT: ACCEPT_REVIEWER'
 state="$(run_judge_case duplicate_verdict "$judge_dup_verdict_body" "")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
@@ -966,28 +968,28 @@ assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
 judge_decoy_evidence_body="$tmp_root/judgeproto-decoy-evidence.md"
 write_judge_body "$judge_decoy_evidence_body" \
   'STATUS: VERIFIED' 'CHANGED: none' \
-  'EVIDENCE: ACCEPT_CODEX appeared in a prior proposal' \
+  'EVIDENCE: ACCEPT_REVIEWER appeared in a prior proposal' \
   'NEXT: none' 'HANDOFF: done'
 state="$(run_judge_case decoy_in_evidence "$judge_decoy_evidence_body" "")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
 assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
-assert_not_contains "$judge_run_dir/handoff.md" "ACCEPT_CODEX"
+assert_not_contains "$judge_run_dir/handoff.md" "ACCEPT_REVIEWER"
 
 # --- Decoy token in HANDOFF (no VERDICT line) rejected ---------------------
 judge_decoy_handoff_body="$tmp_root/judgeproto-decoy-handoff.md"
 write_judge_body "$judge_decoy_handoff_body" \
   'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' \
-  'HANDOFF: do not use ACCEPT_CLAUDE yet'
+  'HANDOFF: do not use ACCEPT_IMPLEMENTER yet'
 state="$(run_judge_case decoy_in_handoff "$judge_decoy_handoff_body" "")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
 assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
-assert_not_contains "$judge_run_dir/handoff.md" "VERDICT: ACCEPT_CLAUDE"
+assert_not_contains "$judge_run_dir/handoff.md" "VERDICT: ACCEPT_IMPLEMENTER"
 
 # --- Malformed key spellings rejected --------------------------------------
 malformed_idx=0
-for bad_key_line in "XVERDICT: ACCEPT_CLAUDE" "VERDICT : ACCEPT_CLAUDE" " VERDICT: ACCEPT_CLAUDE" "VERDICTX: ACCEPT_CLAUDE"; do
+for bad_key_line in "XVERDICT: ACCEPT_IMPLEMENTER" "VERDICT : ACCEPT_IMPLEMENTER" " VERDICT: ACCEPT_IMPLEMENTER" "VERDICTX: ACCEPT_IMPLEMENTER"; do
   malformed_idx=$((malformed_idx + 1))
   body="$tmp_root/judgeproto-malformed-key-$malformed_idx.md"
   write_judge_body "$body" 'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' "$bad_key_line"
@@ -1001,7 +1003,7 @@ done
 judge_unknown_line_body="$tmp_root/judgeproto-unknown-line.md"
 write_judge_body "$judge_unknown_line_body" \
   'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' \
-  'VERDICT: ACCEPT_CLAUDE' 'NOTE: extra explanation'
+  'VERDICT: ACCEPT_IMPLEMENTER' 'NOTE: extra explanation'
 state="$(run_judge_case unknown_line "$judge_unknown_line_body" "")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
@@ -1011,7 +1013,7 @@ assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
 judge_fence_body="$tmp_root/judgeproto-fence.md"
 write_judge_body "$judge_fence_body" \
   '```' 'STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' \
-  'VERDICT: ACCEPT_CLAUDE' '```'
+  'VERDICT: ACCEPT_IMPLEMENTER' '```'
 state="$(run_judge_case markdown_fence "$judge_fence_body" "")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
@@ -1021,7 +1023,7 @@ assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
 judge_dup_status_body="$tmp_root/judgeproto-dup-status.md"
 write_judge_body "$judge_dup_status_body" \
   'STATUS: VERIFIED' 'STATUS: BLOCKED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' \
-  'VERDICT: ACCEPT_CLAUDE'
+  'VERDICT: ACCEPT_IMPLEMENTER'
 state="$(run_judge_case duplicate_status "$judge_dup_status_body" "")"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$judge_run_dir/handoff.md" "JUDGE UNAVAILABLE"
@@ -1031,7 +1033,7 @@ assert_not_contains "$judge_run_dir/handoff.md" "JUDGE VERDICT"
 missing_idx=0
 for field in STATUS CHANGED NEXT HANDOFF VERDICT; do
   missing_idx=$((missing_idx + 1))
-  declare -a full_lines=('STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' 'VERDICT: ACCEPT_CLAUDE')
+  declare -a full_lines=('STATUS: VERIFIED' 'CHANGED: none' 'NEXT: none' 'HANDOFF: done' 'VERDICT: ACCEPT_IMPLEMENTER')
   declare -a filtered=()
   for l in "${full_lines[@]}"; do
     [[ "$l" == "$field:"* ]] && continue
@@ -1046,7 +1048,7 @@ for field in STATUS CHANGED NEXT HANDOFF VERDICT; do
 done
 
 # --- Each allowed verdict individually accepted, correct verdict extracted
-for verdict in ACCEPT_CLAUDE ACCEPT_CODEX REQUEST_REVISION BLOCKED; do
+for verdict in ACCEPT_IMPLEMENTER ACCEPT_REVIEWER REQUEST_REVISION BLOCKED; do
   body="$tmp_root/judgeproto-valid-$verdict.md"
   write_judge_body "$body" \
     'STATUS: VERIFIED' 'CHANGED: none' 'EVIDENCE: reviewed both proposals' \
@@ -1075,26 +1077,26 @@ done
 decoy_plus_real_body="$tmp_root/judgeproto-decoy-plus-real.md"
 write_judge_body "$decoy_plus_real_body" \
   'STATUS: VERIFIED' 'CHANGED: none' \
-  'EVIDENCE: ACCEPT_CODEX was discussed but not selected' \
+  'EVIDENCE: ACCEPT_REVIEWER was discussed but not selected' \
   'NEXT: none' 'HANDOFF: only the anchored verdict counts' \
   'VERDICT: REQUEST_REVISION'
 state="$(run_judge_case decoy_plus_real_verdict "$decoy_plus_real_body" "" 2)"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: REQUEST_REVISION"
-assert_not_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_CODEX"
+assert_not_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_REVIEWER"
 
 # --- OpenCode judge invalid, agy judge valid: agy's verdict propagates,
 # OpenCode's malformed output contributes nothing.
 agy_valid_body="$tmp_root/judgeproto-agy-valid.md"
 write_judge_body "$agy_valid_body" \
   'STATUS: VERIFIED' 'CHANGED: none' 'EVIDENCE: agy independent judge review' \
-  'NEXT: none' 'HANDOFF: agy fallback judge verdict' 'VERDICT: ACCEPT_CODEX'
+  'NEXT: none' 'HANDOFF: agy fallback judge verdict' 'VERDICT: ACCEPT_REVIEWER'
 state="$(run_judge_case opencode_invalid_then_agy_valid "$judge_status_only_body" "$agy_valid_body" 2)"
 judge_run_dir="$(awk '/^Artifacts: / { print $2 }' "$state/stdout.log")"
 # Gate 14B.4.3 (RT-01b): fallo en rol árbitro → estado árbitro, no global.
 assert_contains "$state/stderr.log" "provider unavailable for arbitration this session: opencode"
 assert_contains "$state/stdout.log" "judge: OpenCode unavailable, trying agy"
-assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_CODEX"
+assert_contains "$judge_run_dir/round-2-claude.prompt.md" "VERDICT: ACCEPT_REVIEWER"
 assert_contains "$judge_run_dir/round-2-claude.prompt.md" "agy fallback judge verdict"
 opencode_calls="$(cat "$state/opencode-count" 2>/dev/null || echo 0)"
 agy_calls="$(cat "$state/agy-count" 2>/dev/null || echo 0)"
@@ -1629,7 +1631,7 @@ n=0; [[ -f "$TEST_COUNT_FILE" ]] && n="$(cat "$TEST_COUNT_FILE")"
 echo $((n + 1)) > "$TEST_COUNT_FILE"
 HOME="$case_home" bash "$repo_dir/bin/install-local" >/dev/null 2>&1
 test -e "$case_home/.config/opencode/AGENTS.md" || { echo "AGENTS.md not created" >&2; exit 1; }
-assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team: Claude (implementer), Codex (reviewer), OpenCode (judge + 1st fallback), agy (2nd fallback)."
+assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team: Claude (planner + independent auditor, read-only), Codex (implementer), agy (primary judge), OpenCode (alternate judge + 1st fallback)."
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 last_byte=$(tail -c1 "$case_home/.config/opencode/AGENTS.md" | od -An -tx1 | tr -d ' \n')
@@ -1651,7 +1653,7 @@ count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENT
 # CASE 3 — MANAGED SECTION AT FIRST LINE THROUGH EOF
 case_home="$(run_installer_case first_line_eof content $'## Agent Bridge Consensus\n\nOLD FIRST-LINE CONTENT')"
 assert_not_contains "$case_home/.config/opencode/AGENTS.md" "OLD FIRST-LINE CONTENT"
-assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team: Claude (implementer), Codex (reviewer), OpenCode (judge + 1st fallback), agy (2nd fallback)."
+assert_contains "$case_home/.config/opencode/AGENTS.md" "You are part of a 4-agent team: Claude (planner + independent auditor, read-only), Codex (implementer), agy (primary judge), OpenCode (alternate judge + 1st fallback)."
 count=$(grep -c '^## Agent Bridge Consensus$' "$case_home/.config/opencode/AGENTS.md" || true)
 [[ "$count" == "1" ]] || { echo "expected 1 managed heading, got $count" >&2; exit 1; }
 

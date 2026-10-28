@@ -9,10 +9,14 @@ Use this skill to run or participate in a local Claude/Codex/OpenCode/Antigravit
 
 ## Default Roles
 
-- Claude: first implementer or planner.
-- Codex: reviewer, verifier, and second implementer.
-- OpenCode: third-party judge and first automatic fallback. Default model: `opencode-go/minimax-m3`.
-- `agy` (Antigravity terminal CLI): second automatic fallback and judge fallback. Default model: `Gemini 3.5 Flash (Medium)`.
+Default profile `AGENT_BRIDGE_ROLES=v2`:
+
+- Claude: initial planner (PLAN, once, before round 1) and independent auditor of the implementation (AUDIT, every round). Claude is read-only in both roles: any workspace change by Claude is a role violation and ends the run `VERIFY_FAILING`.
+- Codex: primary implementer.
+- `agy` (Antigravity terminal CLI): primary third-party judge. Default model: `Gemini 3.5 Flash (Medium)`.
+- OpenCode: alternate judge, only if `agy` is unavailable or excluded for independence; also first automatic fallback for implementer/auditor. Default model: `opencode-go/minimax-m3`.
+
+`AGENT_BRIDGE_ROLES=legacy` keeps the historical arrangement (Claude implements, Codex reviews, OpenCode judges) for regression only.
 
 Any agent that fails (rate limit, timeout, error) is marked unavailable for the session and skipped automatically. No operator intervention needed.
 
@@ -60,7 +64,7 @@ If the ground-truth command fails, the orchestrator rejects `VERIFIED` or `COMPL
 
 Round guidance:
 
-- `1`: Claude works, Codex reviews.
+- `1`: Claude plans, Codex implements, Claude audits.
 - `2`: enough for most fixes.
 - `3+`: only for complex tasks or unresolved disagreement.
 
@@ -94,14 +98,14 @@ OpenCode and `agy` both enforce model selection via `--model`. Run `opencode mod
 
 ## Consensus Workflow
 
-1. Let Claude implement or propose.
-2. Let Codex verify.
-3. If Codex verifies, stop.
-4. If Codex disagrees, let Claude revise or defend once.
-5. If disagreement persists, call OpenCode as judge.
-6. After judge verdict, one agent makes the smallest needed change and the other verifies.
-7. If Claude or Codex is unavailable, try OpenCode and then Antigravity automatically.
-8. A provider that already served as implementer this round is excluded from reviewer fallback selection the same round — it can never review its own implementation. If no distinct supported fallback reviewer is configured after excluding the implementer, the run fails closed (`NO_INDEPENDENT_REVIEWER`) instead of declaring consensus. If primary Codex fails and distinct supported fallback reviewer candidates existed but were unavailable or all failed validation or execution, the run fails closed (`CODEX_ERROR`) instead of declaring consensus.
+1. Claude produces the PLAN (read-only). If Claude cannot plan, the run fails closed (`PLANNER_ERROR`).
+2. Codex implements.
+3. Claude audits the implementation independently (read-only).
+4. If the audit verifies and nothing else blocks, stop.
+5. If the auditor disagrees, Codex revises or defends once.
+6. If disagreement persists, call `agy` as judge; OpenCode only if `agy` is unavailable or excluded. Verdicts (contract `abc-verdicts/2`): `ACCEPT_IMPLEMENTER | ACCEPT_REVIEWER | REQUEST_REVISION | BLOCKED`; the old `ACCEPT_CLAUDE`/`ACCEPT_CODEX` are rejected, never reinterpreted.
+7. If Codex or Claude is unavailable for their role, try OpenCode and then Antigravity automatically (never a participant of the same round as judge).
+8. A provider that already served as implementer this round is excluded from reviewer fallback selection the same round — it can never review its own implementation. If no distinct supported fallback reviewer is configured after excluding the implementer, the run fails closed (`NO_INDEPENDENT_REVIEWER`) instead of declaring consensus. If the primary auditor fails and distinct supported fallback reviewer candidates existed but were unavailable or all failed validation or execution, the run fails closed (`CODEX_ERROR`) instead of declaring consensus.
 
 ## Token Budget
 
@@ -111,4 +115,4 @@ OpenCode and `agy` both enforce model selection via `--model`. Run `opencode mod
 
 The orchestrator only propagates the 5 protocol fields from recent turns. Do not paste logs; reference files in the run artifacts directory.
 
-Final states are `CONSENSUS`, `BLOCKED`, `VERIFY_FAILING`, `CLAUDE_ERROR`, `CODEX_ERROR`, `NO_INDEPENDENT_REVIEWER`, and `MAX_ROUNDS`. `NO_INDEPENDENT_REVIEWER` means no distinct supported fallback reviewer is configured after excluding the implementer. `CODEX_ERROR` covers primary Codex failure when distinct supported fallback reviewer candidates existed but were unavailable or all failed validation or execution. Both paths fail closed and neither emits `CONSENSUS`.
+Final states are `CONSENSUS`, `BLOCKED`, `VERIFY_FAILING`, `IMPLEMENTER_ERROR` (`CLAUDE_ERROR` in legacy), `REVIEWER_ERROR` (`CODEX_ERROR` in legacy), `PLANNER_ERROR`, `NO_INDEPENDENT_REVIEWER`, and `MAX_ROUNDS`. `NO_INDEPENDENT_REVIEWER` means no distinct supported fallback reviewer is configured after excluding the implementer. `REVIEWER_ERROR` covers primary auditor failure when distinct supported fallback reviewer candidates existed but were unavailable or all failed validation or execution. Both paths fail closed and neither emits `CONSENSUS`.

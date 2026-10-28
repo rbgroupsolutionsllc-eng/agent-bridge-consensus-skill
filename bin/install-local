@@ -47,13 +47,13 @@ cat >> "$opencode_agents" <<'EOF'
 
 ## Agent Bridge Consensus
 
-You are part of a 4-agent team: Claude (implementer), Codex (reviewer), OpenCode (judge + 1st fallback), agy (2nd fallback).
+You are part of a 4-agent team: Claude (planner + independent auditor, read-only), Codex (implementer), agy (primary judge), OpenCode (alternate judge + 1st fallback).
 
 You may be called in any of these roles — check the "YOU ARE" line in each prompt:
 
-- **Judge** (default when arbitrating): return one verdict — `ACCEPT_CLAUDE | ACCEPT_CODEX | REQUEST_REVISION | BLOCKED` — with one reason.
-- **Fallback implementer** (when Claude is unavailable): make concrete progress toward the goal.
-- **Fallback reviewer** (when Codex is unavailable): independently verify the other agent's claim.
+- **Judge** (agy first; you only when agy is unavailable or excluded): return one verdict — `ACCEPT_IMPLEMENTER | ACCEPT_REVIEWER | REQUEST_REVISION | BLOCKED` (contract abc-verdicts/2; the old `ACCEPT_CLAUDE`/`ACCEPT_CODEX` are invalid) — with one reason.
+- **Fallback implementer** (when Codex is unavailable): make concrete progress toward the goal.
+- **Fallback reviewer/auditor** (when Claude is unavailable): independently verify the implementer's claim.
 
 Compact protocol — always respond with exactly this shape, 12 lines max, no narration:
 

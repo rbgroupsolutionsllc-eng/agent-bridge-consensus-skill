@@ -2,6 +2,10 @@
 # Gate 14B — regresión permanente de los 4 hallazgos CONFIRMED (14A).
 # Solo mocks (claude/codex/opencode/agy falsos). Sin agentes reales ni claves.
 set -uo pipefail
+# Roles: estas suites de regresión RT-01..RT-03 ejercitan el motor con la disposición histórica
+# (Claude implementa, Codex revisa, OpenCode arbitra). La arquitectura por defecto (v2) se prueba
+# en los casos roles_* del final de este archivo, que fijan AGENT_BRIDGE_ROLES=v2 explícitamente.
+export AGENT_BRIDGE_ROLES=legacy
 
 repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 engine="$repo_dir/bin/agent-turns"
@@ -19,7 +23,25 @@ case_skip() { skip_count=$((skip_count+1)); printf 'SKIP %s (requiere id -u != 0
 cat > "$mockbin/claude" <<'EOF'
 #!/usr/bin/env bash
 [[ -n "${MOCK_CLAUDE_FAIL:-}" ]] && exit 1
-if [[ "${MOCK_CLAUDE_EFFECT:-}" == "write" && -n "${MOCK_WS:-}" ]] && { [[ -z "${MOCK_CLAUDE_WRITE_ONCE:-}" ]] || [[ ! -e "$MOCK_CLAUDE_WRITE_ONCE" ]]; }; then
+# Roles v2: el rol se detecta por el prompt (stdin); registro de rol/argumentos para las pruebas roles_*.
+_body="$(cat)"; _role=""
+case "$_body" in
+  *"YOU ARE: planner"*) _role=planner ;;
+  *"YOU ARE: reviewer"*) _role=reviewer ;;
+  *"YOU ARE: implementer"*) _role=implementer ;;
+esac
+[[ -n "${MOCK_ROLE_LOG:-}" ]] && printf 'claude:%s\n' "$_role" >> "$MOCK_ROLE_LOG"
+[[ -n "${MOCK_ARGS_LOG:-}" ]] && printf 'claude:%s:%s\n' "$_role" "$*" >> "$MOCK_ARGS_LOG"
+[[ -n "${MOCK_CLAUDE_FAIL_ROLE:-}" && "$_role" == "$MOCK_CLAUDE_FAIL_ROLE" ]] && exit 1
+if [[ "$_role" == "planner" ]]; then
+  [[ -n "${MOCK_CLAUDE_PLAN_WRITE:-}" && -n "${MOCK_WS:-}" ]] && echo "plan-edit" > "$MOCK_WS/plan-sneaky.txt"
+  _pf="$(mktemp)"; printf 'STATUS: PROPOSED\nCHANGED: none\nEVIDENCE: plan-evidence\nNEXT: implement per plan\nHANDOFF: roles-plan-marker\n' > "$_pf"
+  [[ -n "${MOCK_CLAUDE_PLAN_FILE:-}" ]] && cp "$MOCK_CLAUDE_PLAN_FILE" "$_pf"
+  _pj=0; _q=""; for a in "$@"; do [[ "$_q" == "--output-format" && "$a" == "json" ]] && _pj=1; _q="$a"; done
+  if [[ "$_pj" == "1" ]]; then python3 -c 'import sys,json; print(json.dumps({"result": open(sys.argv[1]).read(), "session_id": "plan-sid", "total_cost_usd": 0.0}))' "$_pf"; else cat "$_pf"; fi
+  exit 0
+fi
+if [[ "${MOCK_CLAUDE_EFFECT:-}" == "write" && -n "${MOCK_WS:-}" ]] && { [[ -z "${MOCK_CLAUDE_EFFECT_ROLE:-}" || "$_role" == "$MOCK_CLAUDE_EFFECT_ROLE" ]]; } && { [[ -z "${MOCK_CLAUDE_WRITE_ONCE:-}" ]] || [[ ! -e "$MOCK_CLAUDE_WRITE_ONCE" ]]; }; then
   echo "un-declared-change" > "$MOCK_WS/sneaky.txt"
   [[ -n "${MOCK_CLAUDE_WRITE_ONCE:-}" ]] && : > "$MOCK_CLAUDE_WRITE_ONCE"
 elif [[ "${MOCK_CLAUDE_EFFECT:-}" == "rewrite_same_meta" && -n "${MOCK_WS:-}" ]]; then
@@ -63,6 +85,13 @@ EOF
 cat > "$mockbin/codex" <<'EOF'
 #!/usr/bin/env bash
 [[ -n "${MOCK_CODEX_FAIL:-}" ]] && exit 1
+_body="$(cat)"; _role=""
+case "$_body" in
+  *"YOU ARE: reviewer"*) _role=reviewer ;;
+  *"YOU ARE: implementer"*) _role=implementer ;;
+esac
+[[ -n "${MOCK_ROLE_LOG:-}" ]] && printf 'codex:%s\n' "$_role" >> "$MOCK_ROLE_LOG"
+[[ "${MOCK_CODEX_EFFECT:-}" == "write" && -n "${MOCK_WS:-}" ]] && echo "codex-change" > "$MOCK_WS/codex-sneaky.txt"
 out=""; _p=""
 for a in "$@"; do
   [[ "$_p" == "--output-last-message" ]] && out="$a"
@@ -110,7 +139,7 @@ if [[ "$isjudge" -eq 1 ]]; then
   if [[ -n "${MOCK_OPENCODE_JUDGE_FILE:-}" && -f "$MOCK_OPENCODE_JUDGE_FILE" ]]; then
     cat "$MOCK_OPENCODE_JUDGE_FILE"; exit 0
   fi
-  printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: judge r1\nNEXT: none\nHANDOFF: veredicto viz\nVERDICT: ACCEPT_CLAUDE\n'
+  printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: judge r1\nNEXT: none\nHANDOFF: veredicto viz\nVERDICT: ACCEPT_IMPLEMENTER\n'
   exit 0
 fi
 # Gate 14B.4.1: con MOCK_OPENCODE_COUNT_FILE y sin rol de juez, la 1ª
@@ -415,7 +444,7 @@ printf 'STATUS: VERIFIED\nCHANGED: none\nEVIDENCE: rev r2\nNEXT: none\nHANDOFF: 
 # Gate 14B.4.2: respuesta del árbitro AGY (el efectivo tras la exclusión de
 # OpenCode). Veredicto REQUEST_REVISION, idéntico al default del mock de
 # opencode antes de la corrección → el flujo de rondas queda sin cambios.
-printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: arbiter\nNEXT: none\nHANDOFF: arbiter-agy-marker\nVERDICT: ACCEPT_CLAUDE\n' > "$tmp_root/rt01a-agy-judge.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: arbiter\nNEXT: none\nHANDOFF: arbiter-agy-marker\nVERDICT: ACCEPT_IMPLEMENTER\n' > "$tmp_root/rt01a-agy-judge.txt"
 rm -rf "$tmp_root/workspace/judge-ws" "$tmp_root/judge15-oc-count" "$tmp_root/judge15-xd-count"
 mkdir -p "$tmp_root/workspace/judge-ws"
 ( cd /tmp
@@ -826,7 +855,7 @@ fi
 #   'JUDGE VERDICT (round 1): VERDICT: <V> :: ...' en el log (el veredicto REAL
 #   queda documentado aunque el motor lo ignore).
 # Sepo: derivación de cuerpos de árbitro válidos (validate_judge_protocol).
-for _v in BLOCKED REQUEST_REVISION ACCEPT_CODEX ACCEPT_CLAUDE; do
+for _v in BLOCKED REQUEST_REVISION ACCEPT_REVIEWER ACCEPT_IMPLEMENTER; do
   cat > "$tmp_root/rt03-judge-$_v.txt" <<RT03JUDGE
 STATUS: DISAGREE
 CHANGED: none
@@ -947,14 +976,14 @@ else
 fi
 
 # ── Caso 29 (rt03_judge_accept_codex_deterministic_resolution) — ENDURECIDO:
-# VERDICT: ACCEPT_CODEX r1 = la objeción del revisor UPHELD de forma
+# VERDICT: ACCEPT_REVIEWER r1 = la objeción del revisor UPHELD de forma
 # determinista (misma columna exigente del 28):
 #  C1/C2 Árbitro válido r1 + codex VERIFIED en r2 (artefacto + contador).
 #  C3 La objeción upheld queda SIN resolución verificable: claude r2 sigue
 #     DISAGREE, sin ws delta, sin verificación objetiva.
 #  C4 Consenso NO aceptado con evidencia determinista en stdout:
-#       'judge verdict processed (round 1): ACCEPT_CODEX'
-#       'consensus REJECTED: unresolved judge obligation (VERDICT: ACCEPT_CODEX, round 1)'
+#       'judge verdict processed (round 1): ACCEPT_REVIEWER'
+#       'consensus REJECTED: unresolved judge obligation (VERDICT: ACCEPT_REVIEWER, round 1)'
 #     Estado final determinista MAX_ROUNDS rc=1; otro rc≠0 o la ausencia
 #     simple de CONSENSUS no constituye éxito.
 #  Liberación legítima (contrato): en una ronda R > 1 el implementador
@@ -967,11 +996,11 @@ mkdir -p "$tmp_root/workspace/rt03-ws3"
   export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
     MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
     MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-29-xd-count" \
-    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CODEX.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_REVIEWER.txt" \
     MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-29" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-29" \
     AGENT_BRIDGE_HISTORY_TURNS=3 \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-3"
-  bash "$engine" "$tmp_root/workspace/rt03-ws3" "RT-03: ACCEPT_CODEX resolución determinista" 2 > "$tmp_root/rt03-3.full" 2>&1
+  bash "$engine" "$tmp_root/workspace/rt03-ws3" "RT-03: ACCEPT_REVIEWER resolución determinista" 2 > "$tmp_root/rt03-3.full" 2>&1
   echo $? > "$tmp_root/rt03-3.rc"
 )
 rcT3="$(cat "$tmp_root/rt03-3.rc")"
@@ -983,10 +1012,10 @@ if [[ "$oc_hit_t3" -ne 1 ]]; then
   case_fail rt03_judge_accept_codex_deterministic_resolution "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT3" "oc_hit=$oc_hit_t3" "$tmp_root/rt03-3.full"
 elif [[ "$rcT3" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03-3.full" \
      && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03-3.full" \
-     && grep -q "judge verdict processed (round 1): ACCEPT_CODEX" "$tmp_root/rt03-3.full" \
-     && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: ACCEPT_CODEX, round 1)" "$tmp_root/rt03-3.full" \
+     && grep -q "judge verdict processed (round 1): ACCEPT_REVIEWER" "$tmp_root/rt03-3.full" \
+     && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: ACCEPT_REVIEWER, round 1)" "$tmp_root/rt03-3.full" \
      && grep -q "=== Round 2:" "$tmp_root/rt03-3.full" \
-     && [[ -f "$rt_run_3/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_CODEX$' "$rt_run_3/round-1-judge.out.md" \
+     && [[ -f "$rt_run_3/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_REVIEWER$' "$rt_run_3/round-1-judge.out.md" \
      && grep -q '^STATUS: VERIFIED$' "$rt_run_3/round-2-codex.out.md" 2>/dev/null \
      && grep -q '^STATUS: DISAGREE$' "$rt_run_3/round-2-claude.out.md" 2>/dev/null \
      && [[ "$verify_runs_3" == "0" ]] \
@@ -994,16 +1023,16 @@ elif [[ "$rcT3" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03-3.full" \
      && [[ "$xd_count_3" -ge 2 ]]; then
   case_pass rt03_judge_accept_codex_deterministic_resolution
 else
-  case_fail rt03_judge_accept_codex_deterministic_resolution "ACCEPT_CODEX upheld: objeción persistente bloquea consenso hasta resolución determinista (RED: rc=0 sin procesamiento ni resolución)" "$rcT3" "run=$rt_run_3" "$tmp_root/rt03-3.full"
+  case_fail rt03_judge_accept_codex_deterministic_resolution "ACCEPT_REVIEWER upheld: objeción persistente bloquea consenso hasta resolución determinista (RED: rc=0 sin procesamiento ni resolución)" "$rcT3" "run=$rt_run_3" "$tmp_root/rt03-3.full"
 fi
 
 # ── Caso 30 (rt03_judge_accept_claude_processed_transition) — ENDURECIDO:
-# Contrato explícito de transición para ACCEPT_CLAUDE (GREEN pendiente):
+# Contrato explícito de transición para ACCEPT_IMPLEMENTER (GREEN pendiente):
 #  T1 Arbitraje válido: hit-file + artefacto round-1 con VERDICT anclado
-#     ACCEPT_CLAUDE (validado por el motor antes de emitirlo).
+#     ACCEPT_IMPLEMENTER (validado por el motor antes de emitirlo).
 #  T2 La decisión fue PROCESADA, no solo registrada: registro anclado en
 #     stdout (inmune a trim_handoff):
-#       'judge verdict processed (round 1): ACCEPT_CLAUDE'
+#       'judge verdict processed (round 1): ACCEPT_IMPLEMENTER'
 #  T3 Transición: la objeción del revisor queda cerrada POR EL ARBITRAJE;
 #     el consenso posterior es legítimo únicamente cuando la revisión
 #     independiente post-arbitraje quedó registrada por el orquestador
@@ -1022,11 +1051,11 @@ mkdir -p "$tmp_root/workspace/rt03-ws4"
   export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
     MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
     MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-30-xd-count" \
-    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_IMPLEMENTER.txt" \
     MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-30" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-30" \
     AGENT_BRIDGE_HISTORY_TURNS=3 \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-4"
-  bash "$engine" "$tmp_root/workspace/rt03-ws4" "RT-03: ACCEPT_CLAUDE proceso determinista" 2 > "$tmp_root/rt03-4.full" 2>&1
+  bash "$engine" "$tmp_root/workspace/rt03-ws4" "RT-03: ACCEPT_IMPLEMENTER proceso determinista" 2 > "$tmp_root/rt03-4.full" 2>&1
   echo $? > "$tmp_root/rt03-4.rc"
 )
 rcT4="$(cat "$tmp_root/rt03-4.rc")"
@@ -1037,10 +1066,10 @@ esc_t4="$(rt03_judge_escalations "$tmp_root/rt03-4.full")"
 if [[ "$oc_hit_t4" -ne 1 ]]; then
   case_fail rt03_judge_accept_claude_processed_transition "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT4" "oc_hit=$oc_hit_t4" "$tmp_root/rt03-4.full"
 elif [[ "$rcT4" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-4.full" \
-     && grep -q "judge verdict processed (round 1): ACCEPT_CLAUDE" "$tmp_root/rt03-4.full" \
+     && grep -q "judge verdict processed (round 1): ACCEPT_IMPLEMENTER" "$tmp_root/rt03-4.full" \
      && ! grep -q "consensus REJECTED: unresolved judge obligation" "$tmp_root/rt03-4.full" \
      && grep -q "Round 2 - Reviewer (codex)" "$tmp_root/rt03-4.full" \
-     && [[ -f "$rt_run_4/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_CLAUDE$' "$rt_run_4/round-1-judge.out.md" \
+     && [[ -f "$rt_run_4/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_IMPLEMENTER$' "$rt_run_4/round-1-judge.out.md" \
      && grep -q '^STATUS: VERIFIED$' "$rt_run_4/round-2-codex.out.md" 2>/dev/null \
      && grep -q "=== Round 2:" "$tmp_root/rt03-4.full" \
      && [[ "$esc_t4" -eq 1 ]] \
@@ -1049,12 +1078,12 @@ elif [[ "$rcT4" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-4.full" \
      && [[ "$xd_count_4" -ge 2 ]]; then
   case_pass rt03_judge_accept_claude_processed_transition
 else
-  case_fail rt03_judge_accept_claude_processed_transition "ACCEPT_CLAUDE: decisión procesada (registro stdout determinista) + consenso posterior legítimo solo con revisión independiente post-arbitraje (RED: procesamiento ausente aunque rc=0)" "$rcT4" "run=$rt_run_4" "$tmp_root/rt03-4.full"
+  case_fail rt03_judge_accept_claude_processed_transition "ACCEPT_IMPLEMENTER: decisión procesada (registro stdout determinista) + consenso posterior legítimo solo con revisión independiente post-arbitraje (RED: procesamiento ausente aunque rc=0)" "$rcT4" "run=$rt_run_4" "$tmp_root/rt03-4.full"
 fi
 
 # ── Caso 31 (rt03_accept_claude_never_bypasses_safety) — GUARDA del contrato
-# del caso 30: ACCEPT_CLAUDE no puentea los controles de workspace.
-# r1 disputa + árbitro ACCEPT_CLAUDE; claude escribe en el ws REAL (r1 y r2);
+# del caso 30: ACCEPT_IMPLEMENTER no puentea los controles de workspace.
+# r1 disputa + árbitro ACCEPT_IMPLEMENTER; claude escribe en el ws REAL (r1 y r2);
 # r2 codex VERIFIED sin VERIFY_CMD. Transición esperada: el delta real no
 # verificado DOMINA cualquier decisión arbitral → rechazo objetivo
 # determinista VERIFY_FAILING rc=2 con la línea anclada
@@ -1066,12 +1095,12 @@ mkdir -p "$tmp_root/workspace/rt03-ws5"
   export MOCK_CLAUDE_FILE="$tmp_root/rt01a-impl-claude.txt" \
     MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
     MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-31-xd-count" \
-    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_IMPLEMENTER.txt" \
     MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-31" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-31" \
     MOCK_WS="$tmp_root/workspace/rt03-ws5" MOCK_CLAUDE_EFFECT=write \
     AGENT_BRIDGE_HISTORY_TURNS=3 \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-5"
-  bash "$engine" "$tmp_root/workspace/rt03-ws5" "RT-03: ACCEPT_CLAUDE no puentea controles de ws" 2 > "$tmp_root/rt03-5.full" 2>&1
+  bash "$engine" "$tmp_root/workspace/rt03-ws5" "RT-03: ACCEPT_IMPLEMENTER no puentea controles de ws" 2 > "$tmp_root/rt03-5.full" 2>&1
   echo $? > "$tmp_root/rt03-5.rc"
 )
 rcT5="$(cat "$tmp_root/rt03-5.rc")"
@@ -1084,7 +1113,7 @@ elif [[ "$rcT5" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03-5.ful
      && grep -q "=== Round 2:" "$tmp_root/rt03-5.full"; then
   case_pass rt03_accept_claude_never_bypasses_safety
 else
-  case_fail rt03_accept_claude_never_bypasses_safety "ACCEPT_CLAUDE no puede puentear delta real no verificado: rc=2 VERIFY_FAILING con rechazo objetivo (valido pre y post GREEN)" "$rcT5" "" "$tmp_root/rt03-5.full"
+  case_fail rt03_accept_claude_never_bypasses_safety "ACCEPT_IMPLEMENTER no puede puentear delta real no verificado: rc=2 VERIFY_FAILING con rechazo objetivo (valido pre y post GREEN)" "$rcT5" "" "$tmp_root/rt03-5.full"
 fi
 
 # ── Caso 32 (rt03_blocked_ws_integrity_failure_prevails) — RED:
@@ -1175,7 +1204,7 @@ fi
 
 # ── Caso 34 (rt03_accept_codex_legitimate_resolution_releases) — POSITIVO:
 # [Contrato actualizado en F5/F6: ancla objetiva verify rojo→verde, ver caso 33.]
-# Resolución acreditada de una objeción ACCEPT_CODEX. r1 disputa + árbitro ACCEPT_CODEX (objeción upheld); r2 el
+# Resolución acreditada de una objeción ACCEPT_REVIEWER. r1 disputa + árbitro ACCEPT_REVIEWER (objeción upheld); r2 el
 # implementador responde la objeción con revisión real (COMPLETE + marcador)
 # y el MISMO revisor independiente la acepta (VERIFIED), cerrando la objeción
 # de forma explícita y no silenciosa; sin delta por verificar. Contraste
@@ -1191,11 +1220,11 @@ mkdir -p "$tmp_root/workspace/rt03-ws8"
     AGENT_BRIDGE_VERIFY_CMD='test -f fixed.txt' \
     MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
     MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-34-xd-count" \
-    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CODEX.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_REVIEWER.txt" \
     MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-34" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-34" \
     AGENT_BRIDGE_HISTORY_TURNS=3 \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-8"
-  bash "$engine" "$tmp_root/workspace/rt03-ws8" "RT-03: resolución acreditada libera ACCEPT_CODEX" 2 > "$tmp_root/rt03-8.full" 2>&1
+  bash "$engine" "$tmp_root/workspace/rt03-ws8" "RT-03: resolución acreditada libera ACCEPT_REVIEWER" 2 > "$tmp_root/rt03-8.full" 2>&1
   echo $? > "$tmp_root/rt03-8.rc"
 )
 rcT8="$(cat "$tmp_root/rt03-8.rc")"
@@ -1207,7 +1236,7 @@ if [[ "$oc_hit_t8" -ne 1 ]]; then
   case_fail rt03_accept_codex_legitimate_resolution_releases "el escenario no aplicó: el árbitro no ejecutó (preparación mal formada)" "$rcT8" "oc_hit=$oc_hit_t8" "$tmp_root/rt03-8.full"
 elif [[ "$rcT8" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-8.full" \
      && ! grep -q "consensus REJECTED: unresolved judge obligation" "$tmp_root/rt03-8.full" \
-     && [[ -f "$rt_run_8/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_CODEX$' "$rt_run_8/round-1-judge.out.md" \
+     && [[ -f "$rt_run_8/round-1-judge.out.md" ]] && grep -q '^VERDICT: ACCEPT_REVIEWER$' "$rt_run_8/round-1-judge.out.md" \
      && grep -q '^STATUS: DISAGREE$' "$rt_run_8/round-1-claude.out.md" 2>/dev/null \
      && grep -q '^STATUS: COMPLETE$' "$rt_run_8/round-2-claude.out.md" 2>/dev/null \
      && grep -q 'rt03-impl-revision-answer-marker' "$rt_run_8/round-2-claude.out.md" 2>/dev/null \
@@ -1217,7 +1246,7 @@ elif [[ "$rcT8" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03-8.full" \
      && grep -q "judge obligation released" "$tmp_root/rt03-8.full"; then
   case_pass rt03_accept_codex_legitimate_resolution_releases
 else
-  case_fail rt03_accept_codex_legitimate_resolution_releases "resolución acreditada + nueva revisión independiente libera la objeción ACCEPT_CODEX → CONSENSUS rc=0 legítimo (contraste con caso 29)" "$rcT8" "run=$rt_run_8" "$tmp_root/rt03-8.full"
+  case_fail rt03_accept_codex_legitimate_resolution_releases "resolución acreditada + nueva revisión independiente libera la objeción ACCEPT_REVIEWER → CONSENSUS rc=0 legítimo (contraste con caso 29)" "$rcT8" "run=$rt_run_8" "$tmp_root/rt03-8.full"
 fi
 
 # ══ Gate 14B.4.4 / RT03-F1..F4 — RED de regresión (auditoría del GREEN 9975e84) ══
@@ -1451,7 +1480,7 @@ else
 fi
 
 # ══ Gate 14B.4.4 / RT03-G — pruebas adversariales adicionales (auditoría final) ══
-# G1: ACCEPT_CODEX + implementador PROPOSED sin entrega acreditada tampoco
+# G1: ACCEPT_REVIEWER + implementador PROPOSED sin entrega acreditada tampoco
 #     libera (la regla F3 no depende del tipo de veredicto que genera la obligación).
 cat > "$tmp_root/rt03-g1-impl-proposed.txt" <<'RT03G1P'
 STATUS: PROPOSED
@@ -1468,20 +1497,20 @@ mkdir -p "$tmp_root/workspace/rt03-ws13"
     MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03-g1-ac-count" \
     MOCK_CODEX_FILE="$tmp_root/c1r.txt" \
     MOCK_CODEX_COUNT_FILE="$tmp_root/rt03-g1-xd-count" \
-    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CODEX.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_REVIEWER.txt" \
     MOCK_OPENCODE_JUDGE_HIT="$tmp_root/hit-oc-judge-g1" MOCK_AGY_JUDGE_HIT="$tmp_root/hit-agy-judge-g1" \
     AGENT_BRIDGE_HISTORY_TURNS=3 \
     AGENT_BRIDGE_HOME="$tmp_root/bridge-rt03-g1"
-  bash "$engine" "$tmp_root/workspace/rt03-ws13" "RT03-G1: ACCEPT_CODEX no se libera con PROPOSED" 2 > "$tmp_root/rt03-g1.full" 2>&1
+  bash "$engine" "$tmp_root/workspace/rt03-ws13" "RT03-G1: ACCEPT_REVIEWER no se libera con PROPOSED" 2 > "$tmp_root/rt03-g1.full" 2>&1
   echo $? > "$tmp_root/rt03-g1.rc"
 )
 rcG1="$(cat "$tmp_root/rt03-g1.rc")"
 if [[ -f "$tmp_root/hit-oc-judge-g1" && "$rcG1" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03-g1.full" \
    && ! grep -q "judge obligation released" "$tmp_root/rt03-g1.full" \
-   && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: ACCEPT_CODEX, round 1)" "$tmp_root/rt03-g1.full"; then
+   && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: ACCEPT_REVIEWER, round 1)" "$tmp_root/rt03-g1.full"; then
   case_pass rt03g1_accept_codex_proposed_cannot_release
 else
-  case_fail rt03g1_accept_codex_proposed_cannot_release "ACCEPT_CODEX + PROPOSED sin entrega: rc=1 MAX_ROUNDS con obligación pendiente" "$rcG1" "" "$tmp_root/rt03-g1.full"
+  case_fail rt03g1_accept_codex_proposed_cannot_release "ACCEPT_REVIEWER + PROPOSED sin entrega: rc=1 MAX_ROUNDS con obligación pendiente" "$rcG1" "" "$tmp_root/rt03-g1.full"
 fi
 
 # G2: veredicto forjado en campos del implementador/revisor (HANDOFF/EVIDENCE)
@@ -1510,7 +1539,7 @@ fi
 #  F8  el fallo de ground truth se perdía al reiniciarse por ronda.
 # Contrato de liberación (GREEN): la obligación SOLO se libera con (a) ancla
 # objetiva — el ground truth FALLABA al arbitrar — y una validación posterior
-# exitosa más revisión independiente, o (b) un arbitraje posterior ACCEPT_CLAUDE
+# exitosa más revisión independiente, o (b) un arbitraje posterior ACCEPT_IMPLEMENTER
 # que la sustituye explícitamente. Sin ancla objetiva se conserva (fail-safe).
 rt03x_run() { # <nombre> <workspace> <rondas> — el entorno MOCK_* lo fija el llamador
   ( cd /tmp
@@ -1618,7 +1647,7 @@ else
   case_fail rt03p1_anchor_fail_to_pass_releases "ancla (verify rojo al arbitrar) + verify verde posterior + VERIFIED → CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/rt03x-p1.full"
 fi
 
-# P3 (positivo, sustitución explícita): r1 REQUEST_REVISION; r2 segundo arbitraje ACCEPT_CLAUDE la sustituye;
+# P3 (positivo, sustitución explícita): r1 REQUEST_REVISION; r2 segundo arbitraje ACCEPT_IMPLEMENTER la sustituye;
 # r3 revisión independiente VERIFIED → CONSENSUS. Con integridad fallida (P3b) → VERIFY_FAILING.
 rt03x_p3() { # <nombre> <verify|-> 
   rt03x_ws "$1"
@@ -1626,7 +1655,7 @@ rt03x_p3() { # <nombre> <verify|->
       MOCK_CODEX_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/$1-xd" \
       MOCK_CODEX_LATE_FROM=3 MOCK_CODEX_LATE_FILE="$tmp_root/c1r.txt" \
       MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-REQUEST_REVISION.txt" \
-      MOCK_OPENCODE_JUDGE_COUNT_FILE="$tmp_root/$1-jc" MOCK_OPENCODE_JUDGE_LATE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt"
+      MOCK_OPENCODE_JUDGE_COUNT_FILE="$tmp_root/$1-jc" MOCK_OPENCODE_JUDGE_LATE_FILE="$tmp_root/rt03-judge-ACCEPT_IMPLEMENTER.txt"
     rm -f "$tmp_root/$1-xd" "$tmp_root/$1-jc"
     if [[ "$2" == "-" ]]; then unset AGENT_BRIDGE_VERIFY_CMD
     else export AGENT_BRIDGE_VERIFY_CMD="$2" MOCK_WS="$tmp_root/workspace/$1" MOCK_CLAUDE_EFFECT=write; fi
@@ -1635,11 +1664,11 @@ rt03x_p3() { # <nombre> <verify|->
 }
 rt03x_p3 rt03x-p3 -
 if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/rt03x-p3.full" \
-   && grep -q "judge obligation superseded by ACCEPT_CLAUDE" "$tmp_root/rt03x-p3.full" \
+   && grep -q "judge obligation superseded by ACCEPT_IMPLEMENTER" "$tmp_root/rt03x-p3.full" \
    && ! grep -q "judge obligation released" "$tmp_root/rt03x-p3.full"; then
   case_pass rt03p3_later_accept_claude_supersedes_explicitly
 else
-  case_fail rt03p3_later_accept_claude_supersedes_explicitly "ACCEPT_CLAUDE posterior sustituye explícitamente la obligación → CONSENSUS rc=0 en r3" "$RUN_RC" "" "$tmp_root/rt03x-p3.full"
+  case_fail rt03p3_later_accept_claude_supersedes_explicitly "ACCEPT_IMPLEMENTER posterior sustituye explícitamente la obligación → CONSENSUS rc=0 en r3" "$RUN_RC" "" "$tmp_root/rt03x-p3.full"
 fi
 rt03x_p3 rt03x-p3b false
 if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/rt03x-p3b.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03x-p3b.full"; then
@@ -1756,7 +1785,7 @@ else
   case_fail rt03f11_unarbitrated_released_by_objective_anchor "disputa no arbitrada con ancla verify rojo→verde tras delta del implementador libera: CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/rt03x-f11-anchor.full"
 fi
 
-# F10-D1: el ACCEPT_CLAUDE de r1 resolvió el DISAGREE de r1; un BLOCKED/REVISE NUEVO del implementador en r2
+# F10-D1: el ACCEPT_IMPLEMENTER de r1 resolvió el DISAGREE de r1; un BLOCKED/REVISE NUEVO del implementador en r2
 # (con revisor VERIFIED) no queda cubierto por esa resolución → no cierra CONSENSUS.
 for st in blocked:rt03-f10-impl-blocked revise:rt03-f10-impl-revise; do
   nm="${st%%:*}"; fl="${st##*:}"
@@ -1764,21 +1793,21 @@ for st in blocked:rt03-f10-impl-blocked revise:rt03-f10-impl-revise; do
   ( unset AGENT_BRIDGE_VERIFY_CMD
     export MOCK_CLAUDE_FILE="$tmp_root/$fl.txt" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_COUNT_FILE="$tmp_root/rt03x-f10d1-$nm-ac" \
       MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/rt03x-f10d1-$nm-xd" \
-      MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt"
+      MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_IMPLEMENTER.txt"
     rm -f "$tmp_root/rt03x-f10d1-$nm-ac" "$tmp_root/rt03x-f10d1-$nm-xd"
     rt03x_run "rt03x-f10d1-$nm" "$tmp_root/workspace/rt03x-f10d1-$nm" 2 )
   RUN_RC="$(cat "$tmp_root/rt03x-f10d1-$nm.rc")"
   if [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03x-f10d1-$nm.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f10d1-$nm.full" \
-     && grep -q "judge verdict processed (round 1): ACCEPT_CLAUDE" "$tmp_root/rt03x-f10d1-$nm.full" \
+     && grep -q "judge verdict processed (round 1): ACCEPT_IMPLEMENTER" "$tmp_root/rt03x-f10d1-$nm.full" \
      && grep -q "consensus REJECTED: implementer disagreement unresolved (STATUS: ${nm^^})" "$tmp_root/rt03x-f10d1-$nm.full"; then
     case_pass "rt03f10_stale_resolution_does_not_cover_new_${nm}"
   else
-    case_fail "rt03f10_stale_resolution_does_not_cover_new_${nm}" "ACCEPT_CLAUDE de r1 no cubre un ${nm^^} nuevo en r2: rc=1 (RED: rc=0)" "$RUN_RC" "" "$tmp_root/rt03x-f10d1-$nm.full"
+    case_fail "rt03f10_stale_resolution_does_not_cover_new_${nm}" "ACCEPT_IMPLEMENTER de r1 no cubre un ${nm^^} nuevo en r2: rc=1 (RED: rc=0)" "$RUN_RC" "" "$tmp_root/rt03x-f10d1-$nm.full"
   fi
 done
 
 # ══ Gate 14B.4.4 / RT03-F12 — la resolución arbitral se vincula a la disputa concreta, no al STATUS ══
-# r1: DISAGREE(A) + revisor DISAGREE → árbitro ACCEPT_CLAUDE (resuelve la disputa de r1).
+# r1: DISAGREE(A) + revisor DISAGREE → árbitro ACCEPT_IMPLEMENTER (resuelve la disputa de r1).
 # r2: el implementador responde DISAGREE con OTRO contenido (EVIDENCE/HANDOFF distintos) y el revisor VERIFIED:
 #     misma etiqueta STATUS, disputa diferente → la decisión de r1 no se reutiliza.
 printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: rt03-f12 segunda disputa distinta\nNEXT: none\nHANDOFF: rt03-f12-disputa-B\n' > "$tmp_root/rt03-f12-impl-B.txt"
@@ -1787,18 +1816,18 @@ rt03f12_case() { # <nombre> <archivo-implementador-desde-r2>
   ( unset AGENT_BRIDGE_VERIFY_CMD
     export MOCK_CLAUDE_FILE="$2" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_COUNT_FILE="$tmp_root/$1-ac" \
       MOCK_CODEX_FILE="$tmp_root/c1r.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/$1-xd" \
-      MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_CLAUDE.txt"
+      MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt03-judge-ACCEPT_IMPLEMENTER.txt"
     rm -f "$tmp_root/$1-ac" "$tmp_root/$1-xd"
     rt03x_run "$1" "$tmp_root/workspace/$1" 2 )
   RUN_RC="$(cat "$tmp_root/$1.rc")"
 }
 rt03f12_case rt03x-f12 "$tmp_root/rt03-f12-impl-B.txt"
 if [[ "$RUN_RC" -eq 1 ]] && grep -q "Done: MAX_ROUNDS" "$tmp_root/rt03x-f12.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/rt03x-f12.full" \
-   && grep -q "judge verdict processed (round 1): ACCEPT_CLAUDE" "$tmp_root/rt03x-f12.full" \
+   && grep -q "judge verdict processed (round 1): ACCEPT_IMPLEMENTER" "$tmp_root/rt03x-f12.full" \
    && grep -q "consensus REJECTED: implementer disagreement unresolved (STATUS: DISAGREE)" "$tmp_root/rt03x-f12.full"; then
   case_pass rt03f12_same_status_different_dispute_not_covered
 else
-  case_fail rt03f12_same_status_different_dispute_not_covered "ACCEPT_CLAUDE de la disputa A no cubre una disputa B con el mismo STATUS: rc=1 (RED: rc=0 CONSENSUS)" "$RUN_RC" "" "$tmp_root/rt03x-f12.full"
+  case_fail rt03f12_same_status_different_dispute_not_covered "ACCEPT_IMPLEMENTER de la disputa A no cubre una disputa B con el mismo STATUS: rc=1 (RED: rc=0 CONSENSUS)" "$RUN_RC" "" "$tmp_root/rt03x-f12.full"
 fi
 # Guarda positiva 1: el MISMO objeto arbitrado (eco idéntico de la disputa resuelta) sigue cubierto.
 rt03f12_case rt03x-f12-same "$tmp_root/rt01a-impl-claude.txt"
@@ -1847,6 +1876,191 @@ if [[ -n "$rid_a" && "$rid_a" == "$rid_a2" && "$rid_a" != "$rid_b" && -n "$rid_b
   case_pass rt03f12_response_id_distinguishes_valid_disputes
 else
   case_fail rt03f12_response_id_distinguishes_valid_disputes "protocolo válido: A==A idéntica, A!=B, ambas no vacías" "-" "a=${rid_a:0:8} a2=${rid_a2:0:8} b=${rid_b:0:8}" ""
+fi
+
+# ══ ABC — migración de roles (AGENT_BRIDGE_ROLES=v2, arquitectura por defecto) ══
+#  Claude PLAN (solo lectura) → Codex IMPLEMENT → Claude AUDIT (solo lectura)
+#  Árbitro: AGY primero; OpenCode solo si AGY no está disponible o está excluido.
+#  Veredictos role-bound abc-verdicts/2: ACCEPT_IMPLEMENTER / ACCEPT_REVIEWER (los antiguos se rechazan).
+#  Cada caso usa rutas únicas dentro del tmp_root recién creado (sin limpiezas intermedias).
+rv2_run() { # <nombre> <rondas> — el llamador exporta los MOCK_*; fuerza roles v2
+  rt03x_ws "$1"
+  ( cd /tmp
+    export AGENT_BRIDGE_ROLES=v2 AGENT_BRIDGE_HISTORY_TURNS=3 AGENT_BRIDGE_HOME="$tmp_root/bridge-$1" MOCK_ROLE_LOG="$tmp_root/$1.roles" MOCK_ARGS_LOG="$tmp_root/$1.args" MOCK_WS="$tmp_root/workspace/$1"
+    bash "$engine" "$tmp_root/workspace/$1" "roles v2: $1" "$2" > "$tmp_root/$1.full" 2>&1
+    echo $? > "$tmp_root/$1.rc" )
+  RUN_RC="$(cat "$tmp_root/$1.rc")"
+}
+rv2_hits() { oc_hit=0; agy_hit=0; [[ -f "$tmp_root/$1-oc" ]] && oc_hit=1; [[ -f "$tmp_root/$1-agy" ]] && agy_hit=1; }
+rv2_judge_env() { export MOCK_OPENCODE_JUDGE_HIT="$tmp_root/$1-oc" MOCK_AGY_JUDGE_HIT="$tmp_root/$1-agy"; }
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: v2 judge agy\nNEXT: none\nHANDOFF: v2-agy\nVERDICT: ACCEPT_IMPLEMENTER\n' > "$tmp_root/v2-judge-agy-accept-impl.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: v2 judge oc\nNEXT: none\nHANDOFF: v2-oc\nVERDICT: ACCEPT_REVIEWER\n' > "$tmp_root/v2-judge-oc-accept-rev.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: legacy\nNEXT: none\nHANDOFF: legacy-claude\nVERDICT: ACCEPT_CLAUDE\n' > "$tmp_root/v2-judge-legacy-claude.txt"
+printf 'STATUS: DISAGREE\nCHANGED: none\nEVIDENCE: legacy\nNEXT: none\nHANDOFF: legacy-codex\nVERDICT: ACCEPT_CODEX\n' > "$tmp_root/v2-judge-legacy-codex.txt"
+
+# V1: secuencia PLAN → IMPLEMENT → AUDIT, plan inyectado, Claude en modo solo lectura y sin reanudar la sesión del plan.
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt"; rv2_run roles-v1 2 )
+RUN_RC="$(cat "$tmp_root/roles-v1.rc")"
+if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/roles-v1.full" \
+   && [[ "$(cat "$tmp_root/roles-v1.roles")" == $'claude:planner\ncodex:implementer\nclaude:reviewer' ]] \
+   && grep -q "=== Plan: Claude ===" "$tmp_root/roles-v1.full" && grep -q "=== Round 1: Codex ===" "$tmp_root/roles-v1.full" && grep -q "=== Round 1: Claude ===" "$tmp_root/roles-v1.full" \
+   && grep -q "roles-plan-marker" "$tmp_root"/bridge-roles-v1/runs/*/plan.md \
+   && grep -q "# Plan" "$tmp_root"/bridge-roles-v1/runs/*/round-1-codex.prompt.md \
+   && grep -q "roles-plan-marker" "$tmp_root"/bridge-roles-v1/runs/*/round-1-claude.prompt.md \
+   && ! grep -q "acceptEdits" "$tmp_root/roles-v1.args" && [[ "$(grep -c -- '--permission-mode plan' "$tmp_root/roles-v1.args")" == "2" ]] \
+   && ! grep -q -- '--resume' "$tmp_root/roles-v1.args"; then
+  case_pass roles_v2_plan_implement_audit_sequence
+else
+  case_fail roles_v2_plan_implement_audit_sequence "Claude PLAN → Codex IMPLEMENT → Claude AUDIT; plan inyectado; Claude read-only; sin resume del plan" "$RUN_RC" "roles=$(tr '\n' ',' < "$tmp_root/roles-v1.roles")" "$tmp_root/roles-v1.full"
+fi
+
+# V2: Claude modifica el workspace al PLANIFICAR → violación de rol, el implementador nunca corre.
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt" MOCK_CLAUDE_PLAN_WRITE=1; rv2_run roles-v2 2 )
+RUN_RC="$(cat "$tmp_root/roles-v2.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/roles-v2.full" && grep -q "role violation: Claude modified the workspace during planning" "$tmp_root/roles-v2.full" \
+   && ! grep -q "codex" "$tmp_root/roles-v2.roles" && ! grep -q "Done: CONSENSUS" "$tmp_root/roles-v2.full"; then
+  case_pass roles_v2_claude_plan_cannot_modify_workspace
+else
+  case_fail roles_v2_claude_plan_cannot_modify_workspace "plan que modifica el workspace → VERIFY_FAILING rc=2 sin turno del implementador" "$RUN_RC" "" "$tmp_root/roles-v2.full"
+fi
+
+# V3: Claude modifica el workspace al AUDITAR (aunque VERIFY_CMD pase y diga VERIFIED) → violación; jamás consenso.
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt" MOCK_CLAUDE_EFFECT=write MOCK_CLAUDE_EFFECT_ROLE=reviewer AGENT_BRIDGE_VERIFY_CMD=true; rv2_run roles-v3 2 )
+RUN_RC="$(cat "$tmp_root/roles-v3.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/roles-v3.full" && grep -q "role violation: Claude modified the workspace during audit" "$tmp_root/roles-v3.full" \
+   && ! grep -q "Done: CONSENSUS" "$tmp_root/roles-v3.full"; then
+  case_pass roles_v2_claude_audit_cannot_modify_workspace
+else
+  case_fail roles_v2_claude_audit_cannot_modify_workspace "auditoría que modifica el workspace → VERIFY_FAILING rc=2 (verify verde no lo blanquea)" "$RUN_RC" "" "$tmp_root/roles-v3.full"
+fi
+
+# V4: fallo del planificador → PLANNER_ERROR rc=9, sin sustituir el rol.
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt" MOCK_CLAUDE_FAIL_ROLE=planner; rv2_run roles-v4 2 )
+RUN_RC="$(cat "$tmp_root/roles-v4.rc")"
+if [[ "$RUN_RC" -eq 9 ]] && grep -q "Done: PLANNER_ERROR" "$tmp_root/roles-v4.full" && ! grep -q "codex" "$tmp_root/roles-v4.roles"; then
+  case_pass roles_v2_planner_failure_fails_closed
+else
+  case_fail roles_v2_planner_failure_fails_closed "planificador caído → PLANNER_ERROR rc=9 sin turno del implementador" "$RUN_RC" "" "$tmp_root/roles-v4.full"
+fi
+
+# V5: árbitro AGY primero; OpenCode no es consultado cuando AGY responde.
+( export MOCK_CODEX_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" MOCK_AGY_JUDGE_FILE="$tmp_root/v2-judge-agy-accept-impl.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/v2-judge-oc-accept-rev.txt"; rv2_judge_env roles-v5; rv2_run roles-v5 1 )
+RUN_RC="$(cat "$tmp_root/roles-v5.rc")"
+rv2_hits roles-v5
+if [[ "$agy_hit" -eq 1 && "$oc_hit" -eq 0 ]] && grep -q "escalating to agy judge..." "$tmp_root/roles-v5.full" && ! grep -q "OpenCode judge" "$tmp_root/roles-v5.full" \
+   && grep -q "judge verdict processed (round 1): ACCEPT_IMPLEMENTER" "$tmp_root/roles-v5.full"; then
+  case_pass roles_v2_agy_is_primary_judge
+else
+  case_fail roles_v2_agy_is_primary_judge "AGY arbitra primero; OpenCode no se invoca" "$RUN_RC" "agy=$agy_hit oc=$oc_hit" "$tmp_root/roles-v5.full"
+fi
+
+# V6: AGY indisponible (respuesta inválida) → OpenCode arbitra como alternativo.
+( export MOCK_CODEX_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-judge-garbage.txt" \
+    MOCK_OPENCODE_JUDGE_FILE="$tmp_root/v2-judge-oc-accept-rev.txt"; rv2_judge_env roles-v6; rv2_run roles-v6 1 )
+RUN_RC="$(cat "$tmp_root/roles-v6.rc")"
+rv2_hits roles-v6
+if [[ "$agy_hit" -eq 1 && "$oc_hit" -eq 1 ]] && grep -q "judge: agy unavailable, trying OpenCode..." "$tmp_root/roles-v6.full" \
+   && grep -q "judge verdict processed (round 1): ACCEPT_REVIEWER" "$tmp_root/roles-v6.full"; then
+  case_pass roles_v2_opencode_alternate_when_agy_unavailable
+else
+  case_fail roles_v2_opencode_alternate_when_agy_unavailable "AGY inválido → OpenCode arbitra" "$RUN_RC" "agy=$agy_hit oc=$oc_hit" "$tmp_root/roles-v6.full"
+fi
+
+# V7: AGY excluido por independencia (implementó la ronda) → OpenCode arbitra; AGY nunca arbitra.
+( export MOCK_CODEX_FAIL=1 AGENT_BRIDGE_FALLBACKS=agy MOCK_AGY_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/v2-judge-agy-accept-impl.txt" MOCK_OPENCODE_JUDGE_FILE="$tmp_root/v2-judge-oc-accept-rev.txt"; rv2_judge_env roles-v7; rv2_run roles-v7 1 )
+RUN_RC="$(cat "$tmp_root/roles-v7.rc")"
+rv2_hits roles-v7
+if [[ "$agy_hit" -eq 0 && "$oc_hit" -eq 1 ]] && grep -q "judge: agy excluded (independence: implemented/reviewed this round)" "$tmp_root/roles-v7.full" \
+   && grep -q "judge verdict processed (round 1): ACCEPT_REVIEWER" "$tmp_root/roles-v7.full"; then
+  case_pass roles_v2_opencode_alternate_when_agy_excluded
+else
+  case_fail roles_v2_opencode_alternate_when_agy_excluded "AGY implementó → excluido; OpenCode arbitra" "$RUN_RC" "agy=$agy_hit oc=$oc_hit" "$tmp_root/roles-v7.full"
+fi
+
+# V8: AGY implementó y OpenCode auditó (fallbacks) → ningún árbitro independiente: rc=8.
+( export MOCK_CODEX_FAIL=1 MOCK_CLAUDE_FAIL_ROLE=reviewer AGENT_BRIDGE_FALLBACKS="agy,opencode" MOCK_AGY_FILE="$tmp_root/rt01a-impl-claude.txt" \
+    MOCK_OPENCODE_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt"; rv2_judge_env roles-v8; rv2_run roles-v8 1 )
+RUN_RC="$(cat "$tmp_root/roles-v8.rc")"
+rv2_hits roles-v8
+if [[ "$RUN_RC" -eq 8 ]] && grep -q "Done: NO_INDEPENDENT_JUDGE" "$tmp_root/roles-v8.full" && [[ "$agy_hit" -eq 0 && "$oc_hit" -eq 0 ]]; then
+  case_pass roles_v2_no_independent_judge_intact
+else
+  case_fail roles_v2_no_independent_judge_intact "implementador agy + auditor OpenCode → NO_INDEPENDENT_JUDGE rc=8" "$RUN_RC" "agy=$agy_hit oc=$oc_hit" "$tmp_root/roles-v8.full"
+fi
+
+# V9: los tokens del contrato /1 se rechazan explícitamente (nunca se reinterpretan) → disputa no arbitrada (UNARBITRATED).
+for lt in CLAUDE CODEX; do
+  ( export MOCK_CODEX_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" \
+      MOCK_AGY_JUDGE_FILE="$tmp_root/v2-judge-legacy-${lt,,}.txt" MOCK_OPENCODE_JUDGE_FILE="$tmp_root/v2-judge-legacy-${lt,,}.txt"; rv2_judge_env roles-v9-$lt; rv2_run roles-v9-$lt 2 )
+RUN_RC="$(cat "$tmp_root/roles-v9-$lt.rc")"
+  if [[ "$RUN_RC" -eq 1 ]] && grep -q "legacy verdict token 'ACCEPT_$lt'" "$tmp_root/roles-v9-$lt.full" && ! grep -q "judge verdict processed" "$tmp_root/roles-v9-$lt.full" \
+     && grep -q "unarbitrated dispute registered as pending obligation" "$tmp_root/roles-v9-$lt.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/roles-v9-$lt.full"; then
+    case_pass "roles_v2_legacy_verdict_ACCEPT_${lt}_rejected"
+  else
+    case_fail "roles_v2_legacy_verdict_ACCEPT_${lt}_rejected" "ACCEPT_$lt (contrato /1) se rechaza explícitamente, sin reinterpretar" "$RUN_RC" "" "$tmp_root/roles-v9-$lt.full"
+  fi
+done
+
+# V10: ACCEPT_IMPLEMENTER resuelve la disputa del implementador (r1 AGY lo dicta; r2 auditoría VERIFIED sobre la misma respuesta) → CONSENSUS.
+( export MOCK_CODEX_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" MOCK_CLAUDE_COUNT_FILE="$tmp_root/roles-v10-cc" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/v2-judge-agy-accept-impl.txt"; rv2_judge_env roles-v10; rv2_run roles-v10 2 )
+RUN_RC="$(cat "$tmp_root/roles-v10.rc")"
+if [[ "$RUN_RC" -eq 0 ]] && grep -q "Done: CONSENSUS" "$tmp_root/roles-v10.full" && grep -q "judge verdict processed (round 1): ACCEPT_IMPLEMENTER" "$tmp_root/roles-v10.full"; then
+  case_pass roles_v2_accept_implementer_resolves_dispute
+else
+  case_fail roles_v2_accept_implementer_resolves_dispute "ACCEPT_IMPLEMENTER + auditoría VERIFIED posterior → CONSENSUS rc=0" "$RUN_RC" "" "$tmp_root/roles-v10.full"
+fi
+
+# V11 (F10 en v2): Codex DISAGREE + Claude VERIFIED sin arbitraje → no cierra.
+( export MOCK_CODEX_FILE="$tmp_root/rt01a-impl-claude.txt" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt"; rv2_run roles-v11 2 )
+RUN_RC="$(cat "$tmp_root/roles-v11.rc")"
+if [[ "$RUN_RC" -eq 1 ]] && grep -q "consensus REJECTED: implementer disagreement unresolved" "$tmp_root/roles-v11.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/roles-v11.full"; then
+  case_pass roles_v2_f10_implementer_disagreement_not_overridden
+else
+  case_fail roles_v2_f10_implementer_disagreement_not_overridden "Codex DISAGREE + Claude VERIFIED sin resolución → rc=1" "$RUN_RC" "" "$tmp_root/roles-v11.full"
+fi
+
+# V12 (F11 en v2): árbitros indisponibles en r1; r2 Codex PROPOSED + Claude VERIFIED → obligación UNARBITRATED, sin consenso.
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CODEX_COUNT_FILE="$tmp_root/roles-v12-xc" MOCK_CLAUDE_FILE="$tmp_root/c1r.txt" MOCK_CLAUDE_FIRST_FILE="$tmp_root/rt03-rev-codex-dispute2.txt" MOCK_CLAUDE_COUNT_FILE="$tmp_root/roles-v12-cc" \
+    MOCK_AGY_JUDGE_FILE="$tmp_root/rt01a-judge-garbage.txt" MOCK_OPENCODE_JUDGE_FILE="$tmp_root/rt01a-judge-garbage.txt"; rv2_judge_env roles-v12; rv2_run roles-v12 2 )
+RUN_RC="$(cat "$tmp_root/roles-v12.rc")"
+if [[ "$RUN_RC" -eq 1 ]] && grep -q "consensus REJECTED: unresolved judge obligation (VERDICT: UNARBITRATED, round 1)" "$tmp_root/roles-v12.full" && ! grep -q "Done: CONSENSUS" "$tmp_root/roles-v12.full"; then
+  case_pass roles_v2_f11_unarbitrated_dispute_persists
+else
+  case_fail roles_v2_f11_unarbitrated_dispute_persists "juez caído en r1 → UNARBITRATED persiste (rc=1)" "$RUN_RC" "" "$tmp_root/roles-v12.full"
+fi
+
+# V13 (integridad en v2): auditor BLOCKED + ground truth fallido → VERIFY_FAILING rc=2 (no BLOCKED rc=3).
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CODEX_EFFECT=write AGENT_BRIDGE_VERIFY_CMD=false MOCK_CLAUDE_FILE="$tmp_root/c2r.txt"; rv2_run roles-v13 2 )
+RUN_RC="$(cat "$tmp_root/roles-v13.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/roles-v13.full" && ! grep -q "Done: BLOCKED" "$tmp_root/roles-v13.full"; then
+  case_pass roles_v2_integrity_precedes_auditor_blocked
+else
+  case_fail roles_v2_integrity_precedes_auditor_blocked "auditor BLOCKED + verify rojo → VERIFY_FAILING rc=2" "$RUN_RC" "" "$tmp_root/roles-v13.full"
+fi
+
+# V14: valor inválido de AGENT_BRIDGE_ROLES → rc=2 (nunca un perfil implícito).
+rt03x_ws roles-v14
+( cd /tmp; AGENT_BRIDGE_ROLES=bogus AGENT_BRIDGE_HOME="$tmp_root/bridge-roles-v14" bash "$engine" "$tmp_root/workspace/roles-v14" "x" 1 > "$tmp_root/roles-v14.full" 2>&1; echo $? > "$tmp_root/roles-v14.rc" )
+if [[ "$(cat "$tmp_root/roles-v14.rc")" -eq 2 ]] && grep -q "Invalid AGENT_BRIDGE_ROLES" "$tmp_root/roles-v14.full"; then
+  case_pass roles_invalid_profile_rejected
+else
+  case_fail roles_invalid_profile_rejected "AGENT_BRIDGE_ROLES inválido → rc=2" "$(cat "$tmp_root/roles-v14.rc")" "" "$tmp_root/roles-v14.full"
+fi
+
+# V15 (auditoría fresca D1): Claude escribe al AUDITAR y luego responde sin protocolo válido; el fallback (OpenCode)
+# contesta VERIFIED con VERIFY_CMD verde. La violación del auditor no se blanquea por el fallback → VERIFY_FAILING.
+printf 'narración libre sin protocolo\n' > "$tmp_root/roles-v15-claude-invalid.txt"
+( export MOCK_CODEX_FILE="$tmp_root/c1c.txt" MOCK_CLAUDE_FILE="$tmp_root/roles-v15-claude-invalid.txt" MOCK_CLAUDE_EFFECT=write MOCK_CLAUDE_EFFECT_ROLE=reviewer \
+    MOCK_OPENCODE_FILE="$tmp_root/c1r.txt" AGENT_BRIDGE_VERIFY_CMD=true; rv2_run roles-v15 2 )
+RUN_RC="$(cat "$tmp_root/roles-v15.rc")"
+if [[ "$RUN_RC" -eq 2 ]] && grep -q "Done: VERIFY_FAILING" "$tmp_root/roles-v15.full" && grep -q "role violation: Claude modified the workspace during audit" "$tmp_root/roles-v15.full" \
+   && ! grep -q "Done: CONSENSUS" "$tmp_root/roles-v15.full"; then
+  case_pass roles_v2_audit_violation_not_laundered_by_fallback
+else
+  case_fail roles_v2_audit_violation_not_laundered_by_fallback "auditor Claude escribe y falla/inválido → el fallback no blanquea la violación (rc=2)" "$RUN_RC" "" "$tmp_root/roles-v15.full"
 fi
 
 if [[ $ok_count -eq $total ]]; then

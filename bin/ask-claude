@@ -15,8 +15,14 @@ output_file="${3:-}"
 
 cd "$workspace"
 
+# AGENT_BRIDGE_CLAUDE_READONLY=1: planner/auditor mode (no edits), as used by agent-turns roles v2.
+mode=(--permission-mode acceptEdits)
+if [[ "${AGENT_BRIDGE_CLAUDE_READONLY:-0}" == "1" ]]; then
+  mode=(--permission-mode plan --disallowed-tools "Edit,Write,NotebookEdit")
+fi
+
 if [[ -n "$output_file" ]]; then
-  claude -p --permission-mode acceptEdits --output-format text --add-dir "$workspace" - < "$prompt_file" > "$output_file"
+  claude -p "${mode[@]}" --output-format text --add-dir "$workspace" - < "$prompt_file" > "$output_file"
 else
-  claude -p --permission-mode acceptEdits --output-format text --add-dir "$workspace" - < "$prompt_file"
+  claude -p "${mode[@]}" --output-format text --add-dir "$workspace" - < "$prompt_file"
 fi
